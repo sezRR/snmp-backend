@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: fastapi
+  labels:
+    app: fastapi
+spec:
+  # Reachable only through the Traefik Ingress, which owns host port 80.
+  type: ClusterIP
+  selector:
+    app: fastapi
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

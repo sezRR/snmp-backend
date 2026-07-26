@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# IDE / editor state (contains absolute local paths)
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+
+# Local overrides and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+kubeconfig

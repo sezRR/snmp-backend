@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  labels:
+    app: fastapi
+data:
+  # Non-secret half of Settings (src/app/config.py). Credentials come from the
+  # timescaledb Secret; both are mounted with envFrom, and real environment
+  # variables take precedence over any .env file in the image.
+
+  # Must match the IngressRoute path and its StripPrefix middleware.
+  ROOT_PATH: /api
+  LOG_LEVEL: INFO
+
+  DB_POOL_MIN: "1"
+  # Keep above COLLECTOR_CONCURRENCY so polling cannot starve request handlers.
+  DB_POOL_MAX: "16"
+  DB_AUTO_INIT: "true"
+
+  COLLECTOR_ENABLED: "true"
+  COLLECTOR_INTERVAL_SECONDS: "15"
+  COLLECTOR_CONCURRENCY: "10"
+
+  # No real SNMP agents on this cluster; the simulator produces the same
+  # payload shape. Set to false to poll the machines' real IPv4 addresses.
+  SNMP_SIMULATE: "true"
+  SNMP_COMMUNITY: public
+  SNMP_PORT: "161"
+  SNMP_TIMEOUT_SECONDS: "2.0"
+  SNMP_RETRIES: "1"
+
+  # Likewise for OpenStack: a fake fleet stands in for openstack.connect().
+  OPENSTACK_SIMULATE: "true"
+  OPENSTACK_CACHE_TTL_SECONDS: "300"
+
+  SSE_HEARTBEAT_SECONDS: "15"
+  SSE_QUEUE_MAXSIZE: "100"

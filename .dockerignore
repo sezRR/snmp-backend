@@ -1,0 +1,17 @@
+.venv
+# Credentials stay out of the image; Kubernetes injects them as env vars.
+.env
+.env.*
+__pycache__/
+*.py[oc]
+.git
+.gitignore
+.idea
+.dockerignore
+Dockerfile
+k8s/
+README.md
+build/
+dist/
+wheels/
+*.egg-info

@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: timescaledb
+  labels:
+    app: timescaledb
+spec:
+  serviceName: timescaledb
+  # Single node: no replication, no Patroni, no HA. Matching the TigerData
+  # Kubernetes guide, which mounts a standalone PVC rather than using
+  # volumeClaimTemplates.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: timescaledb
+  template:
+    metadata:
+      labels:
+        app: timescaledb
+    spec:
+      securityContext:
+        # postgres is uid/gid 999 in this image. Starting as that user rather
+        # than as root matters for more than hygiene: the entrypoint only
+        # chown/chmods PGDATA and /var/run/postgresql when it runs as root, and
+        # those calls fail with `Operation not permitted` under the dropped
+        # capabilities below. Non-root, it skips them and fsGroup has already
+        # made the volume group-writable.
+        runAsUser: 999
+        runAsGroup: 999
+        runAsNonRoot: true
+        fsGroup: 999
+      containers:
+        - name: timescaledb
+          # Pinned deliberately. The TigerData guide uses timescaledb-ha:pg18;
+          # this stays on the plain single-node image already in use.
+          image: timescale/timescaledb:2.22.1-pg17
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          # Deliberately NOT `envFrom` the whole Secret: it also carries the
+          # app's PGHOST/PGUSER/PGPASSWORD, and this image's own init scripts
+          # call psql, which would then dial the Service over TCP while only the
+          # temporary unix-socket server is up — `connection refused`, failed
+          # init, restart loop. Only the POSTGRES_* keys belong here.
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: timescaledb
+                  key: POSTGRES_DB
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: timescaledb
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: timescaledb
+                  key: POSTGRES_PASSWORD
+            # A subdirectory, so initdb never sees the volume's lost+found.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          # No /docker-entrypoint-initdb.d mount: the schema is owned by the
+          # application (src/app/db/schema.sql, applied by src/app/db/init.py),
+          # which can be re-run against an existing database. Entrypoint init
+          # scripts only ever run once, on an empty data directory.
+          readinessProbe:
+            exec:
+              # -h localhost keeps this on TCP, so it only passes once the
+              # server is actually accepting connections. During the initdb
+              # phase the entrypoint runs a temporary unix-socket-only server
+              # that pg_isready would otherwise report as ready.
+              command: ["pg_isready", "-U", "app", "-d", "app", "-h", "localhost"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "app", "-d", "app", "-h", "localhost"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            # Not readOnlyRootFilesystem: the entrypoint writes to /tmp,
+            # /var/run/postgresql and /etc/postgresql during init.
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: timescaledb-pvc

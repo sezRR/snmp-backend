@@ -1,0 +1,14 @@
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: fastapi-stripprefix
+  labels:
+    app: fastapi
+spec:
+  # Referenced by the IngressRoute. The app serves /, /items/{id} and /healthz
+  # at the root, so the /api prefix is removed before the request reaches it.
+  # ROOT_PATH on the Deployment tells the app the prefix still exists, so
+  # generated URLs stay correct.
+  stripPrefix:
+    prefixes:
+      - /api

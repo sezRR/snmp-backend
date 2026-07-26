@@ -1,0 +1,20 @@
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: timescaledb
+  labels:
+    app: timescaledb
+spec:
+  entryPoints:
+    # Defined in k8s/traefik-values.yaml; host port 5432.
+    - postgres
+  routes:
+    # HostSNI(`*`) is the only legal matcher on a non-TLS TCP route, and
+    # Postgres cannot be SNI-routed anyway — its TLS upgrade happens inside the
+    # wire protocol, after the connection is established. So this entryPoint
+    # forwards everything to one backend; a second Postgres would need its own
+    # entryPoint on another port.
+    - match: HostSNI(`*`)
+      services:
+        - name: timescaledb
+          port: 5432
