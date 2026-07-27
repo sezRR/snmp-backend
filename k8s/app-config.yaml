@@ -27,11 +27,15 @@ data:
 
   # No real SNMP agents on this cluster; the simulator produces the same
   # payload shape. Set to false to poll the machines' real IPv4 addresses.
-  SNMP_SIMULATE: "true"
+  SNMP_SIMULATE: "false"
   SNMP_COMMUNITY: public
   SNMP_PORT: "161"
   SNMP_TIMEOUT_SECONDS: "1.5"
   SNMP_RETRIES: "1"
+  # Rows per GETBULK response. Held low because the agents are polled over a
+  # Tailscale tunnel (1280-byte MTU) from inside the cluster: a bigger reply is
+  # fragmented and the fragments do not survive the hop out of the VM.
+  SNMP_MAX_REPETITIONS: "10"
   SNMP_DISKIO_ENABLED: "true"
 
   # Compression and retention on the metrics hypertable. At a five second

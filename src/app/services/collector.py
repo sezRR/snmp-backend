@@ -226,7 +226,11 @@ class Collector:
         return len(samples)
 
     async def _resolve_addresses(self, rows: list[dict[str, Any]]) -> list[tuple[str, str]]:
-        """Pair each MAC with the address to poll, following OpenStack."""
+        """Pair each MAC with the address to poll, following OpenStack.
+
+        External machines have no lookup record, so their stored address stands
+        as given — the client is the only thing that can move them.
+        """
         try:
             index = await self._lookup.mac_index()
         except Exception as exc:
@@ -240,6 +244,12 @@ class Collector:
             mac = row["mac"]
             ipv4 = row["ipv4"]
             server = index.get(normalise_mac(mac))
+            if server is not None and row["external"]:
+                # Registered as external — either while the lookup was down, or
+                # before the machine was imported into the fleet. OpenStack has
+                # it now, so it owns the address from here on.
+                log.info("machine %s is in OpenStack after all; no longer external", mac)
+                await self._db.run_query(machines_repo.mark_managed, mac)
             if server is not None and server.ipv4 != ipv4:
                 log.info("machine %s moved %s -> %s", mac, ipv4, server.ipv4)
                 await self._db.run_query(machines_repo.set_ipv4, mac, server.ipv4)

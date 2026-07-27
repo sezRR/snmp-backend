@@ -19,7 +19,7 @@ spec:
         runAsUser: 1000
       containers:
         - name: fastapi
-          image: fastapi-demo:0.6.0
+          image: fastapi-demo:0.6.2
           # The image is built by the local Docker daemon, which OrbStack's
           # Kubernetes shares. Nothing is ever pulled from a registry.
           imagePullPolicy: IfNotPresent

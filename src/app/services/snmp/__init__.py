@@ -7,7 +7,8 @@ no migration, no model edit.
 Current shape:
 
     {"cpu":  {"usage_percent": 37.5, "cores": 4},
-     "ram":  {"total_bytes": …, "used_bytes": …, "used_percent": …},
+     "ram":  {"total_bytes": …, "used_bytes": …, "used_percent": …,
+              "available_bytes": …, "buffers_bytes": …, "cached_bytes": …},
      "disk": [{"mount": "/", "total_bytes": …, "used_bytes": …, "used_percent": …}],
      "disk_io": {"read_bps": …, "write_bps": …, "read_iops": …, "write_iops": …,
                  "read_bytes": …, "write_bytes": …, "reads": …, "writes": …,
@@ -82,10 +83,12 @@ def build_sampler(
     from app.services.snmp.pysnmp_backend import PySnmpSampler
 
     log.info(
-        "snmp: pysnmp v2c against port %s (timeout %ss, %s retries, disk i/o %s)",
+        "snmp: pysnmp v2c against port %s (timeout %ss, %s retries, "
+        "max-repetitions %s, disk i/o %s)",
         settings.snmp_port,
         settings.snmp_timeout_seconds,
         settings.snmp_retries,
+        settings.snmp_max_repetitions,
         "on" if settings.snmp_diskio_enabled else "off",
     )
     return PySnmpSampler(
@@ -93,6 +96,7 @@ def build_sampler(
         port=settings.snmp_port,
         timeout_seconds=settings.snmp_timeout_seconds,
         retries=settings.snmp_retries,
+        max_repetitions=settings.snmp_max_repetitions,
         diskio_enabled=settings.snmp_diskio_enabled,
     )
 

@@ -19,12 +19,19 @@ The three tables are walked concurrently, and the columns within each table are
 walked concurrently too. Done serially this is twenty-odd round trips per machine
 per tick, which is what decides whether a short interval is reachable at all.
 
-DISKIO-MIB needs an snmpd that ships the `ucd-snmp/diskio` module *and* exposes
-it, which the stock restrictive view does not:
+Every one of those subtrees has to be inside the agent's view, and the stock
+Debian/Ubuntu view (`system` plus `hrSystem` only) contains none of them. An agent
+left that way answers each walk with nothing at all, which arrives here as "no
+HOST-RESOURCES-MIB rows" rather than as a permission error:
 
-    view   systemview  included  .1.3.6.1.4.1.2021.13.15
+    view   fleet  included  .1.3.6.1.2.1.1            # system
+    view   fleet  included  .1.3.6.1.2.1.2            # ifTable
+    view   fleet  included  .1.3.6.1.2.1.25           # host resources
+    view   fleet  included  .1.3.6.1.2.1.31           # ifXTable
+    view   fleet  included  .1.3.6.1.4.1.2021.13.15   # diskIO
 
-Without that the walk comes back empty and the `disk_io` key is simply dropped.
+DISKIO-MIB additionally needs an snmpd that ships the `ucd-snmp/diskio` module.
+Without it that walk comes back empty and the `disk_io` key is simply dropped.
 
 Selected by `SNMP_SIMULATE=false`.
 """
@@ -47,6 +54,7 @@ from pysnmp.hlapi.v3arch.asyncio import (
     UdpTransportTarget,
     bulk_walk_cmd,
 )
+from pysnmp.proto import errind
 
 from app.services.snmp import SnmpError
 
@@ -59,8 +67,16 @@ HR_STORAGE_ALLOCATION_UNITS = "1.3.6.1.2.1.25.2.3.1.4"
 HR_STORAGE_SIZE = "1.3.6.1.2.1.25.2.3.1.5"
 HR_STORAGE_USED = "1.3.6.1.2.1.25.2.3.1.6"
 
+HR_STORAGE_OTHER = "1.3.6.1.2.1.25.2.1.1"
 HR_STORAGE_RAM = "1.3.6.1.2.1.25.2.1.2"
 HR_STORAGE_FIXED_DISK = "1.3.6.1.2.1.25.2.1.4"
+
+# net-snmp files its extra memory readings under hrStorageOther and identifies
+# them only by description, so these strings are the whole contract. An agent
+# that names them differently falls back to the raw hrStorageUsed figure.
+MEM_AVAILABLE_DESCR = "Available memory"
+MEM_BUFFERS_DESCR = "Memory buffers"
+MEM_CACHED_DESCR = "Cached memory"
 
 # IF-MIB. The 64-bit ifXTable counters are preferred: a 32-bit octet counter
 # wraps in under a minute on a 10G link, which no polling interval can follow.
@@ -109,8 +125,57 @@ _COUNTER_TTL_SECONDS = 3600.0
 _PRUNE_EVERY_SECONDS = 300.0
 
 
+class _WalkTimeout(SnmpError):
+    """No response at all — as opposed to an answer we could not use.
+
+    Separated from the rest because it is the one failure the bulk size can do
+    something about; every other error means the agent replied.
+    """
+
+
 def _percent(used: int, total: int) -> float:
     return round(used / total * 100, 2) if total else 0.0
+
+
+def _apply_reclaimable_memory(
+    ram: dict[str, Any], memory_rows: dict[str, tuple[int, int]]
+) -> None:
+    """Restate memory usage the way the kernel does, in place.
+
+    `hrStorageUsed` for physical memory is `MemTotal - MemFree`, so every page
+    the kernel is using as page cache counts as used. On a host that has been up
+    for a while that reads as ~95% used while several hundred megabytes are in
+    fact free for the asking, which is not what the number is taken to mean.
+
+    net-snmp publishes `MemAvailable` as a separate storage row — the kernel's
+    own estimate of what a new allocation could get, cache eviction included —
+    and `total - available` is then exactly the "used" column of `free`. Where
+    that row is missing (older agents), buffers and cache are subtracted
+    directly, which is the same idea and a slightly worse estimate. Where
+    neither is there, the raw figure stands.
+
+    `used_bytes` and `used_percent` keep their names because they keep their
+    meaning; the components are added beside them so the reading can be
+    reconstructed rather than taken on faith.
+    """
+    total = ram["total_bytes"]
+    available = memory_rows.get(MEM_AVAILABLE_DESCR, (0, 0))[0]
+    buffers = memory_rows.get(MEM_BUFFERS_DESCR, (0, 0))[1]
+    cached = memory_rows.get(MEM_CACHED_DESCR, (0, 0))[1]
+
+    if available > 0:
+        used = max(0, total - available)
+    elif buffers or cached:
+        used = max(0, ram["used_bytes"] - buffers - cached)
+        available = max(0, total - used)
+    else:
+        return
+
+    ram["used_bytes"] = used
+    ram["used_percent"] = _percent(used, total)
+    ram["available_bytes"] = available
+    ram["buffers_bytes"] = buffers or None
+    ram["cached_bytes"] = cached or None
 
 
 def _counts_toward_total(device: str) -> bool:
@@ -200,6 +265,10 @@ class PySnmpSampler:
         self._context = ContextData()
         # Machine key (its MAC, not its address) -> previous counter read.
         self._counters: dict[str, _CounterState] = {}
+        # Address -> bulk size that host's path was found to tolerate. Keyed on
+        # the address rather than the MAC because it describes the network
+        # between here and there, which is what a re-IP actually changes.
+        self._repetitions: dict[str, int] = {}
         self._last_prune = time.monotonic()
         # Hosts already warned about, so a permanent condition logs once rather
         # than every interval.
@@ -207,7 +276,7 @@ class PySnmpSampler:
 
     # ---- transport ----------------------------------------------------------
 
-    async def _walk(self, target, root_oid: str) -> dict[str, Any]:
+    async def _walk_once(self, target, root_oid: str, repetitions: int) -> dict[str, Any]:
         """GETBULK-walk one column, keyed by row index (the OID suffix)."""
         values: dict[str, Any] = {}
         prefix = root_oid + "."
@@ -217,11 +286,13 @@ class PySnmpSampler:
             target,
             self._context,
             0,
-            self._max_repetitions,
+            repetitions,
             ObjectType(ObjectIdentity(root_oid)),
             lexicographicMode=False,
         ):
             if err_indication:
+                if isinstance(err_indication, errind.RequestTimedOut):
+                    raise _WalkTimeout(str(err_indication))
                 raise SnmpError(str(err_indication))
             if err_status:
                 raise SnmpError(f"{err_status.prettyPrint()} at index {err_index}")
@@ -232,18 +303,54 @@ class PySnmpSampler:
                 values[oid_str[len(prefix) :]] = value
         return values
 
-    async def _walk_all(self, target, *root_oids: str) -> list[dict[str, Any]]:
+    async def _walk(self, target, host: str, root_oid: str) -> dict[str, Any]:
+        """Walk one column, backing off the bulk size if the reply never arrives.
+
+        A response too large for the smallest MTU on the path is fragmented, and a
+        path that drops fragments — a tunnel, a NAT — turns that into a plain
+        timeout. Which tables are affected depends on the agent's data, not on its
+        configuration: the same twenty-five rows fit comfortably for one host and
+        do not for another whose mount points happen to be long.
+
+        So the size is not a constant to be guessed right once. On a timeout the
+        walk halves it and tries again, and the result is remembered for the host,
+        so the cost is paid once rather than every tick. It is never raised again
+        within the process: the condition that forced it down is a property of the
+        path, and probing for its disappearance every interval would reintroduce
+        exactly the timeout it is avoiding. A restart re-reads the configured value.
+        """
+        repetitions = self._repetitions.get(host, self._max_repetitions)
+        while True:
+            try:
+                return await self._walk_once(target, root_oid, repetitions)
+            except _WalkTimeout:
+                if repetitions <= 1:
+                    # One row per response and it still does not arrive: this is
+                    # not a size problem, so report it as the timeout it is.
+                    raise
+                repetitions = max(1, repetitions // 2)
+                self._repetitions[host] = repetitions
+                log.warning(
+                    "%s: walk of %s timed out; retrying with max-repetitions %s "
+                    "(likely an oversized response on a path that drops fragments)",
+                    host,
+                    root_oid,
+                    repetitions,
+                )
+
+    async def _walk_all(self, target, host: str, *root_oids: str) -> list[dict[str, Any]]:
         """Walk several columns at once. One round trip's latency, not N."""
         return list(
-            await asyncio.gather(*(self._walk(target, oid) for oid in root_oids))
+            await asyncio.gather(*(self._walk(target, host, oid) for oid in root_oids))
         )
 
     # ---- host resources -----------------------------------------------------
 
-    async def _host_resources(self, target) -> dict[str, Any]:
+    async def _host_resources(self, target, host: str) -> dict[str, Any]:
         """CPU load and the storage table: memory and mounted filesystems."""
         loads, types, descrs, units, sizes, used = await self._walk_all(
             target,
+            host,
             HR_PROCESSOR_LOAD,
             HR_STORAGE_TYPE,
             HR_STORAGE_DESCR,
@@ -263,6 +370,10 @@ class PySnmpSampler:
             "cores": len(cpu_values),
         }
 
+        # The memory rows net-snmp reports outside hrStorageRam, keyed by their
+        # description, so the physical-memory row can be corrected below.
+        memory_rows: dict[str, tuple[int, int]] = {}
+
         ram: dict[str, Any] = {}
         disks: list[dict[str, Any]] = []
         for index, size in sizes.items():
@@ -273,6 +384,8 @@ class PySnmpSampler:
                 continue
             storage_type = str(types.get(index, ""))
             descr = str(descrs.get(index, index))
+            if storage_type == HR_STORAGE_OTHER:
+                memory_rows[descr] = (total_bytes, used_bytes)
             if storage_type == HR_STORAGE_RAM and not ram:
                 ram = {
                     "total_bytes": total_bytes,
@@ -289,12 +402,15 @@ class PySnmpSampler:
                     }
                 )
 
+        if ram:
+            _apply_reclaimable_memory(ram, memory_rows)
+
         return {"cpu": cpu, "ram": ram, "disk": disks}
 
     # ---- network ------------------------------------------------------------
 
     async def _network(
-        self, target, now: float, state: _CounterState
+        self, target, host: str, now: float, state: _CounterState
     ) -> tuple[dict[str, Any], dict[str, tuple[int, int]]]:
         """Per-interface throughput, derived from the octet counters.
 
@@ -304,6 +420,7 @@ class PySnmpSampler:
         """
         names, types, oper, hc_in, hc_out, high_speed, speed = await self._walk_all(
             target,
+            host,
             IF_NAME,
             IF_TYPE,
             IF_OPER_STATUS,
@@ -322,7 +439,9 @@ class PySnmpSampler:
         if not hc_in:
             fallbacks.extend((IF_IN_OCTETS, IF_OUT_OCTETS))
         if fallbacks:
-            answered = dict(zip(fallbacks, await self._walk_all(target, *fallbacks)))
+            answered = dict(
+                zip(fallbacks, await self._walk_all(target, host, *fallbacks))
+            )
             names = names or answered.get(IF_DESCR, {})
             low_in = answered.get(IF_IN_OCTETS, {})
             low_out = answered.get(IF_OUT_OCTETS, {})
@@ -403,6 +522,7 @@ class PySnmpSampler:
         """
         devices, read_x, written_x, reads_c, writes_c, la1 = await self._walk_all(
             target,
+            ipv4,
             DISK_IO_DEVICE,
             DISK_IO_NREADX,
             DISK_IO_NWRITTENX,
@@ -419,7 +539,7 @@ class PySnmpSampler:
         narrow_bytes = not read_x
         if narrow_bytes:
             read_x, written_x = await self._walk_all(
-                target, DISK_IO_NREAD, DISK_IO_NWRITTEN
+                target, ipv4, DISK_IO_NREAD, DISK_IO_NWRITTEN
             )
             if ipv4 not in self._warned_diskio32:
                 self._warned_diskio32.add(ipv4)
@@ -528,8 +648,8 @@ class PySnmpSampler:
         state = self._counters.get(key) or _CounterState()
 
         tasks: list[Any] = [
-            self._host_resources(target),
-            self._network(target, now, state),
+            self._host_resources(target, ipv4),
+            self._network(target, ipv4, now, state),
         ]
         if self._diskio_enabled:
             tasks.append(self._disk_io(target, ipv4, now, state))

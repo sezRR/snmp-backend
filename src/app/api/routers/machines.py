@@ -52,27 +52,62 @@ async def register_machine(
 ) -> Machine:
     """Register a machine by address.
 
-    The MAC is resolved from OpenStack and becomes the machine's identity, so an
-    address OpenStack does not know cannot be registered.
+    For a machine in the OpenStack fleet the MAC is resolved from the lookup and
+    becomes its identity. A machine outside the fleet has no record to resolve,
+    so the client supplies the MAC and the machine is stored as external: no
+    OpenStack details on reads, and the collector will not move its address.
+
+    A supplied MAC for an address OpenStack does know must match what OpenStack
+    says, otherwise the two would disagree about what is being polled.
     """
     ipv4 = str(payload.ipv4)
+    supplied_mac = parse_mac(payload.mac) if payload.mac is not None else None
+
     try:
         server = await lookup.by_ipv4(ipv4)
     except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"openstack lookup unavailable: {exc}",
-        ) from exc
+        # Without a MAC there is nothing to register: identity comes from the
+        # lookup. With one, the client has supplied everything we need, so the
+        # outage only costs us the classification — see below.
+        if supplied_mac is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"openstack lookup unavailable: {exc}",
+            ) from exc
+        log.warning(
+            "openstack lookup unavailable (%s); registering %s as external", exc, ipv4
+        )
+        server = None
 
-    if server is None:
+    if server is None and supplied_mac is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"OpenStack has no server with address {ipv4}",
+            detail=(
+                f"OpenStack has no server with address {ipv4}; supply `mac` to "
+                "register it as a machine outside OpenStack"
+            ),
         )
 
-    mac = normalise_mac(server.mac)
+    if server is not None and supplied_mac is not None:
+        resolved = normalise_mac(server.mac)
+        if resolved != supplied_mac:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"OpenStack says address {ipv4} is {resolved}, "
+                    f"not {supplied_mac}"
+                ),
+            )
+
+    # External when OpenStack produced no record. If that was only because the
+    # lookup was down, the collector clears the flag on the first tick that
+    # resolves the MAC.
+    external = server is None
+    mac = normalise_mac(server.mac) if server is not None else supplied_mac
     try:
-        row = await db.run_query(machines_repo.insert, mac, ipv4, payload.label)
+        row = await db.run_query(
+            machines_repo.insert, mac, ipv4, payload.label, external
+        )
     except psycopg2.errors.UniqueViolation as exc:
         # The MAC is free but the address is taken — same host registered under
         # a MAC that has since changed in OpenStack.
@@ -86,7 +121,9 @@ async def register_machine(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"machine {mac} is already registered",
         )
-    log.info("registered machine %s (%s)", mac, ipv4)
+    log.info(
+        "registered %s machine %s (%s)", "external" if external else "openstack", mac, ipv4
+    )
     return Machine(**row, openstack=server)
 
 
@@ -115,14 +152,46 @@ async def get_machine(mac: str, db: DbDep, lookup: LookupDep) -> Machine:
 async def update_machine(
     mac: str, payload: MachineUpdate, db: DbDep, lookup: LookupDep
 ) -> Machine:
-    """Patch the two client-owned fields. Omitted fields are left alone."""
-    row = await db.run_query(
-        machines_repo.update,
-        parse_mac(mac),
-        payload.label,
-        payload.enabled,
-        "label" in payload.model_fields_set,
-    )
+    """Patch the client-owned fields. Omitted fields are left alone.
+
+    `ipv4` is one of them only for an external machine — nothing else knows
+    where it moved. OpenStack owns a managed machine's address and the collector
+    re-reads it every tick, so accepting a patch there would be a lie that lasts
+    one interval.
+    """
+    parsed = parse_mac(mac)
+    ipv4 = str(payload.ipv4) if payload.ipv4 is not None else None
+
+    if ipv4 is not None:
+        current = await db.run_query(machines_repo.get, parsed)
+        if current is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="unknown machine"
+            )
+        if not current["external"]:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"machine {parsed} is an OpenStack server; its address comes "
+                    "from the lookup and cannot be patched"
+                ),
+            )
+
+    try:
+        row = await db.run_query(
+            machines_repo.update,
+            parsed,
+            payload.label,
+            payload.enabled,
+            ipv4,
+            "label" in payload.model_fields_set,
+        )
+    except psycopg2.errors.UniqueViolation as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"address {ipv4} is already registered",
+        ) from exc
+
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="unknown machine")
     return await enrich(row, lookup)

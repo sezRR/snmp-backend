@@ -12,14 +12,25 @@ CREATE EXTENSION IF NOT EXISTS timescaledb;
 -- — tenant, user, flavor, specs — comes from OpenStack at read time, so there
 -- is no second copy of it to drift. `label` is the client's own annotation, not
 -- an OpenStack fact, which is why it is stored.
+--
+-- `external` marks a machine OpenStack does not know: the client supplied the
+-- MAC itself. It is stored rather than inferred from a failed lookup because
+-- the two cases need different handling — an external machine has no OpenStack
+-- record to be missing, while a managed one that stops resolving has been
+-- deleted or moved and should be reported as such.
 CREATE TABLE IF NOT EXISTS machines (
     mac        macaddr     PRIMARY KEY,
     ipv4       inet        NOT NULL,
     label      text,
     enabled    boolean     NOT NULL DEFAULT true,
+    external   boolean     NOT NULL DEFAULT false,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- For tables created before `external` existed; CREATE TABLE IF NOT EXISTS
+-- above is a no-op on them.
+ALTER TABLE machines ADD COLUMN IF NOT EXISTS external boolean NOT NULL DEFAULT false;
 
 -- One machine per address: the collector polls by IPv4.
 CREATE UNIQUE INDEX IF NOT EXISTS machines_ipv4_key ON machines (ipv4);

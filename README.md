@@ -29,10 +29,20 @@ an enabled flag. Server id, tenant, user, flavor and its specs are looked up per
 request and never persisted, so there is no second copy to drift.
 
 **MAC is identity; IPv4 is a polling address.** A client registers a machine by
-IPv4 and the backend resolves the MAC from OpenStack, so an address OpenStack
-does not know cannot be registered. Each collection cycle re-reads the address
-from the lookup, so a re-IP'd server keeps being polled. Deleting a MAC deletes
-its history.
+IPv4 and the backend resolves the MAC from OpenStack. Each collection cycle
+re-reads the address from the lookup, so a re-IP'd server keeps being polled.
+Deleting a MAC deletes its history.
+
+**Machines outside OpenStack are registered with their MAC.** An address the
+fleet does not know has no MAC to resolve, so the client supplies one and the
+row is flagged `external`: no OpenStack details on reads, and the collector
+leaves its address alone — `PATCH {ipv4}` is how an external machine moves, and
+it is rejected for a managed one, whose address the next tick would overwrite. A
+MAC supplied for an address OpenStack *does* know must agree with it. The flag
+is stored rather than inferred from a missing lookup record, because "never was
+in OpenStack" and "deleted from OpenStack after registration" are different
+answers; if such a machine later turns up in the fleet — registered external
+during a lookup outage, or imported since — the next tick clears the flag.
 
 **Metrics are one `jsonb` column.** Adding or removing a metric is a change to
 the sampler alone — no migration, no model edit, and aggregates over a metric that
@@ -73,10 +83,11 @@ rather than contradicting itself.
 
 ```sql
 CREATE TABLE machines (
-    mac        macaddr PRIMARY KEY,      -- identity, resolved from OpenStack
+    mac        macaddr PRIMARY KEY,      -- identity: from OpenStack, or client-supplied
     ipv4       inet    NOT NULL UNIQUE,  -- what the collector polls
     label      text,                     -- the client's own annotation
     enabled    boolean NOT NULL DEFAULT true,
+    external   boolean NOT NULL DEFAULT false,  -- not an OpenStack server
     ...
 );
 
@@ -101,7 +112,8 @@ A sample looks like:
 
 ```json
 {"cpu":  {"usage_percent": 22.93, "cores": 1},
- "ram":  {"total_bytes": 2147483648, "used_bytes": 727130208, "used_percent": 33.86},
+ "ram":  {"total_bytes": 2147483648, "used_bytes": 727130208, "used_percent": 33.86,
+          "available_bytes": 1420353440, "buffers_bytes": 35889152, "cached_bytes": 1121976320},
  "disk": [{"mount": "/", "total_bytes": 21474836480, "used_bytes": 8967258924, "used_percent": 41.76}],
  "disk_io": {"read_bps": 112487038.9, "write_bps": 45507872.5,
              "read_iops": 6865.7, "write_iops": 11110.3,
@@ -122,6 +134,15 @@ A sample looks like:
                              "speed_bps": 1000000000,
                              "rx_util_percent": 0.65, "tx_util_percent": 1.52}]}}
 ```
+
+`ram.used_bytes` is not the agent's own figure. `hrStorageUsed` for physical
+memory is `MemTotal - MemFree`, which counts the page cache as used and therefore
+reads as ~95% on any host that has been up long enough to fill it. The sample
+reports `total - MemAvailable` instead — the same number `free` prints under
+"used" — and carries `available_bytes`, `buffers_bytes` and `cached_bytes`
+alongside so the raw reading can be reconstructed. Agents too old to publish an
+`Available memory` row fall back to subtracting buffers and cache, and agents
+that publish neither keep the raw figure.
 
 Every rate here is one SNMP does not report: agents expose cumulative counters,
 so `rx_bps`, `read_bps`, `read_iops` and the rest are derived from the delta
@@ -148,17 +169,56 @@ same I/O two or three times, so the host totals sum only the devices marked
 named for what it is: at a five second interval it lags the rates beside it by
 design.
 
-Disk I/O needs an `snmpd` built with the `ucd-snmp/diskio` module — present in
-the Debian, Ubuntu and RHEL packages — **and** exposed, which the stock
-restrictive view does not do:
+## Configuring an agent
+
+The stock Debian/Ubuntu `snmpd.conf` exposes `system` and `hrSystem` and nothing
+else, so a machine added to the fleet without touching it answers every walk with
+an empty result — which reaches the log as `no HOST-RESOURCES-MIB rows`, not as a
+permission error. Replace the `systemonly` view and the `rocommunity` lines that
+reference it with:
 
 ```
-view   systemview  included  .1.3.6.1.4.1.2021.13.15
+view   fleet  included   .1.3.6.1.2.1.1            # system
+view   fleet  included   .1.3.6.1.2.1.2            # IF-MIB ifTable
+view   fleet  included   .1.3.6.1.2.1.25           # HOST-RESOURCES-MIB
+view   fleet  included   .1.3.6.1.2.1.31           # IF-MIB ifXTable
+view   fleet  included   .1.3.6.1.4.1.2021.13.15   # UCD DISKIO-MIB
+
+rocommunity  public default -V fleet
 ```
 
-Without that the walk returns nothing and the `disk_io` key is dropped from the
-sample; cpu, ram, disk and network are unaffected. `SNMP_DISKIO_ENABLED=false`
-skips the walk entirely for fleets that will never serve it.
+Two things that file will punish: a trailing `#` comment on a `view` line is
+parsed as the view's mask (`Error: invalid MASK`, and the line is dropped), and
+appending the new lines without deleting the old ones changes nothing, because
+the first `rocommunity` matching a community name wins. `snmpd` starts anyway
+when a line fails to parse, so check `systemctl status snmpd` for `Error:` rather
+than trusting "active (running)".
+
+`hrProcessorLoad` is empty for the first few seconds after a restart — net-snmp
+needs two reads of `/proc/stat` before it can report a load — so verify with a
+walk taken a moment later, not immediately.
+
+Disk I/O additionally needs an `snmpd` built with the `ucd-snmp/diskio` module,
+present in the Debian, Ubuntu and RHEL packages. Without it that walk returns
+nothing and the `disk_io` key is dropped from the sample; cpu, ram, disk and
+network are unaffected. `SNMP_DISKIO_ENABLED=false` skips the walk entirely for
+fleets that will never serve it.
+
+### Response size and MTU
+
+`SNMP_MAX_REPETITIONS` decides how many rows an agent packs into one GETBULK
+reply, and the ceiling on it is the path's, not SNMP's: a reply larger than the
+smallest MTU between collector and agent is fragmented, and any hop that drops
+fragments — a tunnel, a NAT out of a VM — turns that into a walk that simply
+times out. Polling over Tailscale (1280-byte MTU) from a pod, 25 rows of
+`hrStorageDescr` on a container host is already past the line, while 10 is not:
+the mount paths are long and it is the bytes, not the row count, that decide.
+
+Because that threshold is a property of the data as much as the path, the
+sampler does not rely on the setting being right. A walk that times out is
+retried with the bulk size halved, and the working value is remembered per
+address, so the cost is paid once instead of every tick. It is not raised again
+while the process lives; a restart re-reads the configured value.
 
 ## API
 
@@ -167,9 +227,9 @@ skips the walk entirely for fleets that will never serve it.
 | GET | `/` | service info and which backends are simulated |
 | GET | `/healthz` | no dependencies — backs liveness |
 | GET | `/readyz` | queries Postgres — backs readiness |
-| POST | `/machines` | `{ipv4, label?}`; 404 if OpenStack does not know the address, 409 if already registered |
-| GET | `/machines` | our rows enriched with server id, tenant, user, flavor + specs |
-| GET/PATCH/DELETE | `/machines/{mac}` | `PATCH {label?, enabled?}`; `DELETE` cascades the history |
+| POST | `/machines` | `{ipv4, mac?, label?}`; `mac` required — and only accepted — for an address OpenStack does not know; 404 without it, 409 if it disagrees with OpenStack or is already registered |
+| GET | `/machines` | our rows enriched with server id, tenant, user, flavor + specs; `external` marks the machines that have none |
+| GET/PATCH/DELETE | `/machines/{mac}` | `PATCH {label?, enabled?, ipv4?}` — `ipv4` on external machines only, 409 otherwise; `DELETE` cascades the history |
 | GET | `/metrics` | `?mac=&since=&limit=` — repeat `mac` to filter on several |
 | GET | `/metrics/latest` | most recent sample per machine |
 | GET | `/metrics/stats` | `?bucket=1 minute&hours=1&mac=` — `time_bucket` over the jsonb |
@@ -206,6 +266,7 @@ The settings worth knowing:
 | `COLLECTOR_SAMPLE_TIMEOUT_SECONDS` | 0 | Ceiling on one machine's sample; 0 derives 80% of the interval |
 | `SNMP_SIMULATE` | true | false ⇒ real pysnmp against each machine's IPv4 |
 | `SNMP_DISKIO_ENABLED` | true | ~6 extra walks per machine; needs the diskio view above |
+| `SNMP_MAX_REPETITIONS` | 10 | Rows per GETBULK reply. Lower it for agents behind a small-MTU path — see below |
 | `METRICS_COMPRESS_AFTER_HOURS` | 24 | 0 disables. TimescaleDB columnar compression |
 | `METRICS_RETENTION_DAYS` | 30 | 0 disables. Chunks older than this are dropped |
 | `OPENSTACK_SIMULATE` | true | false ⇒ needs `openstacksdk` and a real adapter |
@@ -353,6 +414,11 @@ curl -s http://localhost/api/admin/openstack/servers
 curl -s -X POST http://localhost/api/machines \
   -H 'content-type: application/json' \
   -d '{"ipv4":"10.0.0.11","label":"web-1"}'
+
+# a machine outside OpenStack: no record to resolve, so give the MAC
+curl -s -X POST http://localhost/api/machines \
+  -H 'content-type: application/json' \
+  -d '{"ipv4":"192.168.1.50","mac":"de:ad:be:ef:00:01","label":"nas"}'
 
 curl -s http://localhost/api/machines               # rows + OpenStack details
 curl -s 'http://localhost/api/metrics?limit=5'

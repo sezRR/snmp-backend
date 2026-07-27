@@ -60,6 +60,14 @@ class Settings(BaseSettings):
     # sample budget a 5 second interval derives.
     snmp_timeout_seconds: float = 1.5
     snmp_retries: int = 1
+    # Rows an agent may pack into one GETBULK response. The ceiling is not SNMP's
+    # but the path's: a response larger than the smallest MTU between here and the
+    # agent is fragmented, and a fragment lost to a NAT or a tunnel takes the whole
+    # response with it — the walk simply times out. Twenty-five rows of a table
+    # with long string columns (hrStorageDescr on a container host) is enough to
+    # cross that line over a 1280-byte tunnel, so the default is deliberately low.
+    # The sampler halves it per agent whenever a walk times out anyway.
+    snmp_max_repetitions: int = 10
     # DISKIO-MIB costs about six extra walks per machine and needs an snmpd that
     # both ships the diskio module and exposes 1.3.6.1.4.1.2021.13.15 in its
     # view. Turn it off for agents that have neither.

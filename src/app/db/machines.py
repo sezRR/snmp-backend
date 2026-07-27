@@ -9,19 +9,24 @@ from __future__ import annotations
 
 from typing import Any
 
-_COLUMNS = "mac::text AS mac, host(ipv4) AS ipv4, label, enabled, created_at, updated_at"
+_COLUMNS = (
+    "mac::text AS mac, host(ipv4) AS ipv4, label, enabled, external, "
+    "created_at, updated_at"
+)
 
 
-def insert(cur, mac: str, ipv4: str, label: str | None) -> dict[str, Any] | None:
+def insert(
+    cur, mac: str, ipv4: str, label: str | None, external: bool = False
+) -> dict[str, Any] | None:
     """Register a machine. Returns None when the MAC is already registered."""
     cur.execute(
         f"""
-        INSERT INTO machines (mac, ipv4, label)
-        VALUES (%s, %s, %s)
+        INSERT INTO machines (mac, ipv4, label, external)
+        VALUES (%s, %s, %s, %s)
         ON CONFLICT (mac) DO NOTHING
         RETURNING {_COLUMNS}
         """,
-        (mac, ipv4, label),
+        (mac, ipv4, label, external),
     )
     return cur.fetchone()
 
@@ -54,23 +59,26 @@ def update(
     mac: str,
     label: str | None,
     enabled: bool | None,
+    ipv4: str | None,
     label_given: bool,
 ) -> dict[str, Any] | None:
-    """Patch label and/or enabled.
+    """Patch label, enabled and/or ipv4.
 
     `label_given` distinguishes "set the label to null" from "leave it alone",
-    which a nullable value alone cannot express.
+    which a nullable value alone cannot express. The caller decides whether an
+    address patch is allowed — that depends on who owns the address.
     """
     cur.execute(
         f"""
         UPDATE machines
         SET label      = CASE WHEN %s THEN %s ELSE label END,
             enabled    = COALESCE(%s, enabled),
+            ipv4       = COALESCE(%s, ipv4),
             updated_at = now()
         WHERE mac = %s
         RETURNING {_COLUMNS}
         """,
-        (label_given, label, enabled, mac),
+        (label_given, label, enabled, ipv4, mac),
     )
     return cur.fetchone()
 
@@ -87,6 +95,21 @@ def set_ipv4(cur, mac: str, ipv4: str) -> dict[str, Any] | None:
         (ipv4, mac, ipv4),
     )
     return cur.fetchone()
+
+
+def mark_managed(cur, mac: str) -> bool:
+    """Clear the external flag once OpenStack turns out to know the MAC.
+
+    A machine registered as external while the lookup was unavailable, or one
+    later imported into the fleet, would otherwise keep claiming to be outside
+    OpenStack while its record is right there.
+    """
+    cur.execute(
+        "UPDATE machines SET external = false, updated_at = now() "
+        "WHERE mac = %s AND external",
+        (mac,),
+    )
+    return cur.rowcount > 0
 
 
 def delete(cur, mac: str) -> bool:
