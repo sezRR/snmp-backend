@@ -37,6 +37,17 @@ class MetricStatsRow(BaseModel):
     net_rx_bps_max: float | None = None
     net_tx_bps_avg: float | None = None
     net_tx_bps_max: float | None = None
+    # Disk throughput in bytes per second and IOPS in operations per second,
+    # summed across the machine's real block devices. Null for a bucket whose
+    # samples predate the metric or whose agent serves no DISKIO-MIB.
+    disk_read_bps_avg: float | None = None
+    disk_read_bps_max: float | None = None
+    disk_write_bps_avg: float | None = None
+    disk_write_bps_max: float | None = None
+    disk_read_iops_avg: float | None = None
+    disk_read_iops_max: float | None = None
+    disk_write_iops_avg: float | None = None
+    disk_write_iops_max: float | None = None
 
 
 class PurgeResult(BaseModel):

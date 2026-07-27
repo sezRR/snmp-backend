@@ -40,8 +40,15 @@ class Settings(BaseSettings):
 
     # ---- Collector ----------------------------------------------------------
     collector_enabled: bool = True
-    collector_interval_seconds: float = 15.0
-    collector_concurrency: int = 10
+    collector_interval_seconds: float = 5.0
+    # Gates SNMP calls only, not database connections: a tick issues two or three
+    # queries in total regardless of how many machines it samples, so this is
+    # sized against the fleet and the interval, not against `db_pool_max`.
+    collector_concurrency: int = 32
+    # Wall-clock ceiling on one machine's sample, so a slow agent can never hold
+    # a concurrency slot for longer than the interval. 0 derives it from the
+    # interval, which is the sane default; set it explicitly to override.
+    collector_sample_timeout_seconds: float = 0.0
 
     # ---- SNMP ---------------------------------------------------------------
     # With no real SNMP agents around, the simulator is the default. Flipping
@@ -49,8 +56,22 @@ class Settings(BaseSettings):
     snmp_simulate: bool = True
     snmp_community: str = "public"
     snmp_port: int = 161
-    snmp_timeout_seconds: float = 2.0
+    # Worst case per machine is timeout * (retries + 1) = 3.0s, inside the 4.0s
+    # sample budget a 5 second interval derives.
+    snmp_timeout_seconds: float = 1.5
     snmp_retries: int = 1
+    # DISKIO-MIB costs about six extra walks per machine and needs an snmpd that
+    # both ships the diskio module and exposes 1.3.6.1.4.1.2021.13.15 in its
+    # view. Turn it off for agents that have neither.
+    snmp_diskio_enabled: bool = True
+
+    # ---- Metric retention ----------------------------------------------------
+    # Applied as TimescaleDB background jobs by `app.db.init`. Either at 0
+    # disables that policy and leaves the data alone. Compression works on
+    # batches of up to a thousand rows, so the ratio it achieves depends on how
+    # full a chunk is — a busy day compresses far better than a quiet one.
+    metrics_compress_after_hours: float = 24.0
+    metrics_retention_days: float = 30.0
 
     # ---- OpenStack ----------------------------------------------------------
     # Only the simulated lookup ships today; the real client goes behind the

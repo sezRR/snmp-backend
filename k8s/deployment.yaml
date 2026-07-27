@@ -19,7 +19,7 @@ spec:
         runAsUser: 1000
       containers:
         - name: fastapi
-          image: fastapi-demo:0.5.2
+          image: fastapi-demo:0.6.0
           # The image is built by the local Docker daemon, which OrbStack's
           # Kubernetes shares. Nothing is ever pulled from a registry.
           imagePullPolicy: IfNotPresent
@@ -61,11 +61,16 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 10
           resources:
+            # Sized for the collector rather than for request traffic: a tick
+            # every 5 seconds sampling up to 32 machines at once, each sample
+            # parsed out of SNMP varbinds and serialised to jsonb, is the steady
+            # load here. Memory holds the per-machine counter baselines and one
+            # SSE queue per subscriber.
             requests:
-              cpu: 50m
-              memory: 64Mi
+              cpu: 200m
+              memory: 128Mi
             limits:
-              memory: 256Mi
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

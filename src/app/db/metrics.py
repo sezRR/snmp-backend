@@ -85,7 +85,17 @@ def stats(
             avg((m.metrics->'network'->>'rx_bps')::double precision)    AS net_rx_bps_avg,
             max((m.metrics->'network'->>'rx_bps')::double precision)    AS net_rx_bps_max,
             avg((m.metrics->'network'->>'tx_bps')::double precision)    AS net_tx_bps_avg,
-            max((m.metrics->'network'->>'tx_bps')::double precision)    AS net_tx_bps_max
+            max((m.metrics->'network'->>'tx_bps')::double precision)    AS net_tx_bps_max,
+            -- disk_io totals are scalars on the object, unlike the per-mount
+            -- `disk` array above, so they need no lateral.
+            avg((m.metrics->'disk_io'->>'read_bps')::double precision)   AS disk_read_bps_avg,
+            max((m.metrics->'disk_io'->>'read_bps')::double precision)   AS disk_read_bps_max,
+            avg((m.metrics->'disk_io'->>'write_bps')::double precision)  AS disk_write_bps_avg,
+            max((m.metrics->'disk_io'->>'write_bps')::double precision)  AS disk_write_bps_max,
+            avg((m.metrics->'disk_io'->>'read_iops')::double precision)  AS disk_read_iops_avg,
+            max((m.metrics->'disk_io'->>'read_iops')::double precision)  AS disk_read_iops_max,
+            avg((m.metrics->'disk_io'->>'write_iops')::double precision) AS disk_write_iops_avg,
+            max((m.metrics->'disk_io'->>'write_iops')::double precision) AS disk_write_iops_max
         FROM metrics AS m
         {_DISK_LATERAL}
         WHERE m.ts > now() - (%(hours)s::double precision * INTERVAL '1 hour')

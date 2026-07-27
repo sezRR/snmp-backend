@@ -73,6 +73,10 @@ class Collector:
         self._bus = bus
         self._task: asyncio.Task[None] | None = None
         self._semaphore = asyncio.Semaphore(settings.collector_concurrency)
+        # The loop and POST /admin/collector/tick both call `tick()`. Two ticks
+        # running at once would interleave their reads of the same counter
+        # baselines and derive nonsense rates from them.
+        self._tick_lock = asyncio.Lock()
 
         # Observability, all in memory.
         self.started_at: datetime | None = None
@@ -82,7 +86,26 @@ class Collector:
         self.last_inserted = 0
         self.last_failed = 0
         self.last_tick_error: str | None = None
+        self.overrun_count = 0
+        # Smoothed tick-to-tick spacing. The configured interval is what we ask
+        # for; this is what the loop actually achieves, and they diverge as soon
+        # as a tick outruns its period.
+        self.effective_interval: float | None = None
+        self._last_tick_started: float | None = None
         self.statuses: dict[str, MachineStatus] = {}
+
+    @property
+    def _sample_budget(self) -> float:
+        """Wall-clock ceiling on one machine's sample.
+
+        Bounds the tick regardless of how the sampler spends its time — SNMP
+        timeouts, retries and DNS all sit underneath it. Defaults to most of the
+        interval, so a slot is never held across a whole period.
+        """
+        configured = self._settings.collector_sample_timeout_seconds
+        if configured > 0:
+            return configured
+        return max(1.0, self._settings.collector_interval_seconds * 0.8)
 
     # ---- lifecycle ----------------------------------------------------------
 
@@ -116,9 +139,20 @@ class Collector:
     # ---- loop ---------------------------------------------------------------
 
     async def _run(self) -> None:
-        interval = self._settings.collector_interval_seconds
         while True:
+            # Read fresh each pass rather than binding it once for the lifetime
+            # of the process, so the value cannot go stale behind a reload.
+            interval = self._settings.collector_interval_seconds
             started = time.monotonic()
+            if self._last_tick_started is not None:
+                spacing = started - self._last_tick_started
+                self.effective_interval = (
+                    spacing
+                    if self.effective_interval is None
+                    else round(0.8 * self.effective_interval + 0.2 * spacing, 3)
+                )
+            self._last_tick_started = started
+
             try:
                 await self.tick()
                 self.last_tick_error = None
@@ -131,11 +165,34 @@ class Collector:
                 log.exception("collector tick failed")
             elapsed = time.monotonic() - started
             self.last_tick_duration = elapsed
+
+            if elapsed > interval:
+                # Without this the loop just runs back to back and every status
+                # reading still claims the configured interval. Say so instead:
+                # the cadence is now whatever the tick costs.
+                self.overrun_count += 1
+                log.warning(
+                    "collector tick took %.2fs, longer than the %.2fs interval "
+                    "(%s machines, %s failed) — cadence is degraded",
+                    elapsed,
+                    interval,
+                    self.last_inserted + self.last_failed,
+                    self.last_failed,
+                )
             # Subtract the work from the period so the cadence does not drift.
             await asyncio.sleep(max(0.0, interval - elapsed))
 
     async def tick(self) -> int:
         """One collection round. Returns how many samples were stored."""
+        async with self._tick_lock:
+            return await self._tick()
+
+    @property
+    def ticking(self) -> bool:
+        """Whether a round is in flight, so a forced tick can decline instead."""
+        return self._tick_lock.locked()
+
+    async def _tick(self) -> int:
         self.tick_count += 1
         self.last_tick_at = datetime.now(timezone.utc)
 
@@ -195,7 +252,25 @@ class Collector:
         status = self.statuses.setdefault(mac, MachineStatus(mac))
         async with self._semaphore:
             try:
-                metrics = await self._sampler.sample(ipv4)
+                # The MAC, not the address, is what the sampler remembers
+                # counter baselines under: OpenStack may re-IP a machine between
+                # two ticks and its history should survive that.
+                metrics = await asyncio.wait_for(
+                    self._sampler.sample(ipv4, mac), timeout=self._sample_budget
+                )
+            except asyncio.TimeoutError:
+                # Recorded like any other failure. The point is the slot: a host
+                # that never answers must not hold one for a whole period.
+                status.fail_count += 1
+                status.last_error = f"TimeoutError: no sample within {self._sample_budget:.1f}s"
+                status.last_error_at = datetime.now(timezone.utc)
+                log.warning(
+                    "sample timed out for %s (%s) after %.1fs",
+                    mac,
+                    ipv4,
+                    self._sample_budget,
+                )
+                return None
             except Exception as exc:
                 status.fail_count += 1
                 status.last_error = f"{type(exc).__name__}: {exc}"
@@ -213,6 +288,11 @@ class Collector:
             "enabled": self._settings.collector_enabled,
             "running": self.running,
             "interval_seconds": self._settings.collector_interval_seconds,
+            # What the loop is actually achieving, which is the number worth
+            # watching: it only matches the configured interval while ticks fit.
+            "effective_interval_seconds": self.effective_interval,
+            "overrun_count": self.overrun_count,
+            "sample_budget_seconds": self._sample_budget,
             "concurrency": self._settings.collector_concurrency,
             "snmp_simulated": self._settings.snmp_simulate,
             "started_at": self.started_at,

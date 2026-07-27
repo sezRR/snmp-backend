@@ -38,6 +38,24 @@ CREATE TABLE IF NOT EXISTS metrics (
 
 SELECT create_hypertable('metrics', by_range('ts'), if_not_exists => TRUE);
 
+-- One chunk per day rather than the seven-day default. At a five second
+-- interval a fleet in the hundreds writes millions of rows a day, so weekly
+-- chunks would be both unwieldy to compress and coarse to drop: `purge_all`
+-- and the retention policy are chunk-granular, and a chunk straddling the
+-- cutoff is kept whole.
+SELECT set_chunk_time_interval('metrics', INTERVAL '1 day');
+
+-- Columnar compression. Segmenting by mac keeps one machine's history
+-- contiguous, which is how every query reads it; ordering by ts descending
+-- matches both the index below and the "most recent first" access pattern.
+-- Declaring this is separate from scheduling it — `app.db.init` adds the
+-- policy, because when to compress is a setting.
+ALTER TABLE metrics SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'mac',
+    timescaledb.compress_orderby   = 'ts DESC'
+);
+
 CREATE INDEX IF NOT EXISTS metrics_mac_ts_idx ON metrics (mac, ts DESC);
 
 -- Supports containment/existence queries into the jsonb payload, e.g. finding

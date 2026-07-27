@@ -1,8 +1,8 @@
 # k8s-local-image-deployment
 
-An SNMP metrics backend: FastAPI polls cpu/ram/disk/network from a client-controlled set
-of machines every 15 seconds, stores the samples in TimescaleDB, and streams them
-live over SSE. It runs on a local OrbStack Kubernetes cluster with no container
+An SNMP metrics backend: FastAPI polls cpu, ram, disk capacity, disk throughput
+and IOPS, and network from a client-controlled set of machines every 5 seconds,
+stores the samples in TimescaleDB, and streams them live over SSE. It runs on a local OrbStack Kubernetes cluster with no container
 registry involved at any point, behind Traefik — HTTP under `/api`, raw Postgres
 over an `IngressRouteTCP`.
 
@@ -103,21 +103,62 @@ A sample looks like:
 {"cpu":  {"usage_percent": 22.93, "cores": 1},
  "ram":  {"total_bytes": 2147483648, "used_bytes": 727130208, "used_percent": 33.86},
  "disk": [{"mount": "/", "total_bytes": 21474836480, "used_bytes": 8967258924, "used_percent": 41.76}],
+ "disk_io": {"read_bps": 112487038.9, "write_bps": 45507872.5,
+             "read_iops": 6865.7, "write_iops": 11110.3,
+             "read_bytes": 1450273321378, "write_bytes": 1853005660426,
+             "reads": 173272109, "writes": 193994381,
+             "interval_seconds": 4.998,
+             "devices": [{"device": "vda",
+                          "read_bps": 112487038.9, "write_bps": 45507872.5,
+                          "read_iops": 6865.7, "write_iops": 11110.3,
+                          "read_bytes": 1450273321378, "write_bytes": 1853005660426,
+                          "reads": 173272109, "writes": 193994381,
+                          "busy_percent_1min": 30.14, "counted": true}]},
  "network": {"rx_bps": 812344.5, "tx_bps": 1904771.2,
              "rx_bytes": 402653184000, "tx_bytes": 915678412000,
-             "interval_seconds": 15.02,
+             "interval_seconds": 5.02,
              "interfaces": [{"name": "eth0", "rx_bps": 812344.5, "tx_bps": 1904771.2,
                              "rx_bytes": 402653184000, "tx_bytes": 915678412000,
                              "speed_bps": 1000000000,
                              "rx_util_percent": 0.65, "tx_util_percent": 1.52}]}}
 ```
 
-Bandwidth is a rate SNMP does not report: agents expose cumulative octet
-counters, so `rx_bps`/`tx_bps` are **bytes per second** derived from the delta
-against the previous sample of that host. They are null on the first sample
-after a restart, and on a counter that reset in between — the raw
-`rx_bytes`/`tx_bytes` counters are stored alongside so any window can be
-recomputed from history. Loopback and down interfaces are excluded.
+Every rate here is one SNMP does not report: agents expose cumulative counters,
+so `rx_bps`, `read_bps`, `read_iops` and the rest are derived from the delta
+against the previous sample of that machine. Throughput is **bytes** per second
+and IOPS is **operations** per second. They are null on the first sample after a
+restart, and on a counter that reset in between — the raw counters are stored
+alongside so any window can be recomputed from history. Loopback and down
+interfaces are excluded.
+
+### Disk capacity vs disk I/O
+
+`disk` and `disk_io` are separate keys because they are indexed differently and
+nothing joins them. Capacity comes from `hrStorageTable`, one row per **mount
+point**; throughput comes from `diskIOTable`, one row per **block device**. On
+LVM, RAID or any multi-mount device the mapping between the two is many-to-many,
+so folding them into one array would mean inventing a device for each mount.
+
+The kernel reports both a device-mapper device and the disk underneath it, and
+both a partition and its whole disk. Summing every row would therefore count the
+same I/O two or three times, so the host totals sum only the devices marked
+`counted`; the others still appear in `devices` with their own rates.
+
+`busy_percent_1min` is `diskIOLA1`, which the agent averages over a minute. It is
+named for what it is: at a five second interval it lags the rates beside it by
+design.
+
+Disk I/O needs an `snmpd` built with the `ucd-snmp/diskio` module — present in
+the Debian, Ubuntu and RHEL packages — **and** exposed, which the stock
+restrictive view does not do:
+
+```
+view   systemview  included  .1.3.6.1.4.1.2021.13.15
+```
+
+Without that the walk returns nothing and the `disk_io` key is dropped from the
+sample; cpu, ram, disk and network are unaffected. `SNMP_DISKIO_ENABLED=false`
+skips the walk entirely for fleets that will never serve it.
 
 ## API
 
@@ -138,7 +179,7 @@ recomputed from history. Loopback and down interfaces are excluded.
 | DELETE | `/machines/{mac}/metrics` | purge one machine's history, `?before=` for a range |
 | DELETE | `/metrics` | purge everything; **requires `?confirm=true`**. `?before=` drops whole chunks instead |
 | GET | `/admin/collector` | loop health and per-machine ok/fail counts |
-| POST | `/admin/collector/tick` | run one round now instead of waiting |
+| POST | `/admin/collector/tick` | run one round now instead of waiting; 409 if one is already running |
 | GET | `/admin/openstack/cache` | ttl, age, hits, misses, refreshes |
 | GET | `/admin/openstack/servers` | the fleet as cached — the registerable addresses |
 | POST | `/admin/openstack/cache/flush` | drop the cache; next read repopulates |
@@ -160,22 +201,71 @@ The settings worth knowing:
 
 | Setting | Default | Why it matters |
 | --- | --- | --- |
-| `COLLECTOR_INTERVAL_SECONDS` | 15 | Poll period; the loop subtracts its own runtime so the cadence does not drift |
-| `COLLECTOR_CONCURRENCY` | 10 | Machines sampled in parallel; keep `DB_POOL_MAX` above it |
+| `COLLECTOR_INTERVAL_SECONDS` | 5 | Poll period; the loop subtracts its own runtime so the cadence does not drift |
+| `COLLECTOR_CONCURRENCY` | 32 | Machines sampled in parallel. Bounds SNMP calls, not queries — see below |
+| `COLLECTOR_SAMPLE_TIMEOUT_SECONDS` | 0 | Ceiling on one machine's sample; 0 derives 80% of the interval |
 | `SNMP_SIMULATE` | true | false ⇒ real pysnmp against each machine's IPv4 |
+| `SNMP_DISKIO_ENABLED` | true | ~6 extra walks per machine; needs the diskio view above |
+| `METRICS_COMPRESS_AFTER_HOURS` | 24 | 0 disables. TimescaleDB columnar compression |
+| `METRICS_RETENTION_DAYS` | 30 | 0 disables. Chunks older than this are dropped |
 | `OPENSTACK_SIMULATE` | true | false ⇒ needs `openstacksdk` and a real adapter |
 | `OPENSTACK_CACHE_TTL_SECONDS` | 300 | How stale a tenant/flavor read may be |
 | `DB_AUTO_INIT` | true | Apply `schema.sql` on startup |
 | `ROOT_PATH` | `/api` in-cluster | Must match the IngressRoute path and its StripPrefix |
 
+### Holding the cadence
+
+A short interval is a claim about what the loop can finish, not a setting that
+makes it so. Three things keep the claim honest:
+
+**The walks run concurrently.** A machine's sample touches nineteen or so MIB
+columns. Walked one after another that is nineteen round trips, and a fleet in
+the hundreds cannot be polled every five seconds no matter how the concurrency is
+tuned. The three tables are walked at once, and the columns within each table
+too, so a sample costs about one round trip's latency rather than nineteen.
+
+**Every sample has a deadline.** `COLLECTOR_SAMPLE_TIMEOUT_SECONDS` bounds one
+machine's sample in wall-clock time, whatever the SNMP timeout and retry settings
+add up to underneath. A host that never answers is recorded as a failure and
+releases its concurrency slot; it cannot hold one across a whole period.
+
+**Overruns are reported, not hidden.** The loop sleeps for whatever is left of
+the period, so a tick that outruns its interval simply runs back-to-back and the
+real cadence silently becomes the tick duration. When that happens it now logs a
+warning and increments `overrun_count`, and `GET /admin/collector` reports
+`effective_interval_seconds` — the spacing the loop is actually achieving —
+beside the `interval_seconds` it was asked for. Those two diverging is the signal
+to raise `COLLECTOR_CONCURRENCY` or lengthen the interval.
+
+`POST /admin/collector/tick` returns **409** while a round is in flight. Two
+rounds at once would read the same counter baselines milliseconds apart and every
+rate in the second one would be noise.
+
+### Retention
+
+At a five second interval a machine writes 17,280 samples a day, so a fleet in
+the hundreds writes millions of rows and gigabytes of jsonb a day. `app.db.init`
+therefore schedules two TimescaleDB jobs on the hypertable — compression after
+`METRICS_COMPRESS_AFTER_HOURS`, dropping chunks after `METRICS_RETENTION_DAYS` —
+and chunks are one day rather than the seven-day default, since both policies and
+`DELETE /metrics?before=` are chunk-granular.
+
+The policies live in `init.py` rather than `schema.sql` because both windows are
+settings: they are removed and re-added on every startup, so changing the setting
+changes the policy instead of being ignored in favour of whatever was installed
+first.
+
 ### psycopg2 under async endpoints
 
 Endpoints are `async def` and psycopg2 is synchronous, so every query runs through
 Starlette's worker threadpool around a pooled connection — the event loop never
-blocks. Two consequences: `DB_POOL_MAX` must exceed `COLLECTOR_CONCURRENCY` plus
-request headroom, and AnyIO's default 40 worker threads cap how many queries can
-be in flight regardless of pool size. An async driver would remove both limits;
-psycopg2 is the deliberate choice here, per the TigerData Python quickstart.
+blocks. `DB_POOL_MAX` is sized for request handlers, and AnyIO's default 40 worker
+threads cap how many queries can be in flight regardless of pool size. It does
+**not** need to exceed `COLLECTOR_CONCURRENCY`: that semaphore bounds SNMP calls,
+and a tick issues two or three queries in total — list the machines, one batched
+insert — however many machines it samples. An async driver would remove the
+threadpool limit; psycopg2 is the deliberate choice here, per the TigerData Python
+quickstart.
 
 ## Build
 

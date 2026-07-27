@@ -14,21 +14,30 @@ data:
   LOG_LEVEL: INFO
 
   DB_POOL_MIN: "1"
-  # Keep above COLLECTOR_CONCURRENCY so polling cannot starve request handlers.
+  # Sized for request handlers plus the two or three queries a tick issues.
+  # Unrelated to COLLECTOR_CONCURRENCY, which bounds SNMP calls, not queries.
   DB_POOL_MAX: "16"
   DB_AUTO_INIT: "true"
 
   COLLECTOR_ENABLED: "true"
-  COLLECTOR_INTERVAL_SECONDS: "15"
-  COLLECTOR_CONCURRENCY: "10"
+  COLLECTOR_INTERVAL_SECONDS: "5"
+  COLLECTOR_CONCURRENCY: "32"
+  # 0 derives the per-machine ceiling from the interval.
+  COLLECTOR_SAMPLE_TIMEOUT_SECONDS: "0"
 
   # No real SNMP agents on this cluster; the simulator produces the same
   # payload shape. Set to false to poll the machines' real IPv4 addresses.
   SNMP_SIMULATE: "true"
   SNMP_COMMUNITY: public
   SNMP_PORT: "161"
-  SNMP_TIMEOUT_SECONDS: "2.0"
+  SNMP_TIMEOUT_SECONDS: "1.5"
   SNMP_RETRIES: "1"
+  SNMP_DISKIO_ENABLED: "true"
+
+  # Compression and retention on the metrics hypertable. At a five second
+  # interval an unbounded history is measured in gigabytes per day.
+  METRICS_COMPRESS_AFTER_HOURS: "24"
+  METRICS_RETENTION_DAYS: "30"
 
   # Likewise for OpenStack: a fake fleet stands in for openstack.connect().
   OPENSTACK_SIMULATE: "true"
