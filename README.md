@@ -71,6 +71,10 @@ rather than contradicting itself.
 | `src/app/services/bus.py` | In-process pub/sub feeding SSE |
 | `src/app/api/routers/` | health, machines, metrics, stream, admin |
 | `.env.example` | Every setting with defaults; `.env` is git- and docker-ignored |
+| `compose.yaml` | Both processes on one host: the deployable shape |
+| `compose.override.yaml` | Development overlay — bind mount, `--reload`, published database |
+| `scripts/seed_dev.py` | Registers the simulated fleet against a running API |
+| `Makefile` | `up`, `seed`, `psql`, `logs`, `clean` for the Compose stack |
 | `k8s/timescaledb-*.yaml` | PVC, Secret, StatefulSet, Service |
 | `k8s/app-config.yaml` | Non-secret settings as a ConfigMap |
 | `k8s/deployment.yaml`, `k8s/service.yaml` | The app |
@@ -328,19 +332,158 @@ insert — however many machines it samples. An async driver would remove the
 threadpool limit; psycopg2 is the deliberate choice here, per the TigerData Python
 quickstart.
 
-## Build
+## Local development
+
+Kubernetes is how this is deployed, not how it is developed: a code change there
+costs a build, a tag bump and a rollout. Compose runs the same two processes with
+the source mounted, so a save reloads the server.
 
 ```bash
-docker build -t fastapi-demo:0.4.0 .
+make up      # build, start, wait until /readyz answers
+make seed    # register the simulated OpenStack fleet
+make smoke   # readyz, machines, collector status
+open http://localhost:8000/docs
 ```
 
-Locally, against a throwaway database:
+Without `make`, that is `docker compose up -d --build --wait` and
+`docker compose --profile seed run --rm seed`. Requires Compose v2.24 or newer.
+
+`compose.yaml` holds the stack; `compose.override.yaml`, which Compose loads
+automatically, is what makes it a development environment:
+
+| | `docker compose up` | `docker compose -f compose.yaml up` |
+| --- | --- | --- |
+| Source | `./src` mounted read-only over the image's copy, `uvicorn --reload` | Baked into the image |
+| Database port | published on `127.0.0.1:15432` | not published |
+| SNMP / OpenStack | simulated | whatever `.env` says |
+| Restart policy | none | `unless-stopped` |
+| Root filesystem | writable | read-only, `cap_drop: ALL` |
+
+Both build the tag in `APP_VERSION`, which the Makefile derives from
+`src/app/__init__.py` — see [Build](#build). Invoked without `make`, and with no
+`APP_VERSION` set, they build `fastapi-demo:dev` instead, so a bare
+`docker compose build` can never land on the tag the cluster is pinned to.
+
+An empty `machines` table is why a fresh stack looks broken — the collector ticks
+against nothing and every endpoint returns `[]`. `make seed` registers the six
+hosts `app/services/openstack/simulated.py` serves, by address only, so their
+MACs and flavors come from the lookup exactly as a real machine's would.
+
+The rest:
 
 ```bash
-docker run -d --name tsdb -e POSTGRES_DB=app -e POSTGRES_USER=app \
-  -e POSTGRES_PASSWORD=smoke -p 15499:5432 timescale/timescaledb:2.22.1-pg17
-cp .env.example .env      # then set PGPORT=15499, PGPASSWORD=smoke
+make logs      # follow the app
+make psql      # psql inside the database container
+make down      # stop, keep the data
+make clean     # stop and delete the volume
+```
+
+The database is on `127.0.0.1:15432` for host tools — 15432 rather than 5432 so
+it never collides with the cluster's `IngressRouteTCP`, which already owns the
+Mac's 5432, and loopback-only because OrbStack publishes on every interface and
+that password is committed in plaintext. Running uvicorn on the host against it
+still works, and is the faster loop for debugger work:
+
+```bash
+cp .env.example .env      # then set PGPORT=15432
 PYTHONPATH=src uv run uvicorn app.main:app --port 8099
+```
+
+Dependency changes are the one thing a save cannot pick up, since they live in
+the image: `make build`, or `make watch` to have Compose rebuild whenever
+`pyproject.toml` or `uv.lock` changes.
+
+### Where the settings come from
+
+Compose reads `.env` twice — once to expand `${...}` in the YAML, once as the
+api container's env file — and the file is optional, so a clean checkout starts
+without one. The three variables that describe container topology rather than
+preference (`PGHOST`, `PGPORT`, `ROOT_PATH`) are pinned under `environment:` in
+`compose.yaml`, because a `.env` written for host-run uvicorn says
+`PGHOST=localhost` and `PGPORT=15432`, which would send the container to itself.
+Everything else falls through to `.env` and then to the defaults in
+`src/app/config.py`.
+
+Real SNMP polling from Compose needs one more thing than `SNMP_SIMULATE=false`:
+a route from the container to the agents. A Tailscale address that resolves on
+the Mac does not automatically resolve inside a bridge-network container, which
+is the same reason the cluster's polling is verified from inside the pod rather
+than from the host.
+
+### Can this deploy the app too?
+
+It can, on a single host, and `compose.yaml` alone is written to be that shape —
+that is why the dev conveniences are quarantined in the override rather than
+sprinkled through the base file. On a machine that is not a laptop:
+
+```bash
+docker compose -f compose.yaml up -d --build --wait
+```
+
+What you keep: identical images, pinned database version, health-gated startup
+ordering, restart-on-failure, a named volume, a read-only root filesystem and
+dropped capabilities. Which is close to feature parity with what `k8s/` actually
+provides here, because that cluster is a single node with a single replica and a
+standalone PVC — there is no HA to lose.
+
+What you give up, and what to weigh it against:
+
+* **No rolling update.** `compose up` stops the old container before starting the
+  new one, so a deploy is a few seconds of downtime; `kubectl rollout` gates the
+  new pod on its probes and never drops the old one until it passes. With
+  `replicas: 1` and a collector that resumes on the next tick, that gap is
+  cheap — but it is a real difference, and a `--wait` failure leaves you rolling
+  back by hand.
+* **No ingress, no TLS.** The app is published straight on a host port. The
+  Traefik `IngressRoute`, its `StripPrefix` middleware and the `ROOT_PATH=/api`
+  that pairs with it have no equivalent here; a Compose deployment behind a
+  reverse proxy has to reproduce both.
+* **Secrets are environment variables.** `PGPASSWORD` comes from `.env` on disk
+  next to the compose file, visible in `docker inspect`. A Secret is not much
+  better, but it is at least a separate object with its own access path.
+* **Two places to change a setting.** `k8s/app-config.yaml` and `.env` describe
+  the same `Settings`, and nothing keeps them in step. This is the maintenance
+  cost of having both, and the reason not to grow a third.
+
+The recommendation is to treat `k8s/` as the deployment target of record and
+Compose as the development environment, with single-host Compose deployment as a
+deliberate fallback rather than a parallel path — because keeping two full
+deployment stories honest costs more than either is worth here. Do not try to
+generate one from the other (`kompose` and friends): the manifests encode
+things Compose cannot express, such as the `startupProbe` that keeps a slow
+database from restart-looping the app, and the deliberate `secretKeyRef` that
+keeps `PGHOST` out of the database container.
+
+## Build
+
+The version lives in exactly one place — `src/app/__init__.py`, which is also
+what the running app reports from `GET /` — and the image tag is derived from it:
+
+```bash
+make version   # 0.6.2  ->  fastapi-demo:0.6.2
+make build     # docker compose build, tagged fastapi-demo:0.6.2
+```
+
+The Makefile reads that string with `sed` and exports it as `APP_VERSION`, which
+`compose.yaml` expands into the `image:` tag. So an image built for the
+development stack is also the one `kubectl set image` points the Deployment at,
+and `make deploy-tag` prints that command with the derived tag filled in.
+
+Bare `docker compose build`, with no `APP_VERSION` in the environment, falls back
+to `fastapi-demo:dev`. That is deliberate: `imagePullPolicy: IfNotPresent` means
+whatever sits on the cluster's tag is what the next rollout runs, so a laptop
+build must not be able to land there by accident. Build the cluster's tag on
+purpose, with `make build` or `APP_VERSION=0.6.2 docker compose build`.
+
+The `version` in `pyproject.toml` is a different number and is meant to stay
+that way — it is the virtual project's own metadata, `uv.lock` records it, and
+raising it to match only makes `uv sync --locked` fail the image build until
+`uv lock` is re-run. Nothing installs this package, so that relock buys nothing.
+
+Or without any of that:
+
+```bash
+docker build -t fastapi-demo:0.6.2 .
 ```
 
 ## Deploy
@@ -540,11 +683,22 @@ Tags are deliberately versioned rather than `latest`. With `latest` plus
 `imagePullPolicy: IfNotPresent`, a rebuild leaves the old image running and the
 rollout silently does nothing.
 
+Bumping one is a single edit — `__version__` in `src/app/__init__.py` — after
+which the build tag, the rollout command and what `GET /` reports all follow:
+
 ```bash
-docker build -t fastapi-demo:0.4.1 .
-kubectl set image deploy/fastapi fastapi=fastapi-demo:0.4.1
+make build         # fastapi-demo:<new version>
+make deploy-tag    # prints the two kubectl lines with that tag
+```
+
+```bash
+kubectl set image deploy/fastapi fastapi=fastapi-demo:0.6.3
 kubectl rollout status deploy/fastapi
 ```
+
+`deploy-tag` prints rather than runs: a Make target should not mutate a cluster.
+`k8s/deployment.yaml` still carries the tag it was last deployed with, so update
+it there too when the bump is meant to be permanent.
 
 If you do reuse a tag while experimenting, force the swap:
 

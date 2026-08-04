@@ -9,6 +9,11 @@ __pycache__/
 .idea
 .dockerignore
 Dockerfile
+compose.yaml
+compose.override.yaml
+Makefile
+# Mounted into the seed container at run time; never baked in.
+scripts/
 k8s/
 README.md
 build/

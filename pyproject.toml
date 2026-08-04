@@ -1,5 +1,12 @@
 [project]
 name = "k8s-local-image-deployment"
+# Not the application's version, and deliberately not tracking it. This is the
+# virtual project's own metadata, and `uv.lock` records it — so changing it makes
+# `uv sync --locked` in the Dockerfile fail until `uv lock` is re-run, which is a
+# relock and a rebuilt dependency layer bought for nothing: there is no build
+# backend here, so the package is never installed and nothing reads this string
+# at runtime. The version the app reports, and the one its image tag is built
+# from, is `__version__` in src/app/__init__.py.
 version = "0.1.0"
 description = "Deploy a locally-built Docker image to Kubernetes with no container registry"
 readme = "README.md"

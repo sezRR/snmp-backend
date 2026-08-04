@@ -44,7 +44,7 @@ data:
   METRICS_RETENTION_DAYS: "30"
 
   # Likewise for OpenStack: a fake fleet stands in for openstack.connect().
-  OPENSTACK_SIMULATE: "true"
+  OPENSTACK_SIMULATE: "false"
   OPENSTACK_CACHE_TTL_SECONDS: "300"
 
   SSE_HEARTBEAT_SECONDS: "15"

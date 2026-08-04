@@ -1,0 +1,126 @@
+# The same two processes the Kubernetes manifests run — TimescaleDB and the
+# FastAPI app — wired the same way, on one host.
+#
+# This file on its own is the "deployed" shape: built image, no source mounted,
+# no database port published, restart policies on. `docker compose up` also
+# loads compose.override.yaml, which turns it into a development environment
+# (source bind-mounted, --reload, simulated SNMP, database published to
+# localhost). Anything that is not a developer's machine opts out explicitly:
+#
+#   docker compose -f compose.yaml up -d --wait
+#
+# Config comes from the same `.env` the host-run uvicorn uses (see .env.example);
+# it is optional, and every value below has a working default. Note that `.env`
+# is read twice: Compose expands ${...} from it, and the api container reads it
+# as an env file. The handful of variables that describe container topology
+# rather than preference are set under `environment:` so a `.env` written for
+# running uvicorn on the host — where PGHOST is localhost — cannot break the
+# containers.
+#
+# Requires Compose v2.24+ (`env_file: required: false`).
+
+name: snmp-metrics
+
+services:
+  timescaledb:
+    # Same pin as k8s/timescaledb-statefulset.yaml.
+    image: timescale/timescaledb:2.22.1-pg17
+    environment:
+      POSTGRES_DB: ${PGDATABASE:-app}
+      POSTGRES_USER: ${PGUSER:-app}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-dev-only-not-a-secret}
+      # A subdirectory, so initdb never sees the volume's lost+found.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - timescale-data:/var/lib/postgresql/data
+    # No /docker-entrypoint-initdb.d mount, for the same reason the StatefulSet
+    # has none: the schema is owned by the app (src/app/db/schema.sql, applied
+    # by src/app/db/init.py) and re-applied on every startup. Entrypoint init
+    # scripts only ever run once, against an empty data directory.
+    healthcheck:
+      # -h localhost keeps this on TCP, so it only passes once the server is
+      # really accepting connections — during initdb the entrypoint runs a
+      # temporary unix-socket-only server that pg_isready would call ready.
+      test:
+        ["CMD-SHELL", 'pg_isready -h localhost -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+    # Unlike the StatefulSet this keeps the image's own root entrypoint: it
+    # chowns PGDATA and steps down to postgres itself, which needs the very
+    # capabilities the pod drops. The pod works around that with runAsUser 999
+    # plus fsGroup; on a bind- or volume-mounted Docker volume there is nothing
+    # to work around.
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  api:
+    build:
+      context: .
+    # The Makefile exports APP_VERSION, read from src/app/__init__.py — the one
+    # place the version is written — so `make build` produces exactly the tag
+    # k8s/deployment.yaml pins and `make deploy-tag` names.
+    #
+    # The fallback is deliberately not a version number. Run bare, this builds
+    # `fastapi-demo:dev`, which cannot overwrite the tag the cluster is pinned
+    # to: with imagePullPolicy IfNotPresent, a laptop build sitting on that tag
+    # is what the next rollout would pick up.
+    image: fastapi-demo:${APP_VERSION:-dev}
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Topology, not preference — these must win over anything in `.env`,
+      # which is written for uvicorn running on the host.
+      PGHOST: timescaledb
+      PGPORT: "5432"
+      PGDATABASE: ${PGDATABASE:-app}
+      PGUSER: ${PGUSER:-app}
+      PGPASSWORD: ${PGPASSWORD:-dev-only-not-a-secret}
+      # Nothing terminates TLS in front of this app here, and there is no
+      # Traefik stripping a prefix, so no ROOT_PATH either. Everything else
+      # falls through to `.env` and then to the defaults in src/app/config.py.
+      ROOT_PATH: ${ROOT_PATH:-}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      # /readyz rather than /healthz: it queries Postgres, so `up --wait` means
+      # "serving requests it can actually answer". Docker does not restart an
+      # unhealthy container, so a database blip only shows up in `compose ps`.
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.request
+          sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:8000/readyz", timeout=3).status == 200 else 1)
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      # The app applies its schema on startup and retries while Postgres is
+      # still initialising. This is the startupProbe's job in the Deployment.
+      start_period: 90s
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+volumes:
+  # Survives `docker compose down`; `down -v` is what deletes the data, the
+  # same split as `kubectl delete -k` leaving the PVC behind.
+  timescale-data:

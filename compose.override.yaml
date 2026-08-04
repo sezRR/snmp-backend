@@ -1,0 +1,77 @@
+# Development overlay. Compose loads it automatically, so `docker compose up`
+# is the dev environment and `docker compose -f compose.yaml up` is not.
+#
+# What it changes: source is mounted over the copy in the image and uvicorn
+# reloads on save, the database is reachable from the host, SNMP and OpenStack
+# are simulated, and nothing restarts behind your back.
+
+services:
+  timescaledb:
+    ports:
+      # Loopback only, deliberately. OrbStack and Docker Desktop publish on
+      # every interface, and this is a committed demo password. 15432 rather
+      # than 5432 so it never collides with the cluster's IngressRouteTCP,
+      # which already has the Mac's 5432.
+      - "127.0.0.1:${DB_PORT:-15432}:5432"
+    restart: "no"
+
+  api:
+    volumes:
+      # Read-only: the app never writes to its own source, and this keeps the
+      # container from touching your working tree.
+      - ./src:/app/src:ro
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --reload
+      # Only the mounted tree, not the site-packages under /app/.venv.
+      - --reload-dir
+      - /app/src
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
+      # A container on a laptop has no route to the SNMP agents, and the
+      # simulator produces the same payload shape. Set SNMP_SIMULATE=false in
+      # `.env` to poll real agents — the container needs its own route to them,
+      # which a Tailscale address on the host does not automatically give it.
+      SNMP_SIMULATE: ${SNMP_SIMULATE:-true}
+      OPENSTACK_SIMULATE: ${OPENSTACK_SIMULATE:-true}
+      # File events cross the macOS/Linux boundary on OrbStack and recent
+      # Docker Desktop. If a save does not trigger a reload, set this to true.
+      WATCHFILES_FORCE_POLLING: ${WATCHFILES_FORCE_POLLING:-false}
+    # The reloader needs to fork and write nothing, but a read-only root is an
+    # unhelpful surprise while debugging.
+    read_only: false
+    restart: "no"
+    develop:
+      watch:
+        # Source needs no sync rule — it is bind-mounted above and uvicorn
+        # reloads itself. Dependencies do: they live in the image.
+        - action: rebuild
+          path: ./pyproject.toml
+        - action: rebuild
+          path: ./uv.lock
+
+  # One-shot: register the simulated fleet so a fresh stack has machines to
+  # poll. `docker compose --profile seed run --rm seed` (or `make seed`).
+  seed:
+    profiles:
+      - seed
+    build:
+      context: .
+    # Same image as the api service; only the entrypoint differs.
+    image: fastapi-demo:${APP_VERSION:-dev}
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/app/scripts:ro
+    environment:
+      API_BASE: http://api:8000
+    entrypoint:
+      - python
+      - /app/scripts/seed_dev.py
+    restart: "no"
