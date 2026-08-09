@@ -19,26 +19,34 @@ spec:
         runAsUser: 1000
       containers:
         - name: fastapi
-          image: fastapi-demo:0.6.2
+          image: fastapi-demo:0.7.0
           # The image is built by the local Docker daemon, which OrbStack's
           # Kubernetes shares. Nothing is ever pulled from a registry.
           imagePullPolicy: IfNotPresent
           envFrom:
-            # Non-secret settings, then credentials. PGHOST points at the
-            # cluster-internal Service, so app→database traffic never goes near
-            # Traefik or the IngressRouteTCP.
+            # Non-secret settings, then database credentials, then the API's own
+            # secrets. PGHOST points at the cluster-internal Service, so
+            # app→database traffic never goes near Traefik or the
+            # IngressRouteTCP. Later entries win on a key collision, and these
+            # three sets are disjoint.
             - configMapRef:
                 name: app-config
             - secretRef:
                 name: timescaledb
+            - secretRef:
+                name: api-secrets
           ports:
             - name: http
               containerPort: 8000
           startupProbe:
-            # The app applies its schema during startup and retries while
-            # Postgres is still initialising, so it can be slow to serve the
-            # first request. Liveness and readiness are suppressed until this
-            # passes, which stops a slow database from causing a restart loop.
+            # The app migrates the schema to head during startup, retrying while
+            # Postgres is still initialising, and then creates the admin account
+            # — so it can be slow to serve the first request. Liveness and
+            # readiness are suppressed until this passes, which stops a slow
+            # database from causing a restart loop.
+            #
+            # A pod that never becomes ready and logs a pydantic ValidationError
+            # is missing JWT_SECRET or ADMIN_PASSWORD; see api-secrets.yaml.
             httpGet:
               path: /healthz
               port: http

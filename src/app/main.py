@@ -9,10 +9,13 @@ from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
 
 from app import __version__
-from app.api.routers import admin, health, machines, metrics, stream
+from app.api.routers import admin, auth, health, machines, metrics, roles, stream, users
+from app.api.security import StreamTickets
 from app.config import Settings, get_settings
-from app.db.init import apply_schema
+from app.db.migrate import run_migrations
+from app.db.policies import apply_policies
 from app.db.pool import Database
+from app.services.bootstrap import bootstrap_admin
 from app.services.bus import MetricBus
 from app.services.collector import Collector
 from app.services.openstack import build_lookup
@@ -33,16 +36,28 @@ async def lifespan(app: FastAPI):
     settings: Settings = app.state.settings
     configure_logging(settings)
 
-    if settings.db_auto_init:
-        # Retries internally: on a cold cluster this pod is usually up before
-        # Postgres has finished initdb.
-        await apply_schema(settings)
-
     db = Database(settings)
     db.connect()
     app.state.db = db
 
+    if settings.db_auto_migrate:
+        # Retries internally: on a cold cluster this pod is usually up before
+        # Postgres has finished initdb. Also takes an advisory lock, so replicas
+        # starting together do not race each other through the same revision.
+        await run_migrations(db.engine, settings)
+
+    # Not schema, and so not Alembic's: both windows are settings, re-applied on
+    # every boot so the configuration stays authoritative.
+    await apply_policies(db.engine, settings)
+
+    # Raises if it cannot guarantee an administrator, which aborts startup. An
+    # API with permissions enforced everywhere and nobody holding them is worse
+    # than one that refuses to come up.
+    await bootstrap_admin(db, settings)
+
     app.state.bus = MetricBus(queue_maxsize=settings.sse_queue_maxsize)
+    # In-process and per-pod, like the bus a stream reads from.
+    app.state.stream_tickets = StreamTickets(settings.stream_ticket_ttl_seconds)
     app.state.lookup = build_lookup(settings)
     # The simulated sampler sizes each host from its OpenStack flavor, so its
     # reported cores/RAM/disk agree with what /machines returns.
@@ -96,6 +111,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
 
     app.include_router(health.router)
+    app.include_router(auth.router)
+    app.include_router(users.router)
+    app.include_router(roles.router)
     app.include_router(machines.router)
     app.include_router(metrics.router)
     app.include_router(stream.router)

@@ -9,13 +9,13 @@
 #
 #   docker compose -f compose.yaml up -d --wait
 #
-# Config comes from the same `.env` the host-run uvicorn uses (see .env.example);
-# it is optional, and every value below has a working default. Note that `.env`
-# is read twice: Compose expands ${...} from it, and the api container reads it
-# as an env file. The handful of variables that describe container topology
-# rather than preference are set under `environment:` so a `.env` written for
-# running uvicorn on the host — where PGHOST is localhost — cannot break the
-# containers.
+# Config comes from the same `.env` the host-run uvicorn uses (see .env.example).
+# Everything has a working default except JWT_SECRET and ADMIN_PASSWORD, which
+# have none by design — see the api service below. Note that `.env` is read
+# twice: Compose expands ${...} from it, and the api container reads it as an
+# env file. The handful of variables that describe container topology rather
+# than preference are set under `environment:` so a `.env` written for running
+# uvicorn on the host — where PGHOST is localhost — cannot break the containers.
 #
 # Requires Compose v2.24+ (`env_file: required: false`).
 
@@ -34,9 +34,10 @@ services:
     volumes:
       - timescale-data:/var/lib/postgresql/data
     # No /docker-entrypoint-initdb.d mount, for the same reason the StatefulSet
-    # has none: the schema is owned by the app (src/app/db/schema.sql, applied
-    # by src/app/db/init.py) and re-applied on every startup. Entrypoint init
-    # scripts only ever run once, against an empty data directory.
+    # has none: the schema is owned by the app (Alembic revisions under
+    # src/app/db/migrations, applied by src/app/db/migrate.py) and brought to
+    # head on every startup. Entrypoint init scripts only ever run once, against
+    # an empty data directory.
     healthcheck:
       # -h localhost keeps this on TCP, so it only passes once the server is
       # really accepting connections — during initdb the entrypoint runs a
@@ -90,6 +91,17 @@ services:
       # Traefik stripping a prefix, so no ROOT_PATH either. Everything else
       # falls through to `.env` and then to the defaults in src/app/config.py.
       ROOT_PATH: ${ROOT_PATH:-}
+      # No defaults, on purpose: there is no safe stand-in for a signing key or
+      # an administrator's password. Left empty, the app refuses to start and
+      # says which value is missing — see the validator in src/app/config.py.
+      #
+      # Not `${VAR:?message}`, tempting as that is: Compose interpolates each
+      # file on its own before merging them, so a `:?` here would fire even when
+      # compose.override.yaml supplies a value, and `make up` would never run.
+      JWT_SECRET: ${JWT_SECRET:-}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ADMIN_PASSWORD_RESET: ${ADMIN_PASSWORD_RESET:-false}
     ports:
       - "${API_PORT:-8000}:8000"
     healthcheck:

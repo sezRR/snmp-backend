@@ -42,6 +42,14 @@ services:
       # File events cross the macOS/Linux boundary on OrbStack and recent
       # Docker Desktop. If a save does not trigger a reload, set this to true.
       WATCHFILES_FORCE_POLLING: ${WATCHFILES_FORCE_POLLING:-false}
+      # Dev defaults for the two values compose.yaml refuses to invent, so
+      # `make up` works on a clean checkout. Both are committed demo credentials
+      # and neither is a secret; override them in `.env`. Note that changing
+      # JWT_SECRET invalidates every token already issued.
+      JWT_SECRET: ${JWT_SECRET:-dev-only-not-a-secret-0123456789abcdef0123456789abcdef}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-dev-only-admin-password}
+      ADMIN_PASSWORD_RESET: ${ADMIN_PASSWORD_RESET:-false}
     # The reloader needs to fork and write nothing, but a read-only root is an
     # unhelpful surprise while debugging.
     read_only: false
@@ -71,6 +79,9 @@ services:
       - ./scripts:/app/scripts:ro
     environment:
       API_BASE: http://api:8000
+      # /machines is behind machines:write now, so the seeder logs in first.
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-dev-only-admin-password}
     entrypoint:
       - python
       - /app/scripts/seed_dev.py

@@ -5,19 +5,24 @@ metadata:
   labels:
     app: fastapi
 data:
-  # Non-secret half of Settings (src/app/config.py). Credentials come from the
-  # timescaledb Secret; both are mounted with envFrom, and real environment
-  # variables take precedence over any .env file in the image.
+  # Non-secret half of Settings (src/app/config.py). Database credentials come
+  # from the timescaledb Secret and the API's own from api-secrets; all three
+  # are mounted with envFrom, and real environment variables take precedence
+  # over any .env file in the image.
 
   # Must match the IngressRoute path and its StripPrefix middleware.
   ROOT_PATH: /api
   LOG_LEVEL: INFO
 
-  DB_POOL_MIN: "1"
+  # SQLAlchemy's pool_size is the persistent pool; anything past it is opened
+  # and closed per checkout, so this is a floor worth having above 1.
+  DB_POOL_MIN: "5"
   # Sized for request handlers plus the two or three queries a tick issues.
   # Unrelated to COLLECTOR_CONCURRENCY, which bounds SNMP calls, not queries.
   DB_POOL_MAX: "16"
-  DB_AUTO_INIT: "true"
+  # `alembic upgrade head` on startup, under an advisory lock so replicas do not
+  # race. Set to "false" to migrate from a Job instead.
+  DB_AUTO_MIGRATE: "true"
 
   COLLECTOR_ENABLED: "true"
   COLLECTOR_INTERVAL_SECONDS: "5"
@@ -49,3 +54,23 @@ data:
 
   SSE_HEARTBEAT_SECONDS: "15"
   SSE_QUEUE_MAXSIZE: "100"
+
+  # Auth. JWT_SECRET and ADMIN_PASSWORD are the secret half and live in
+  # api-secrets.yaml; a username is not a secret, and having it here means
+  # `kubectl get cm app-config` answers "who is the admin?".
+  ADMIN_USERNAME: admin
+  # One-shot recovery for a lost admin password: set to "true", restart, then
+  # set it back. Left on, it rewrites the password from the Secret on every
+  # boot, reverting anything set through the API.
+  ADMIN_PASSWORD_RESET: "false"
+  JWT_ALGORITHM: HS256
+  JWT_ISSUER: snmp-metrics-api
+  # Short: an access token carries its own scopes and is verified without a
+  # database round trip, so it cannot be revoked — only outlived.
+  ACCESS_TOKEN_TTL_SECONDS: "900"
+  REFRESH_TOKEN_TTL_SECONDS: "1209600"
+  PASSWORD_MIN_LENGTH: "12"
+  # EventSource cannot send an Authorization header, so browsers exchange a
+  # token for a single-use ticket. Short enough that one captured in Traefik's
+  # access log is already spent.
+  STREAM_TICKET_TTL_SECONDS: "30"

@@ -13,18 +13,23 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sse_starlette.sse import EventSourceResponse
 
 from app.api.deps import BusDep, DbDep, SettingsDep
 from app.api.routers.machines import parse_mac
+from app.api.security import get_stream_principal
 from app.db import machines as machines_repo
 from app.models.metric import MetricSample
 from app.services.bus import MetricBus
 
 log = logging.getLogger(__name__)
 
-router = APIRouter(tags=["stream"])
+# Both routes authenticate through get_stream_principal rather than the usual
+# Bearer dependency: a browser's EventSource cannot set an Authorization header,
+# so it presents a single-use ticket as ?ticket= instead. Either way the caller
+# must hold metrics:read. See app.api.security.
+router = APIRouter(tags=["stream"], dependencies=[Depends(get_stream_principal)])
 
 
 async def _events(

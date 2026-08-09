@@ -59,17 +59,25 @@ rather than contradicting itself.
 
 | Path | Purpose |
 | --- | --- |
-| `src/app/main.py` | App factory and lifespan: schema, pool, lookup, sampler, collector |
+| `src/app/main.py` | App factory and lifespan: migrations, engine, admin bootstrap, collector |
 | `src/app/config.py` | `pydantic-settings`; env wins over `.env` |
-| `src/app/db/schema.sql` | The schema we own — `machines` + `metrics` hypertable |
-| `src/app/db/init.py` | Applies it, idempotently, with retries. Also `python -m app.db.init` |
-| `src/app/db/pool.py` | `ThreadedConnectionPool` + threadpool query helper |
-| `src/app/db/{machines,metrics}.py` | Repositories: no ORM, plain SQL |
+| `src/app/db/tables.py` | Every table as SQLAlchemy sees it — what Alembic diffs against |
+| `src/app/db/migrations/` | Alembic revisions. Inside the package, so they ship in the image |
+| `src/app/db/migrate.py` | `alembic upgrade head` with retries and an advisory lock. Also `python -m app.db.migrate` |
+| `src/app/db/policies.py` | Compression and retention: settings, not schema, so re-applied every boot |
+| `src/app/db/pool.py` | SQLAlchemy engine over psycopg2 + threadpool query/session helpers |
+| `src/app/db/{machines,metrics}.py` | Fleet and metric repositories: hand-written SQL, no ORM |
+| `src/app/db/{users,roles,tokens}.py` | Identity repositories: ORM, one transaction per function |
+| `src/app/security/scopes.py` | The permission vocabulary. Fixed in code, no table |
+| `src/app/api/security.py` | Bearer + scope checking, and the SSE stream tickets |
+| `src/app/services/auth.py` | Argon2 hashing and JWT minting |
+| `src/app/services/bootstrap.py` | Ensures the admin role and account exist, every boot |
 | `src/app/services/openstack/` | `OpenStackLookup` protocol, TTL cache, simulated fleet |
 | `src/app/services/snmp/` | `SnmpSampler` protocol, pysnmp backend, simulator |
 | `src/app/services/collector.py` | The 15s loop |
 | `src/app/services/bus.py` | In-process pub/sub feeding SSE |
-| `src/app/api/routers/` | health, machines, metrics, stream, admin |
+| `src/app/api/routers/` | health, auth, users, roles, machines, metrics, stream, admin |
+| `alembic.ini` | Host CLI only; the app builds an equivalent config in code |
 | `.env.example` | Every setting with defaults; `.env` is git- and docker-ignored |
 | `compose.yaml` | Both processes on one host: the deployable shape |
 | `compose.override.yaml` | Development overlay — bind mount, `--reload`, published database |
@@ -77,13 +85,15 @@ rather than contradicting itself.
 | `Makefile` | `up`, `seed`, `psql`, `logs`, `clean` for the Compose stack |
 | `k8s/timescaledb-*.yaml` | PVC, Secret, StatefulSet, Service |
 | `k8s/app-config.yaml` | Non-secret settings as a ConfigMap |
+| `k8s/api-secrets.yaml` | `JWT_SECRET` and `ADMIN_PASSWORD`, kept out of the database Secret |
 | `k8s/deployment.yaml`, `k8s/service.yaml` | The app |
 | `k8s/{middleware,ingressroute,ingressroutetcp}.yaml` | Traefik routing |
 | `k8s/traefik-values.yaml` | Helm values: `web` + `postgres` entryPoints, CRD provider only |
 
 ## Data model
 
-`src/app/db/schema.sql`, applied by the app on startup:
+Owned by Alembic. Revision `0001` creates the fleet tables and `0002` the
+identity ones; the app runs `alembic upgrade head` on startup.
 
 ```sql
 CREATE TABLE machines (
@@ -104,9 +114,17 @@ SELECT create_hypertable('metrics', by_range('ts'));
 ```
 
 Deliberately *not* loaded through `/docker-entrypoint-initdb.d`: that only runs
-against an empty data directory, so it cannot be evolved. This file is re-applied
-on every startup and stays idempotent. `DB_AUTO_INIT=false` hands the schema to
-something else.
+against an empty data directory, so it could never be evolved. Migrations run on
+every startup instead, under a Postgres advisory lock so replicas starting
+together do not race. `DB_AUTO_MIGRATE=false` hands the schema to something else
+— a Job running `python -m app.db.migrate`, say.
+
+Revision `0001` no-ops on a database that already has `machines`, so a cluster
+deployed before Alembic is adopted by the same `upgrade head` that builds a fresh
+one, with no manual `alembic stamp`.
+
+The identity tables are `users`, `roles`, `role_scopes`, `user_roles` and
+`refresh_tokens` — see [Authentication](#authentication).
 
 The FK is what makes "delete the MAC, delete its history" one statement. A
 hypertable may reference a regular table; the cascade touches every chunk, which
@@ -226,27 +244,44 @@ while the process lives; a restart re-reads the configured value.
 
 ## API
 
-| Method | Path | Notes |
-| --- | --- | --- |
-| GET | `/` | service info and which backends are simulated |
-| GET | `/healthz` | no dependencies — backs liveness |
-| GET | `/readyz` | queries Postgres — backs readiness |
-| POST | `/machines` | `{ipv4, mac?, label?}`; `mac` required — and only accepted — for an address OpenStack does not know; 404 without it, 409 if it disagrees with OpenStack or is already registered |
-| GET | `/machines` | our rows enriched with server id, tenant, user, flavor + specs; `external` marks the machines that have none |
-| GET/PATCH/DELETE | `/machines/{mac}` | `PATCH {label?, enabled?, ipv4?}` — `ipv4` on external machines only, 409 otherwise; `DELETE` cascades the history |
-| GET | `/metrics` | `?mac=&since=&limit=` — repeat `mac` to filter on several |
-| GET | `/metrics/latest` | most recent sample per machine |
-| GET | `/metrics/stats` | `?bucket=1 minute&hours=1&mac=` — `time_bucket` over the jsonb |
-| GET | `/metrics/counts` | rows and latest sample per machine |
-| GET | `/metrics/stream` | SSE firehose, `?mac=` to filter |
-| GET | `/machines/{mac}/metrics/stream` | SSE for one machine |
-| DELETE | `/machines/{mac}/metrics` | purge one machine's history, `?before=` for a range |
-| DELETE | `/metrics` | purge everything; **requires `?confirm=true`**. `?before=` drops whole chunks instead |
-| GET | `/admin/collector` | loop health and per-machine ok/fail counts |
-| POST | `/admin/collector/tick` | run one round now instead of waiting; 409 if one is already running |
-| GET | `/admin/openstack/cache` | ttl, age, hits, misses, refreshes |
-| GET | `/admin/openstack/servers` | the fleet as cached — the registerable addresses |
-| POST | `/admin/openstack/cache/flush` | drop the cache; next read repopulates |
+Everything except the three health endpoints needs a bearer token carrying the
+scope in the third column. See [Authentication](#authentication).
+
+| Method | Path | Scope | Notes |
+| --- | --- | --- | --- |
+| GET | `/` | — | service info and which backends are simulated |
+| GET | `/healthz` | — | no dependencies — backs liveness |
+| GET | `/readyz` | — | queries Postgres — backs readiness |
+| POST | `/auth/login` | — | form-encoded OAuth2 password grant ⇒ access + refresh token |
+| POST | `/auth/refresh` | — | rotates the refresh token; replaying one revokes the whole chain |
+| POST | `/auth/logout` | any | revokes the presented refresh token |
+| GET | `/auth/me` | any | your account, roles and effective scopes |
+| PATCH | `/auth/me/password` | any | needs the current password; ends your other sessions |
+| POST | `/auth/stream-ticket` | `metrics:read` | single-use credential for `EventSource` |
+| GET | `/scopes` | `roles:read` | the fixed catalogue, for building a role editor |
+| GET/POST | `/roles` | `roles:read` / `roles:write` | 422 on an unknown scope name |
+| GET/PATCH/DELETE | `/roles/{name}` | `roles:read` / `roles:write` | 409 on the built-in `admin` role or one still granted |
+| PUT | `/roles/{name}/scopes` | `roles:write` | replace a role's scopes |
+| GET/POST | `/users` | `users:read` / `users:write` | |
+| GET/PATCH/DELETE | `/users/{id}` | `users:read` / `users:write` | `PATCH {is_active}` |
+| PUT | `/users/{id}/roles` | `users:write` | replace a user's roles |
+| PUT | `/users/{id}/password` | `users:write` | administrative reset; ends that user's sessions |
+| POST | `/machines` | `machines:write` | `{ipv4, mac?, label?}`; `mac` required — and only accepted — for an address OpenStack does not know; 404 without it, 409 if it disagrees with OpenStack or is already registered |
+| GET | `/machines` | `machines:read` | our rows enriched with server id, tenant, user, flavor + specs; `external` marks the machines that have none |
+| GET/PATCH/DELETE | `/machines/{mac}` | `machines:read` / `machines:write` | `PATCH {label?, enabled?, ipv4?}` — `ipv4` on external machines only, 409 otherwise; `DELETE` cascades the history |
+| GET | `/metrics` | `metrics:read` | `?mac=&since=&limit=` — repeat `mac` to filter on several |
+| GET | `/metrics/latest` | `metrics:read` | most recent sample per machine |
+| GET | `/metrics/stats` | `metrics:read` | `?bucket=1 minute&hours=1&mac=` — `time_bucket` over the jsonb |
+| GET | `/metrics/counts` | `metrics:read` | rows and latest sample per machine |
+| GET | `/metrics/stream` | `metrics:read` | SSE firehose, `?mac=` to filter |
+| GET | `/machines/{mac}/metrics/stream` | `metrics:read` | SSE for one machine |
+| DELETE | `/machines/{mac}/metrics` | `metrics:write` | purge one machine's history, `?before=` for a range |
+| DELETE | `/metrics` | `metrics:write` | purge everything; **requires `?confirm=true`**. `?before=` drops whole chunks instead |
+| GET | `/admin/collector` | `admin:read` | loop health and per-machine ok/fail counts |
+| POST | `/admin/collector/tick` | `admin:write` | run one round now instead of waiting; 409 if one is already running |
+| GET | `/admin/openstack/cache` | `admin:read` | ttl, age, hits, misses, refreshes |
+| GET | `/admin/openstack/servers` | `admin:read` | the fleet as cached — the registerable addresses |
+| POST | `/admin/openstack/cache/flush` | `admin:write` | drop the cache; next read repopulates |
 
 Streaming is a side channel: samples are written to TimescaleDB first and
 published second, so subscribing changes nothing about what is stored, and events
@@ -256,10 +291,19 @@ more than one replica a client only sees what its pod collected.
 ## Configuration
 
 `.env.example` lists every setting. Real environment variables always win over the
-file, so in Kubernetes the values come from `k8s/app-config.yaml` (non-secret) and
-`k8s/timescaledb-secret.yaml` (credentials), both mounted with `envFrom`. `.env`
-is in `.gitignore` and `.dockerignore`, so credentials reach neither git nor the
-image.
+file, so in Kubernetes the values come from `k8s/app-config.yaml` (non-secret),
+`k8s/timescaledb-secret.yaml` (database credentials) and `k8s/api-secrets.yaml`
+(the signing key and the bootstrap password), all three mounted with `envFrom`.
+`.env` is in `.gitignore` and `.dockerignore`, so credentials reach neither git
+nor the image.
+
+Three settings have no default and no fallback. `JWT_SECRET` is not generated
+when missing, because a generated key would differ between replicas — a token
+minted by one pod rejected by the next — and would rotate on every restart,
+logging everyone out. `ADMIN_USERNAME` and `ADMIN_PASSWORD` are required for the
+reason in [Authentication](#authentication). A blank value counts as missing:
+`ADMIN_PASSWORD=` is exactly what an unfilled ConfigMap key produces, and it
+would otherwise create an admin whose password is the empty string.
 
 The settings worth knowing:
 
@@ -275,7 +319,13 @@ The settings worth knowing:
 | `METRICS_RETENTION_DAYS` | 30 | 0 disables. Chunks older than this are dropped |
 | `OPENSTACK_SIMULATE` | true | false ⇒ needs `openstacksdk` and a real adapter |
 | `OPENSTACK_CACHE_TTL_SECONDS` | 300 | How stale a tenant/flavor read may be |
-| `DB_AUTO_INIT` | true | Apply `schema.sql` on startup |
+| `DB_AUTO_MIGRATE` | true | `alembic upgrade head` on startup, under an advisory lock |
+| `DB_POOL_MIN` | 5 | SQLAlchemy's persistent pool, not a floor — see below |
+| `JWT_SECRET` | **required** | No default. Blank or under 32 chars and the app refuses to start |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | **required** | The bootstrap account; likewise no default |
+| `ADMIN_PASSWORD_RESET` | false | One-shot: rewrites the admin password from the environment |
+| `ACCESS_TOKEN_TTL_SECONDS` | 900 | Access tokens cannot be revoked, so they are short |
+| `REFRESH_TOKEN_TTL_SECONDS` | 1209600 | These are tracked per session and *can* be revoked |
 | `ROOT_PATH` | `/api` in-cluster | Must match the IngressRoute path and its StripPrefix |
 
 ### Holding the cadence
@@ -309,28 +359,133 @@ rate in the second one would be noise.
 ### Retention
 
 At a five second interval a machine writes 17,280 samples a day, so a fleet in
-the hundreds writes millions of rows and gigabytes of jsonb a day. `app.db.init`
+the hundreds writes millions of rows and gigabytes of jsonb a day. `app.db.policies`
 therefore schedules two TimescaleDB jobs on the hypertable — compression after
 `METRICS_COMPRESS_AFTER_HOURS`, dropping chunks after `METRICS_RETENTION_DAYS` —
 and chunks are one day rather than the seven-day default, since both policies and
 `DELETE /metrics?before=` are chunk-granular.
 
-The policies live in `init.py` rather than `schema.sql` because both windows are
-settings: they are removed and re-added on every startup, so changing the setting
-changes the policy instead of being ignored in favour of whatever was installed
-first.
+The policies live in `policies.py` rather than in a migration because both
+windows are settings, not schema: they are removed and re-added on every startup,
+so changing the setting changes the policy. A migration would pin whichever value
+was configured the day it was written, and `add_*_policy(if_not_exists => TRUE)`
+would then keep it and ignore the change.
 
-### psycopg2 under async endpoints
+### SQLAlchemy over psycopg2, under async endpoints
 
-Endpoints are `async def` and psycopg2 is synchronous, so every query runs through
-Starlette's worker threadpool around a pooled connection — the event loop never
-blocks. `DB_POOL_MAX` is sized for request handlers, and AnyIO's default 40 worker
+SQLAlchemy is here for the schema — Alembic diffs `db/tables.py` — and for the
+identity code's ORM. It did not make the database layer async: the driver is
+still psycopg2 and still synchronous, so every query runs through Starlette's
+worker threadpool around a pooled connection, and the event loop never blocks.
+The fleet and metric repositories kept their hand-written SQL, because
+`time_bucket`, `drop_chunks` and the jsonb lateral aggregate have no ORM spelling
+worth having. `DB_POOL_MAX` is sized for request handlers, and AnyIO's default 40 worker
 threads cap how many queries can be in flight regardless of pool size. It does
 **not** need to exceed `COLLECTOR_CONCURRENCY`: that semaphore bounds SNMP calls,
 and a tick issues two or three queries in total — list the machines, one batched
 insert — however many machines it samples. An async driver would remove the
 threadpool limit; psycopg2 is the deliberate choice here, per the TigerData Python
 quickstart.
+
+Two mappings worth knowing. `DB_POOL_MIN` is SQLAlchemy's `pool_size`, which is
+the *persistent* pool rather than a floor to grow from — connections past it are
+opened and closed per checkout, which is why the default is now 5 and not 1. And
+`executemany_mode="values_plus_batch"` on the engine is what keeps the
+collector's batch insert compiling down to psycopg2's `execute_values`, one round
+trip per tick.
+
+## Authentication
+
+Every endpoint except `/`, `/healthz` and `/readyz` needs a bearer token. The
+model has three pieces:
+
+**Scopes are fixed in code** (`src/app/security/scopes.py`) — ten of them, two
+per resource: `machines:*`, `metrics:*`, `admin:*`, `users:*`, `roles:*`. They
+name capabilities the API implements, so they change only with a deployment and
+have no table. `GET /scopes` returns the catalogue.
+
+**Roles are data.** An admin composes them out of scopes through `/roles`, and
+`role_scopes` stores one row per grant. The built-in `admin` role holds every
+scope and is flagged `is_system`: it cannot be deleted, and its scopes cannot be
+edited — the boot reconciler would restore them anyway, which is what lets a
+scope added to the enum reach the admin role without a migration.
+
+**The admin account is bootstrapped from the environment.** `ADMIN_USERNAME` and
+`ADMIN_PASSWORD` are required; the backend refuses to start without them, because
+an API whose permissions are enforced everywhere and whose scopes nobody holds is
+worse than one that will not come up. The account is created once. A password
+changed through the API is *not* reverted on the next restart — set
+`ADMIN_PASSWORD_RESET=true` for one boot to force-rotate a lost one.
+
+```bash
+# a token
+TOKEN=$(curl -fsS -X POST localhost:8000/auth/login \
+  -d grant_type=password -d username=admin -d password="$ADMIN_PASSWORD" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+# or just: make token
+
+curl -fsS -H "Authorization: Bearer $TOKEN" localhost:8000/auth/me
+
+# a read-only role and a user holding it
+curl -fsS -X POST localhost:8000/roles -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"viewer","scopes":["machines:read","metrics:read"]}'
+curl -fsS -X POST localhost:8000/users -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"viewer1","password":"a-long-enough-password","roles":["viewer"]}'
+```
+
+Swagger's **Authorize** button works the same way — `/auth/login` is an OAuth2
+password grant, and each operation lists the scopes it needs.
+
+### Tokens
+
+An **access token** (15 minutes) carries the user's scopes in its claims, so an
+authenticated request costs no database queries — which is what makes it
+affordable on the SSE routes. It cannot be revoked, only outlived.
+
+A **refresh token** (14 days) carries no authority except the right to mint a new
+pair, and every one is recorded in `refresh_tokens` by its `jti`. Refreshing
+rotates it: the old one is revoked and linked to its successor. Presenting a
+token that has already been exchanged means a copy escaped — the real client
+would hold the successor — so the response is to revoke that user's entire chain,
+not to fail one request.
+
+Anything that must take effect immediately (disabling a user, changing a
+password) revokes refresh tokens. Role changes are visible within one access
+token's lifetime, or at once on the next refresh, which re-reads the roles.
+
+### Streaming
+
+`EventSource` cannot set an `Authorization` header. Putting the access token in
+the query string would be the obvious fix and the wrong one — a credential with
+full API authority would land in Traefik's access log, the browser's history and
+every proxy between. So a client exchanges its token for a ticket:
+
+```bash
+TICKET=$(curl -fsS -X POST localhost:8000/auth/stream-ticket \
+  -H "Authorization: Bearer $TOKEN" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["ticket"])')
+curl -N "localhost:8000/metrics/stream?ticket=$TICKET"
+```
+
+The ticket is single-use and lives 30 seconds, so one captured in a log is
+already spent. Clients that *can* send headers — curl, anything server-side —
+just use the bearer token and skip this.
+
+### Guardrails
+
+Permissions are the one part of a system that can be edited into an
+unrecoverable state, so four things are refused outright:
+
+- **Amplification.** You cannot grant a role holding scopes you do not hold, nor
+  create one. Without this, `users:write` would silently be every permission.
+- **Editing yourself.** Not your own roles, not your own account's existence.
+- **The last administrator.** Any change leaving no active user with
+  `users:write` is refused — checked *after* the mutation inside the same
+  transaction, since a pre-check races.
+- **The system role.** `admin` cannot be deleted or have its scopes changed, and
+  a role still granted to someone cannot be deleted.
 
 ## Local development
 
@@ -341,9 +496,16 @@ the source mounted, so a save reloads the server.
 ```bash
 make up      # build, start, wait until /readyz answers
 make seed    # register the simulated OpenStack fleet
-make smoke   # readyz, machines, collector status
+make smoke   # readyz, then machines and collector status with a token
+make token   # print an admin access token, for pasting into curl
 open http://localhost:8000/docs
 ```
+
+`compose.override.yaml` supplies committed dev values for `JWT_SECRET` and
+`ADMIN_PASSWORD`, so this works on a clean checkout with no `.env` at all. The
+admin account is `admin` / `dev-only-admin-password`. Override either in `.env`;
+`compose.yaml` on its own invents neither, so the deployed shape fails loudly
+instead of running on a signing key that is in this repository.
 
 Without `make`, that is `docker compose up -d --build --wait` and
 `docker compose --profile seed run --rm seed`. Requires Compose v2.24 or newer.
@@ -357,6 +519,7 @@ automatically, is what makes it a development environment:
 | Database port | published on `127.0.0.1:15432` | not published |
 | SNMP / OpenStack | simulated | whatever `.env` says |
 | Restart policy | none | `unless-stopped` |
+| `JWT_SECRET` / `ADMIN_PASSWORD` | committed dev defaults | must be supplied |
 | Root filesystem | writable | read-only, `cap_drop: ALL` |
 
 Both build the tag in `APP_VERSION`, which the Makefile derives from
@@ -385,9 +548,14 @@ that password is committed in plaintext. Running uvicorn on the host against it
 still works, and is the faster loop for debugger work:
 
 ```bash
-cp .env.example .env      # then set PGPORT=15432
+cp .env.example .env      # PGPORT is already 15432; fill in the blank values
+printf 'JWT_SECRET=%s\n' "$(openssl rand -hex 32)" >> .env
+printf 'ADMIN_PASSWORD=dev-only-admin-password\n' >> .env
 PYTHONPATH=src uv run uvicorn app.main:app --port 8099
 ```
+
+The same `.env` is what the Alembic targets read — `make revision`, `make check`
+and `make history` run on the host against the published database port.
 
 Dependency changes are the one thing a save cannot pick up, since they live in
 the image: `make build`, or `make watch` to have Compose rebuild whenever
@@ -460,8 +628,8 @@ The version lives in exactly one place — `src/app/__init__.py`, which is also
 what the running app reports from `GET /` — and the image tag is derived from it:
 
 ```bash
-make version   # 0.6.2  ->  fastapi-demo:0.6.2
-make build     # docker compose build, tagged fastapi-demo:0.6.2
+make version   # 0.7.0  ->  fastapi-demo:0.7.0
+make build     # docker compose build, tagged fastapi-demo:0.7.0
 ```
 
 The Makefile reads that string with `sed` and exports it as `APP_VERSION`, which
@@ -473,7 +641,7 @@ Bare `docker compose build`, with no `APP_VERSION` in the environment, falls bac
 to `fastapi-demo:dev`. That is deliberate: `imagePullPolicy: IfNotPresent` means
 whatever sits on the cluster's tag is what the next rollout runs, so a laptop
 build must not be able to land there by accident. Build the cluster's tag on
-purpose, with `make build` or `APP_VERSION=0.6.2 docker compose build`.
+purpose, with `make build` or `APP_VERSION=0.7.0 docker compose build`.
 
 The `version` in `pyproject.toml` is a different number and is meant to stay
 that way — it is the virtual project's own metadata, `uv.lock` records it, and
@@ -483,7 +651,7 @@ raising it to match only makes `uv sync --locked` fail the image build until
 Or without any of that:
 
 ```bash
-docker build -t fastapi-demo:0.6.2 .
+docker build -t fastapi-demo:0.7.0 .
 ```
 
 ## Deploy
@@ -647,11 +815,13 @@ http://<MAC_LAN_IP>/api/docs      -> Swagger UI
 <MAC_LAN_IP>:5432                 -> Postgres
 ```
 
-> **Unauthenticated plain HTTP, with `/api/docs` browsable and `DELETE /metrics`
-> reachable.** Anything on the network can read, write and purge. Fine on a
-> trusted home LAN; do not run it on shared or public Wi-Fi. If the macOS firewall
-> is enabled it will block this and you will need an inbound allow rule for
-> OrbStack.
+> **Plain HTTP.** Endpoints need a bearer token, but nothing is encrypted in
+> transit — a password posted to `/api/auth/login` and every token after it cross
+> the network in the clear, and `k8s/api-secrets.yaml` ships a committed demo
+> signing key that anyone reading this repository can forge tokens with. Replace
+> both Secrets and put TLS in front of Traefik before running anywhere that is
+> not a trusted machine. If the macOS firewall is enabled it will block this and
+> you will need an inbound allow rule for OrbStack.
 
 ### Port-forward
 
@@ -692,7 +862,7 @@ make deploy-tag    # prints the two kubectl lines with that tag
 ```
 
 ```bash
-kubectl set image deploy/fastapi fastapi=fastapi-demo:0.6.3
+kubectl set image deploy/fastapi fastapi=fastapi-demo:0.7.1
 kubectl rollout status deploy/fastapi
 ```
 
@@ -706,10 +876,22 @@ If you do reuse a tag while experimenting, force the swap:
 kubectl rollout restart deploy/fastapi
 ```
 
-Changing the schema means editing `src/app/db/schema.sql` — keep it idempotent,
-since it re-runs on every startup. Adding a metric means editing only the sampler:
-the `jsonb` column takes any shape, and `metrics/stats` skips samples that lack a
-key.
+Changing the schema means editing `src/app/db/tables.py` and generating a
+revision from it:
+
+```bash
+make revision m="add widgets"   # autogenerated from the diff, on the host
+make check                      # passes when tables.py and the migrations agree
+```
+
+Read the generated file before it runs. The dev container bind-mounts `./src`,
+reloads on change and boots with `DB_AUTO_MIGRATE=true`, so a revision is applied
+to the dev database the moment it lands — `make clean` if you then change your
+mind. Revisions are authored on the host, not in the container: `read_only: true`
+here and `readOnlyRootFilesystem: true` in Kubernetes both forbid writing them.
+
+Adding a *metric* still needs no migration at all: the `jsonb` column takes any
+shape, and `metrics/stats` skips samples that lack a key.
 
 ## Teardown
 

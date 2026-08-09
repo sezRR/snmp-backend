@@ -9,6 +9,8 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, Query, status
 
 from app.api.deps import DbDep
+from app.api.security import requires
+from app.security.scopes import Scope
 from app.api.routers.machines import parse_mac
 from app.db import machines as machines_repo
 from app.db import metrics as metrics_repo
@@ -28,7 +30,7 @@ def _normalise_macs(macs: list[str] | None) -> list[str] | None:
     return [parse_mac(m) for m in macs] if macs else None
 
 
-@router.get("/metrics")
+@router.get("/metrics", dependencies=[requires(Scope.METRICS_READ)])
 async def list_metrics(
     db: DbDep,
     mac: MacQuery = None,
@@ -41,14 +43,14 @@ async def list_metrics(
     return [MetricSample(**row) for row in rows]
 
 
-@router.get("/metrics/latest")
+@router.get("/metrics/latest", dependencies=[requires(Scope.METRICS_READ)])
 async def latest_metrics(db: DbDep) -> list[MetricSample]:
     """The most recent sample per machine — what a dashboard opens with."""
     rows = await db.run_query(metrics_repo.latest_per_machine)
     return [MetricSample(**row) for row in rows]
 
 
-@router.get("/metrics/stats")
+@router.get("/metrics/stats", dependencies=[requires(Scope.METRICS_READ)])
 async def metric_stats(
     db: DbDep,
     bucket: Annotated[
@@ -68,13 +70,15 @@ async def metric_stats(
     return [MetricStatsRow(**row) for row in rows]
 
 
-@router.get("/metrics/counts")
+@router.get("/metrics/counts", dependencies=[requires(Scope.METRICS_READ)])
 async def metric_counts(db: DbDep) -> list[dict]:
     """Row count and latest sample per machine."""
     return await db.run_query(metrics_repo.counts_by_machine)
 
 
-@router.delete("/machines/{mac}/metrics")
+@router.delete(
+    "/machines/{mac}/metrics", dependencies=[requires(Scope.METRICS_WRITE)]
+)
 async def purge_machine_metrics(
     mac: str,
     db: DbDep,
@@ -98,7 +102,7 @@ async def purge_machine_metrics(
     )
 
 
-@router.delete("/metrics")
+@router.delete("/metrics", dependencies=[requires(Scope.METRICS_WRITE)])
 async def purge_all_metrics(
     db: DbDep,
     confirm: Annotated[

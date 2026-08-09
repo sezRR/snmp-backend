@@ -12,10 +12,21 @@ description = "Deploy a locally-built Docker image to Kubernetes with no contain
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    # Alembic owns the schema; SQLAlchemy's metadata is what it diffs against.
+    # Both go through psycopg2, which stays the driver.
+    "alembic>=1.16",
     "fastapi[standard]>=0.140.0",
     "psycopg2-binary>=2.9",
+    # Password hashing. passlib is effectively unmaintained and warns loudly
+    # against bcrypt 4.x; pwdlib is what FastAPI's own docs moved to.
+    "pwdlib[argon2]>=0.2.1",
     "pydantic-settings>=2.14.2",
+    "pyjwt>=2.10",
     "pysnmp>=7.1.27",
+    # Already present transitively, but OAuth2PasswordRequestForm makes it a
+    # hard requirement rather than an extra's incidental dependency.
+    "python-multipart>=0.0.20",
+    "sqlalchemy>=2.0.36",
     "sse-starlette>=3.4.6",
     "starlette>=1.3.1",
 ]

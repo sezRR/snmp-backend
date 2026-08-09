@@ -10,10 +10,12 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-import psycopg2
 from fastapi import APIRouter, HTTPException, status
+from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import DbDep, LookupDep
+from app.api.security import requires
+from app.security.scopes import Scope
 from app.db import machines as machines_repo
 from app.models.machine import Machine, MachineCreate, MachineUpdate
 from app.services.openstack import CachedOpenStack, normalise_mac
@@ -46,7 +48,11 @@ async def enrich(row: dict[str, Any], lookup: CachedOpenStack) -> Machine:
     return Machine(**row, openstack=server)
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[requires(Scope.MACHINES_WRITE)],
+)
 async def register_machine(
     payload: MachineCreate, db: DbDep, lookup: LookupDep
 ) -> Machine:
@@ -108,9 +114,10 @@ async def register_machine(
         row = await db.run_query(
             machines_repo.insert, mac, ipv4, payload.label, external
         )
-    except psycopg2.errors.UniqueViolation as exc:
+    except IntegrityError as exc:
         # The MAC is free but the address is taken — same host registered under
-        # a MAC that has since changed in OpenStack.
+        # a MAC that has since changed in OpenStack. SQLAlchemy wraps psycopg2's
+        # UniqueViolation, so this is the exception to catch.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"address {ipv4} is already registered",
@@ -127,7 +134,7 @@ async def register_machine(
     return Machine(**row, openstack=server)
 
 
-@router.get("")
+@router.get("", dependencies=[requires(Scope.MACHINES_READ)])
 async def list_machines(
     db: DbDep, lookup: LookupDep, enabled_only: bool = False
 ) -> list[Machine]:
@@ -140,7 +147,7 @@ async def list_machines(
     return [Machine(**row, openstack=index.get(row["mac"])) for row in rows]
 
 
-@router.get("/{mac}")
+@router.get("/{mac}", dependencies=[requires(Scope.MACHINES_READ)])
 async def get_machine(mac: str, db: DbDep, lookup: LookupDep) -> Machine:
     row = await db.run_query(machines_repo.get, parse_mac(mac))
     if row is None:
@@ -148,7 +155,7 @@ async def get_machine(mac: str, db: DbDep, lookup: LookupDep) -> Machine:
     return await enrich(row, lookup)
 
 
-@router.patch("/{mac}")
+@router.patch("/{mac}", dependencies=[requires(Scope.MACHINES_WRITE)])
 async def update_machine(
     mac: str, payload: MachineUpdate, db: DbDep, lookup: LookupDep
 ) -> Machine:
@@ -186,7 +193,7 @@ async def update_machine(
             ipv4,
             "label" in payload.model_fields_set,
         )
-    except psycopg2.errors.UniqueViolation as exc:
+    except IntegrityError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"address {ipv4} is already registered",
@@ -197,7 +204,11 @@ async def update_machine(
     return await enrich(row, lookup)
 
 
-@router.delete("/{mac}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{mac}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[requires(Scope.MACHINES_WRITE)],
+)
 async def delete_machine(mac: str, db: DbDep) -> None:
     """Deregister a machine. Its metric history is cascaded away with it."""
     deleted = await db.run_query(machines_repo.delete, parse_mac(mac))
