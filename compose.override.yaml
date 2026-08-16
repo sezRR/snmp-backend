@@ -50,6 +50,15 @@ services:
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-dev-only-admin-password}
       ADMIN_PASSWORD_RESET: ${ADMIN_PASSWORD_RESET:-false}
+      # `Settings` only demands a credential key when SNMP_SIMULATE=false, but
+      # the dev stack wants one regardless: without it the backend cannot seed
+      # the `default-v2c` profile, and a machine with no credential bound is not
+      # polled at all — the stack would come up healthy and collect nothing.
+      # A committed dev key, like the two above. Never use it anywhere real.
+      SNMP_CREDENTIAL_KEYS: ${SNMP_CREDENTIAL_KEYS:-{"dev":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"}}
+      SNMP_CREDENTIAL_ACTIVE_KEY: ${SNMP_CREDENTIAL_ACTIVE_KEY:-dev}
+      SNMP_COMMUNITY: ${SNMP_COMMUNITY:-public}
+      SNMP_PORT: ${SNMP_PORT:-161}
     # The reloader needs to fork and write nothing, but a read-only root is an
     # unhelpful surprise while debugging.
     read_only: false
@@ -62,6 +71,91 @@ services:
           path: ./pyproject.toml
         - action: rebuild
           path: ./uv.lock
+
+  # A real SNMP agent to point real credentials at.
+  #
+  # The simulator cannot exercise SNMPv3: engine discovery, key localization and
+  # the time-window checks all live in the protocol, and getting any of them
+  # wrong fails in ways a simulator will happily report as success. This is one
+  # container with one authPriv user, so `make up` yields something an
+  # authPriv credential can actually be tested against.
+  #
+  # Started under a profile, because the default dev stack simulates SNMP and
+  # has no use for it: `docker compose --profile snmp up -d snmpd`.
+  snmpd:
+    profiles:
+      - snmp
+    # Alpine plus net-snmp from its repository rather than a prebuilt SNMP
+    # image: the popular ones are amd64-only and pin net-snmp 5.7, which
+    # predates SHA-2 and AES-192/256 in `createUser` — so the one thing this
+    # container exists to test could not be configured on it.
+    image: docker.io/library/alpine:3.20
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        # -tools as well, so `docker compose exec snmpd snmpget ...` can be used
+        # to tell "the agent is wrong" apart from "our sampler is wrong".
+        apk add --no-cache net-snmp net-snmp-tools >/dev/null
+        mkdir -p /var/lib/net-snmp
+        # createUser is consumed on first start: snmpd hashes the passphrases
+        # into /var/lib/net-snmp/snmpd.conf and the line is meant to be removed
+        # afterwards. It lives in the persistent file here, which is empty on
+        # every container start, so it is written fresh each time.
+        cat > /var/lib/net-snmp/snmpd.conf <<'EOF'
+        createUser fleetmon SHA-256 "dev-auth-passphrase" AES-128 "dev-priv-passphrase"
+        EOF
+        # The view matters as much as the user. The stock view contains none of
+        # the subtrees the sampler walks, and an agent left that way answers
+        # every walk with nothing at all rather than with a permission error —
+        # which arrives here as "no HOST-RESOURCES-MIB rows".
+        cat > /etc/snmp/snmpd.conf <<'EOF'
+        rouser fleetmon authPriv -V fleet
+        rocommunity public default -V fleet
+        view fleet included .1.3.6.1.2.1.1
+        view fleet included .1.3.6.1.2.1.2
+        view fleet included .1.3.6.1.2.1.25
+        view fleet included .1.3.6.1.2.1.31
+        view fleet included .1.3.6.1.4.1.2021.13.15
+        EOF
+        # The listen address goes on the command line, not in `agentaddress`:
+        # with the config-file form this build fails with "Error opening
+        # specified endpoint" and exits.
+        exec snmpd -f -Lo -c /etc/snmp/snmpd.conf udp:0.0.0.0:161
+    restart: "no"
+
+  # A second agent with the *same* securityName and a different passphrase.
+  #
+  # This is not padding. pysnmp caches USM users on an engine under
+  # (userName, securityEngineId), so before credentials got an engine each,
+  # these two profiles shared a cache entry and every tick tore one down to
+  # install the other while samples were in flight. One agent cannot reproduce
+  # that; two with a colliding user name is the smallest thing that can.
+  # Bind a credential per agent and watch both stay green.
+  snmpd2:
+    profiles:
+      - snmp
+    image: docker.io/library/alpine:3.20
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        apk add --no-cache net-snmp net-snmp-tools >/dev/null
+        mkdir -p /var/lib/net-snmp
+        cat > /var/lib/net-snmp/snmpd.conf <<'EOF'
+        createUser fleetmon SHA-256 "second-auth-passphrase" AES-128 "second-priv-passphrase"
+        EOF
+        cat > /etc/snmp/snmpd.conf <<'EOF'
+        rouser fleetmon authPriv -V fleet
+        view fleet included .1.3.6.1.2.1.1
+        view fleet included .1.3.6.1.2.1.2
+        view fleet included .1.3.6.1.2.1.25
+        view fleet included .1.3.6.1.2.1.31
+        EOF
+        exec snmpd -f -Lo -c /etc/snmp/snmpd.conf udp:0.0.0.0:161
+    restart: "no"
 
   # One-shot: register the simulated fleet so a fresh stack has machines to
   # poll. `docker compose --profile seed run --rm seed` (or `make seed`).

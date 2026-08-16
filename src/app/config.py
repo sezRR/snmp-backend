@@ -11,11 +11,54 @@ have to be handed a JWT signing key it will never use — and `make check` works
 on a developer's machine without one.
 """
 
+import json
 from functools import lru_cache
 from urllib.parse import quote_plus
 
 from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# AES-256, so nothing shorter is a key. Enforced rather than padded or hashed
+# into shape: a 16-byte value in this variable is a mistake, not a request for
+# AES-128, and silently accepting it would hide the mistake forever.
+CREDENTIAL_KEY_BYTES = 32
+
+
+def parse_key_ring(raw: str) -> dict[str, bytes]:
+    """`{"k1": "<hex>"}` -> `{"k1": b"..."}`. Raises ValueError on anything else.
+
+    Shared with `python -m app.db.reencrypt`, which needs the same parse without
+    the rest of `Settings`.
+    """
+    if not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"SNMP_CREDENTIAL_KEYS is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict) or not parsed:
+        raise ValueError(
+            'SNMP_CREDENTIAL_KEYS must be a non-empty JSON object, e.g. {"k1": "<hex>"}'
+        )
+
+    ring: dict[str, bytes] = {}
+    for key_id, value in parsed.items():
+        if not isinstance(value, str):
+            raise ValueError(f"SNMP_CREDENTIAL_KEYS[{key_id!r}] must be a hex string")
+        try:
+            material = bytes.fromhex(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"SNMP_CREDENTIAL_KEYS[{key_id!r}] is not hex: {exc}"
+            ) from exc
+        if len(material) != CREDENTIAL_KEY_BYTES:
+            raise ValueError(
+                f"SNMP_CREDENTIAL_KEYS[{key_id!r}] is {len(material)} bytes; "
+                f"it must be {CREDENTIAL_KEY_BYTES}. "
+                "Generate one with: openssl rand -hex 32"
+            )
+        ring[key_id] = material
+    return ring
 
 
 class DatabaseSettings(BaseSettings):
@@ -112,6 +155,11 @@ class Settings(DatabaseSettings):
     # With no real SNMP agents around, the simulator is the default. Flipping
     # this to false uses pysnmp against the machines' IPv4 addresses.
     snmp_simulate: bool = True
+    # The seed for the built-in `default-v2c` credential profile, and nothing
+    # else. Since credentials became rows, the sampler has no fallback path to
+    # this value: `app.services.bootstrap` copies it into a profile once, on the
+    # first boot that finds none, and never reads it again. Removable a release
+    # after every deployment has been through that boot.
     snmp_community: str = "public"
     snmp_port: int = 161
     # Worst case per machine is timeout * (retries + 1) = 3.0s, inside the 4.0s
@@ -130,6 +178,21 @@ class Settings(DatabaseSettings):
     # both ships the diskio module and exposes 1.3.6.1.4.1.2021.13.15 in its
     # view. Turn it off for agents that have neither.
     snmp_diskio_enabled: bool = True
+
+    # ---- SNMP credential encryption -----------------------------------------
+    # A key *ring*, not a key: `{"k1": "<64 hex chars>", ...}`, with
+    # SNMP_CREDENTIAL_ACTIVE_KEY naming the one new writes use. Every row
+    # records the id it was encrypted under, so old keys stay in the ring until
+    # `python -m app.db.reencrypt` has moved every row onto the new one. That is
+    # what makes rotation a rolling operation rather than a re-entry of every
+    # passphrase.
+    #
+    # Unlike JWT_SECRET these have defaults, because the simulated sampler never
+    # decrypts anything and a developer running SNMP_SIMULATE=true should not
+    # need to generate a key. The validator below demands them as soon as the
+    # deployment polls real agents.
+    snmp_credential_keys: SecretStr = SecretStr("")
+    snmp_credential_active_key: str = ""
 
     # ---- Metric retention ----------------------------------------------------
     # Applied as TimescaleDB background jobs by `app.db.policies`. Either at 0
@@ -222,6 +285,46 @@ class Settings(DatabaseSettings):
                 "generate one with: openssl rand -hex 32"
             )
         return self
+
+    @model_validator(mode="after")
+    def _credential_key_ring_is_usable(self) -> "Settings":
+        """Refuse to start without a usable key ring, once SNMP is real.
+
+        Gated on `snmp_simulate` because the simulated sampler never decrypts a
+        credential, so demanding a key from a developer running the default
+        stack would be ceremony. The moment the deployment polls real agents the
+        key becomes load-bearing: without it every v3 machine fails every tick,
+        and a monitoring backend that reports itself healthy while collecting
+        nothing is worse than one that will not boot.
+        """
+        if self.snmp_simulate:
+            # Still reject a *malformed* ring even here — a typo should surface
+            # on the developer's machine, not on the first real deployment.
+            parse_key_ring(self.snmp_credential_keys.get_secret_value())
+            return self
+
+        ring = parse_key_ring(self.snmp_credential_keys.get_secret_value())
+        if not ring:
+            raise ValueError(
+                "SNMP_CREDENTIAL_KEYS must be set when SNMP_SIMULATE=false. "
+                'Generate one with: openssl rand -hex 32, then set {"k1": "<that>"} '
+                "and SNMP_CREDENTIAL_ACTIVE_KEY=k1"
+            )
+        if not self.snmp_credential_active_key.strip():
+            raise ValueError(
+                "SNMP_CREDENTIAL_ACTIVE_KEY must name one of the ids in "
+                f"SNMP_CREDENTIAL_KEYS ({', '.join(sorted(ring))})"
+            )
+        if self.snmp_credential_active_key not in ring:
+            raise ValueError(
+                f"SNMP_CREDENTIAL_ACTIVE_KEY={self.snmp_credential_active_key!r} is "
+                f"not in SNMP_CREDENTIAL_KEYS ({', '.join(sorted(ring))})"
+            )
+        return self
+
+    @property
+    def credential_key_ring(self) -> dict[str, bytes]:
+        return parse_key_ring(self.snmp_credential_keys.get_secret_value())
 
 
 @lru_cache

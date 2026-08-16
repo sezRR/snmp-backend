@@ -9,15 +9,27 @@ from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
 
 from app import __version__
-from app.api.routers import admin, auth, health, machines, metrics, roles, stream, users
+from app.api.routers import (
+    admin,
+    auth,
+    credentials,
+    health,
+    machines,
+    metrics,
+    roles,
+    stream,
+    users,
+)
 from app.api.security import StreamTickets
 from app.config import Settings, get_settings
 from app.db.migrate import run_migrations
 from app.db.policies import apply_policies
 from app.db.pool import Database
-from app.services.bootstrap import bootstrap_admin
+from app.security.crypto import CredentialCipher
+from app.services.bootstrap import bootstrap_admin, bootstrap_credentials
 from app.services.bus import MetricBus
 from app.services.collector import Collector
+from app.services.credentials import CredentialCache
 from app.services.openstack import build_lookup
 from app.services.snmp import build_sampler
 
@@ -55,6 +67,13 @@ async def lifespan(app: FastAPI):
     # than one that refuses to come up.
     await bootstrap_admin(db, settings)
 
+    app.state.cipher = CredentialCipher.from_settings(settings)
+    # Seeds the default v2c profile from SNMP_COMMUNITY on the first boot that
+    # finds none, and binds the machines that predate credentials. Not a
+    # migration: Alembic runs without the key ring, and this needs to encrypt.
+    await bootstrap_credentials(db, settings, app.state.cipher)
+    app.state.credentials = CredentialCache(db, app.state.cipher)
+
     app.state.bus = MetricBus(queue_maxsize=settings.sse_queue_maxsize)
     # In-process and per-pod, like the bus a stream reads from.
     app.state.stream_tickets = StreamTickets(settings.stream_ticket_ttl_seconds)
@@ -68,6 +87,7 @@ async def lifespan(app: FastAPI):
         sampler=app.state.sampler,
         lookup=app.state.lookup,
         bus=app.state.bus,
+        credentials=app.state.credentials,
     )
     if settings.collector_enabled:
         app.state.collector.start()
@@ -115,6 +135,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(users.router)
     app.include_router(roles.router)
     app.include_router(machines.router)
+    app.include_router(credentials.router)
+    # Same /machines prefix as the machines router, carrying the credential
+    # sub-resource. Separate because its routes are gated on credentials:write.
+    app.include_router(credentials.machine_router)
     app.include_router(metrics.router)
     app.include_router(stream.router)
     app.include_router(admin.router)

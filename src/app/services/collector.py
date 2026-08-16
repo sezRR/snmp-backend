@@ -2,7 +2,7 @@
 
 Every `COLLECTOR_INTERVAL_SECONDS`:
 
-1. read the enabled machines;
+1. read the enabled machines, each with the SNMP credential it is bound to;
 2. refresh each IPv4 from the OpenStack lookup — OpenStack owns the address, so a
    re-IP'd server keeps being polled without the client doing anything;
 3. sample all of them concurrently, bounded by `COLLECTOR_CONCURRENCY`;
@@ -10,7 +10,10 @@ Every `COLLECTOR_INTERVAL_SECONDS`:
 5. publish each sample to the bus for SSE subscribers.
 
 A machine that fails to answer is recorded and skipped; it never stops the tick
-or the other machines' samples.
+or the other machines' samples. A machine with no credential bound is recorded
+the same way rather than skipped silently — there is no fallback community
+string any more, so "nobody has given this machine a credential" is a real and
+reportable state.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from app.db import metrics as metrics_repo
 from app.db.pool import Database
 from app.models.metric import MetricSample
 from app.services.bus import MetricBus
+from app.services.credentials import CredentialCache
 from app.services.openstack import CachedOpenStack, normalise_mac
 from app.services.snmp import SnmpSampler
 
@@ -39,6 +43,9 @@ class MachineStatus:
     def __init__(self, mac: str) -> None:
         self.mac = mac
         self.ipv4: str | None = None
+        # The credential's name, not its id: this is read by a human wondering
+        # why a machine is failing, and a UUID answers nothing.
+        self.credential: str | None = None
         self.ok_count = 0
         self.fail_count = 0
         self.last_ok: datetime | None = None
@@ -49,12 +56,18 @@ class MachineStatus:
         return {
             "mac": self.mac,
             "ipv4": self.ipv4,
+            "credential": self.credential,
             "ok_count": self.ok_count,
             "fail_count": self.fail_count,
             "last_ok": self.last_ok,
             "last_error": self.last_error,
             "last_error_at": self.last_error_at,
         }
+
+    def record_failure(self, error: str) -> None:
+        self.fail_count += 1
+        self.last_error = error
+        self.last_error_at = datetime.now(timezone.utc)
 
 
 class Collector:
@@ -65,12 +78,14 @@ class Collector:
         sampler: SnmpSampler,
         lookup: CachedOpenStack,
         bus: MetricBus,
+        credentials: CredentialCache,
     ) -> None:
         self._settings = settings
         self._db = db
         self._sampler = sampler
         self._lookup = lookup
         self._bus = bus
+        self._credentials = credentials
         self._task: asyncio.Task[None] | None = None
         self._semaphore = asyncio.Semaphore(settings.collector_concurrency)
         # The loop and POST /admin/collector/tick both call `tick()`. Two ticks
@@ -196,7 +211,7 @@ class Collector:
         self.tick_count += 1
         self.last_tick_at = datetime.now(timezone.utc)
 
-        rows = await self._db.run_query(machines_repo.list_all, True)
+        rows = await self._db.run_query(machines_repo.list_for_polling)
         if not rows:
             self.last_inserted = 0
             self.last_failed = 0
@@ -205,7 +220,7 @@ class Collector:
         targets = await self._resolve_addresses(rows)
 
         results = await asyncio.gather(
-            *(self._sample_one(mac, ipv4) for mac, ipv4 in targets),
+            *(self._sample_one(row, ipv4) for row, ipv4 in targets),
             return_exceptions=False,
         )
         samples = [sample for sample in results if sample is not None]
@@ -225,8 +240,10 @@ class Collector:
 
         return len(samples)
 
-    async def _resolve_addresses(self, rows: list[dict[str, Any]]) -> list[tuple[str, str]]:
-        """Pair each MAC with the address to poll, following OpenStack.
+    async def _resolve_addresses(
+        self, rows: list[dict[str, Any]]
+    ) -> list[tuple[dict[str, Any], str]]:
+        """Pair each machine row with the address to poll, following OpenStack.
 
         External machines have no lookup record, so their stored address stands
         as given — the client is the only thing that can move them.
@@ -239,7 +256,7 @@ class Collector:
             log.warning("address refresh skipped: %s", exc)
             index = {}
 
-        targets: list[tuple[str, str]] = []
+        targets: list[tuple[dict[str, Any], str]] = []
         for row in rows:
             mac = row["mac"]
             ipv4 = row["ipv4"]
@@ -251,29 +268,68 @@ class Collector:
                 log.info("machine %s is in OpenStack after all; no longer external", mac)
                 await self._db.run_query(machines_repo.mark_managed, mac)
             if server is not None and server.ipv4 != ipv4:
-                log.info("machine %s moved %s -> %s", mac, ipv4, server.ipv4)
+                # A managed machine's credential follows it: OpenStack is the
+                # address authority here, and anyone able to re-IP a server
+                # there already holds more than this credential is worth. Named
+                # in the log so the move is at least visible to whoever owns it.
+                log.info(
+                    "machine %s moved %s -> %s (credential %s)",
+                    mac,
+                    ipv4,
+                    server.ipv4,
+                    row["credential_name"] or "none",
+                )
                 await self._db.run_query(machines_repo.set_ipv4, mac, server.ipv4)
                 ipv4 = server.ipv4
-            targets.append((mac, ipv4))
-            self.statuses.setdefault(mac, MachineStatus(mac)).ipv4 = ipv4
+            targets.append((row, ipv4))
+            status = self.statuses.setdefault(mac, MachineStatus(mac))
+            status.ipv4 = ipv4
+            status.credential = row["credential_name"]
         return targets
 
-    async def _sample_one(self, mac: str, ipv4: str) -> MetricSample | None:
+    async def _sample_one(
+        self, row: dict[str, Any], ipv4: str
+    ) -> MetricSample | None:
+        mac = row["mac"]
         status = self.statuses.setdefault(mac, MachineStatus(mac))
+
+        if row["credential_id"] is None:
+            # Not an error the machine can fix by answering: nobody has told us
+            # how to authenticate to it. Reported per machine rather than
+            # dropped, so it shows up in /admin/collector as the configuration
+            # gap it is instead of the machine simply never appearing.
+            status.record_failure(
+                "no credential bound: PUT /machines/{mac}/snmp-credential"
+            )
+            return None
+
+        try:
+            credential = await self._credentials.resolve(
+                row["credential_id"], row["credential_secret_version"]
+            )
+        except Exception as exc:
+            # A deleted credential, or a key ring that can no longer open this
+            # row. Either way there is nothing to poll with, and the whole tick
+            # must not fail over one machine's credential.
+            status.record_failure(f"{type(exc).__name__}: {exc}")
+            log.warning("credential unavailable for %s (%s): %s", mac, ipv4, exc)
+            return None
+
         async with self._semaphore:
             try:
                 # The MAC, not the address, is what the sampler remembers
                 # counter baselines under: OpenStack may re-IP a machine between
                 # two ticks and its history should survive that.
                 metrics = await asyncio.wait_for(
-                    self._sampler.sample(ipv4, mac), timeout=self._sample_budget
+                    self._sampler.sample(ipv4, mac, credential),
+                    timeout=self._sample_budget,
                 )
             except asyncio.TimeoutError:
                 # Recorded like any other failure. The point is the slot: a host
                 # that never answers must not hold one for a whole period.
-                status.fail_count += 1
-                status.last_error = f"TimeoutError: no sample within {self._sample_budget:.1f}s"
-                status.last_error_at = datetime.now(timezone.utc)
+                status.record_failure(
+                    f"TimeoutError: no sample within {self._sample_budget:.1f}s"
+                )
                 log.warning(
                     "sample timed out for %s (%s) after %.1fs",
                     mac,
@@ -282,9 +338,7 @@ class Collector:
                 )
                 return None
             except Exception as exc:
-                status.fail_count += 1
-                status.last_error = f"{type(exc).__name__}: {exc}"
-                status.last_error_at = datetime.now(timezone.utc)
+                status.record_failure(f"{type(exc).__name__}: {exc}")
                 log.warning("sample failed for %s (%s): %s", mac, ipv4, exc)
                 return None
         status.ok_count += 1

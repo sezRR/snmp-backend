@@ -165,6 +165,13 @@ async def update_machine(
     where it moved. OpenStack owns a managed machine's address and the collector
     re-reads it every tick, so accepting a patch there would be a lie that lasts
     one interval.
+
+    And not even then, once a credential is bound. Repointing a machine that
+    holds a shared credential aims the collector's next authenticated poll at
+    whatever is at the new address, which is how a holder of `machines:write`
+    alone would harvest a fleet-wide SNMPv3 passphrase from a host they control.
+    Unbind, repoint, rebind: the rebind is what requires `credentials:write`,
+    and requiring it is the point.
     """
     parsed = parse_mac(mac)
     ipv4 = str(payload.ipv4) if payload.ipv4 is not None else None
@@ -181,6 +188,15 @@ async def update_machine(
                 detail=(
                     f"machine {parsed} is an OpenStack server; its address comes "
                     "from the lookup and cannot be patched"
+                ),
+            )
+        if current["credential_id"] is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"machine {parsed} has an SNMP credential bound; unbind it "
+                    "with DELETE /machines/{mac}/snmp-credential before changing "
+                    "the address, then bind it again"
                 ),
             )
 

@@ -19,9 +19,15 @@ and reports null.
 
 from __future__ import annotations
 
+import logging
 import random
 import time
 from typing import Any, Awaitable, Callable
+from uuid import UUID
+
+from app.models.credential import ResolvedCredential
+
+log = logging.getLogger(__name__)
 
 _GIB = 1024**3
 _MIB = 1024**2
@@ -37,6 +43,9 @@ class SimulatedSampler:
     def __init__(self, hardware: HardwareResolver | None = None) -> None:
         self._state: dict[str, dict[str, float]] = {}
         self._hardware = hardware
+
+    def forget_credential(self, credential_id: UUID) -> None:
+        """Nothing to forget: this sampler holds no per-credential state."""
 
     def _profile(
         self, key: str, hardware: tuple[int, int, int] | None
@@ -91,7 +100,16 @@ class SimulatedSampler:
     def _walk(value: float, step: float, low: float, high: float) -> float:
         return min(high, max(low, value + random.uniform(-step, step)))
 
-    async def sample(self, ipv4: str, key: str) -> dict[str, Any]:
+    async def sample(
+        self, ipv4: str, key: str, credential: ResolvedCredential
+    ) -> dict[str, Any]:
+        # Accepted and ignored. There is no agent to authenticate to, so there
+        # is nothing for a credential to be right or wrong against, and a
+        # simulated validation would be a second implementation of the real
+        # check — one that drifts from it and reports pass where pysnmp fails.
+        # The binding is still exercised end to end: an unbound machine never
+        # reaches this method, because the collector skips it first.
+        log.debug("simulated sample of %s with credential %s", ipv4, credential.name)
         state = self._state.get(key)
         if state is None:
             hardware = await self._hardware(ipv4) if self._hardware else None

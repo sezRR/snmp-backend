@@ -1,4 +1,6 @@
-"""Ensure the admin role and the admin account exist, on every boot.
+"""Ensure the admin role, the admin account and the default credential exist.
+
+Runs on every boot, after migrations and before the app serves anything.
 
 This runs after migrations and before the app serves anything, and it raises on
 failure — which crashes the pod. That is the intent: an API whose permission
@@ -24,14 +26,19 @@ locked everyone out permanently.
 from __future__ import annotations
 
 import logging
+from uuid import uuid4
 
+from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session
 
 from app.config import Settings
+from app.db import credentials as credentials_repo
+from app.db import machines as machines_repo
 from app.db import roles as roles_repo
 from app.db import users as users_repo
 from app.db.pool import Database
 from app.db.tables import Role, RoleScope
+from app.security.crypto import CredentialCipher
 from app.security.scopes import ADMIN_ROLE_NAME, ALL_SCOPES
 from app.services.auth import hash_password_blocking
 
@@ -106,3 +113,78 @@ def bootstrap_blocking(session: Session, settings: Settings) -> None:
 async def bootstrap_admin(db: Database, settings: Settings) -> None:
     """Run the reconciler in one transaction. Raises to abort startup."""
     await db.run_session(bootstrap_blocking, settings)
+
+
+# --- SNMP credentials --------------------------------------------------------
+
+DEFAULT_V2C_NAME = "default-v2c"
+
+
+def seed_default_credential_blocking(
+    conn: Connection, settings: Settings, cipher: CredentialCipher
+) -> None:
+    """Carry `SNMP_COMMUNITY` into a credential profile, once.
+
+    Migration 0003 adds the table and leaves it empty, because Alembic runs with
+    `DatabaseSettings` and has no key ring to encrypt with. This is where the
+    upgrade actually lands: the community string every machine was previously
+    polled with becomes a `default-v2c` profile, and every machine that has no
+    credential is bound to it, so a fleet that was being polled before the
+    upgrade is still being polled after it.
+
+    **The bind only runs in the same pass that creates the profile.** Rebinding
+    unbound machines on every boot would undo a deliberate unbind — including
+    the unbind that `PATCH /machines/{mac}` tells an operator to perform before
+    moving a machine's address, which would then silently rebind under them.
+    After the first pass this function does nothing at all.
+    """
+    existing = credentials_repo.get_by_name(conn, DEFAULT_V2C_NAME)
+    if existing is not None:
+        return
+
+    credential_id = uuid4()
+    payload = {"community": settings.snmp_community}
+    secret, key_id = cipher.encrypt(credential_id, 1, payload)
+    row = credentials_repo.insert(
+        conn,
+        credential_id,
+        DEFAULT_V2C_NAME,
+        "Created from SNMP_COMMUNITY when this deployment gained credentials.",
+        "2c",
+        None,
+        None,
+        None,
+        None,
+        secret,
+        key_id,
+        cipher.fingerprint(payload),
+    )
+    if row is None:
+        # Another replica won the race between the read and this insert.
+        return
+
+    bound = machines_repo.bind_unbound(conn, credential_id)
+    log.warning(
+        "credential bootstrap: created %r from SNMP_COMMUNITY and bound %s "
+        "existing machine(s) to it — SNMP_COMMUNITY is no longer read after this",
+        DEFAULT_V2C_NAME,
+        bound,
+    )
+
+
+async def bootstrap_credentials(
+    db: Database, settings: Settings, cipher: CredentialCipher
+) -> None:
+    """Seed the default credential, if this deployment has a key to seal it.
+
+    Skipped without a key ring, which is the simulated-stack case: `Settings`
+    only demands one when `SNMP_SIMULATE=false`, and a simulated sampler
+    authenticates to nothing. The endpoints report the same missing
+    configuration as a 503 if anyone tries to create a credential anyway.
+    """
+    if not cipher.usable:
+        log.info(
+            "credential bootstrap: skipped, no SNMP_CREDENTIAL_KEYS configured"
+        )
+        return
+    await db.run_query(seed_default_credential_blocking, settings, cipher)

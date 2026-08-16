@@ -14,13 +14,28 @@ a bind marker, so every cast is written `CAST(x AS type)`.
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 _COLUMNS = (
     "CAST(mac AS text) AS mac, host(ipv4) AS ipv4, label, enabled, external, "
-    "created_at, updated_at"
+    "credential_id, created_at, updated_at"
+)
+
+# What the collector needs, and only the collector: the machine plus its
+# credential's identity and secret counter, which together are the sampler's
+# cache key. Joined rather than denormalised onto the machine so an edit to the
+# credential is picked up on the next tick without touching every bound row. The
+# ciphertext is deliberately absent — see `app.db.credentials`.
+#
+# Spelled out rather than built from `_COLUMNS` because `created_at` and
+# `updated_at` exist on both tables and would be ambiguous unqualified.
+_POLL_COLUMNS = (
+    "CAST(m.mac AS text) AS mac, host(m.ipv4) AS ipv4, m.label, m.enabled, "
+    "m.external, m.credential_id, m.created_at, m.updated_at, "
+    "c.name AS credential_name, c.secret_version AS credential_secret_version"
 )
 
 
@@ -77,6 +92,73 @@ def list_all(conn: Connection, enabled_only: bool = False) -> list[dict[str, Any
         {"enabled_only": enabled_only},
     ).mappings()
     return [dict(row) for row in rows]
+
+
+def list_for_polling(conn: Connection) -> list[dict[str, Any]]:
+    """The enabled machines, each with the credential it is bound to.
+
+    A LEFT JOIN, not an inner one: an unbound machine still comes back so the
+    collector can record "no credential bound" against it. Dropping it from the
+    result would make a machine that is enabled and registered simply vanish
+    from /admin/collector, which is the least helpful way to report a
+    misconfiguration.
+    """
+    rows = conn.execute(
+        text(
+            f"""
+            SELECT {_POLL_COLUMNS}
+            FROM machines m
+            LEFT JOIN snmp_credentials c ON c.id = m.credential_id
+            WHERE m.enabled
+            ORDER BY m.created_at
+            """
+        )
+    ).mappings()
+    return [dict(row) for row in rows]
+
+
+def bind_credential(
+    conn: Connection, mac: str, credential_id: UUID
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        text(
+            f"""
+            UPDATE machines
+            SET credential_id = :credential_id, updated_at = now()
+            WHERE mac = :mac
+            RETURNING {_COLUMNS}
+            """
+        ),
+        {"mac": mac, "credential_id": credential_id},
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+def unbind_credential(conn: Connection, mac: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        text(
+            f"""
+            UPDATE machines
+            SET credential_id = NULL, updated_at = now()
+            WHERE mac = :mac
+            RETURNING {_COLUMNS}
+            """
+        ),
+        {"mac": mac},
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+def bind_unbound(conn: Connection, credential_id: UUID) -> int:
+    """Bind every machine that has no credential. Used once, at bootstrap."""
+    result = conn.execute(
+        text(
+            "UPDATE machines SET credential_id = :credential_id, updated_at = now() "
+            "WHERE credential_id IS NULL"
+        ),
+        {"credential_id": credential_id},
+    )
+    return result.rowcount
 
 
 def update(

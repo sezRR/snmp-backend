@@ -1,4 +1,4 @@
-"""Real SNMP sampling with pysnmp (v2c).
+"""Real SNMP sampling with pysnmp (v2c and v3).
 
 Walks HOST-RESOURCES-MIB, IF-MIB and UCD's DISKIO-MIB by numeric OID rather than
 by name, so the image needs no compiled MIB files:
@@ -33,6 +33,18 @@ HOST-RESOURCES-MIB rows" rather than as a permission error:
 DISKIO-MIB additionally needs an snmpd that ships the `ucd-snmp/diskio` module.
 Without it that walk comes back empty and the `disk_io` key is simply dropped.
 
+**One `SnmpEngine` per credential**, not one per process. pysnmp's LCD caches
+USM users on the engine under `(userName, securityEngineId)`
+(`hlapi/v3arch/asyncio/lcd.py`), and since we never set a security engine id,
+two credentials that share a `userName` — the same `monitor` account with
+different passphrases on two sets of hosts, which is an ordinary thing to
+configure — land on the same cache key. pysnmp copes by deleting and re-adding
+the user, mutating engine state that up to `COLLECTOR_CONCURRENCY` samples are
+using at that moment. The failures that produces are intermittent and
+load-dependent, which is the worst kind to debug. Separate engines have no
+shared cache to race on, and the cost is one engine per distinct credential, not
+per machine.
+
 Selected by `SNMP_SIMULATE=false`.
 """
 
@@ -44,21 +56,62 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import UUID
 
 from pysnmp.hlapi.v3arch.asyncio import (
+    USM_AUTH_HMAC96_MD5,
+    USM_AUTH_HMAC96_SHA,
+    USM_AUTH_HMAC128_SHA224,
+    USM_AUTH_HMAC192_SHA256,
+    USM_AUTH_HMAC256_SHA384,
+    USM_AUTH_HMAC384_SHA512,
+    USM_AUTH_NONE,
+    USM_PRIV_CBC56_DES,
+    USM_PRIV_CBC168_3DES,
+    USM_PRIV_CFB128_AES,
+    USM_PRIV_CFB192_AES,
+    USM_PRIV_CFB256_AES,
+    USM_PRIV_NONE,
     CommunityData,
     ContextData,
     ObjectIdentity,
     ObjectType,
     SnmpEngine,
     UdpTransportTarget,
+    UsmUserData,
     bulk_walk_cmd,
 )
 from pysnmp.proto import errind
 
+from app.models.credential import (
+    AuthProtocol,
+    PrivProtocol,
+    ResolvedCredential,
+    SnmpVersion,
+)
 from app.services.snmp import SnmpError
 
 log = logging.getLogger(__name__)
+
+# Our column values -> pysnmp's protocol objects. A dict rather than putting
+# pysnmp's names in the database, so the stored value stays a stable, readable
+# string that survives a pysnmp rename.
+AUTH_PROTOCOLS = {
+    AuthProtocol.MD5: USM_AUTH_HMAC96_MD5,
+    AuthProtocol.SHA: USM_AUTH_HMAC96_SHA,
+    AuthProtocol.SHA224: USM_AUTH_HMAC128_SHA224,
+    AuthProtocol.SHA256: USM_AUTH_HMAC192_SHA256,
+    AuthProtocol.SHA384: USM_AUTH_HMAC256_SHA384,
+    AuthProtocol.SHA512: USM_AUTH_HMAC384_SHA512,
+}
+
+PRIV_PROTOCOLS = {
+    PrivProtocol.DES: USM_PRIV_CBC56_DES,
+    PrivProtocol.TRIPLE_DES: USM_PRIV_CBC168_3DES,
+    PrivProtocol.AES128: USM_PRIV_CFB128_AES,
+    PrivProtocol.AES192: USM_PRIV_CFB192_AES,
+    PrivProtocol.AES256: USM_PRIV_CFB256_AES,
+}
 
 HR_PROCESSOR_LOAD = "1.3.6.1.2.1.25.3.3.1.2"
 HR_STORAGE_TYPE = "1.3.6.1.2.1.25.2.3.1.2"
@@ -241,28 +294,65 @@ class _CounterState:
         return max(self.interfaces_at or 0.0, self.disks_at or 0.0)
 
 
+@dataclass(frozen=True, slots=True)
+class _Session:
+    """Everything a walk needs that comes from the credential, not the host.
+
+    Built once per `(credential_id, secret_version)` and reused for every
+    machine bound to that credential. The engine is the part that must not be
+    shared across credentials — see the module docstring.
+    """
+
+    engine: SnmpEngine
+    auth: Any
+    context: ContextData
+
+
+def build_auth(credential: ResolvedCredential) -> Any:
+    """The pysnmp auth object for a credential. No I/O, no engine state."""
+    if credential.snmp_version is SnmpVersion.V2C:
+        return CommunityData(credential.community, mpModel=1)  # mpModel=1 → v2c
+
+    # Passphrases, not localized keys: pysnmp localizes them against whatever
+    # engine id discovery returns. Storing localized keys instead would pin each
+    # credential to one agent's engine id and defeat the point of sharing.
+    return UsmUserData(
+        credential.username,
+        authKey=credential.auth_passphrase,
+        privKey=credential.priv_passphrase,
+        authProtocol=(
+            AUTH_PROTOCOLS[credential.auth_protocol]
+            if credential.auth_protocol
+            else USM_AUTH_NONE
+        ),
+        privProtocol=(
+            PRIV_PROTOCOLS[credential.priv_protocol]
+            if credential.priv_protocol
+            else USM_PRIV_NONE
+        ),
+    )
+
+
 class PySnmpSampler:
     """Implements the `SnmpSampler` protocol."""
 
     def __init__(
         self,
-        community: str,
         port: int,
         timeout_seconds: float,
         retries: int,
         max_repetitions: int = 25,
         diskio_enabled: bool = True,
     ) -> None:
-        self._auth = CommunityData(community, mpModel=1)  # mpModel=1 → SNMPv2c
         self._port = port
         self._timeout = timeout_seconds
         self._retries = retries
         self._max_repetitions = max_repetitions
         self._diskio_enabled = diskio_enabled
-        # One engine for the process; it is safe to share across concurrent
-        # requests and avoids re-running engine setup every interval.
-        self._engine = SnmpEngine()
-        self._context = ContextData()
+        # (credential id, secret version) -> its own engine and auth object.
+        # Keyed on the version too, so an edited passphrase builds a fresh
+        # engine rather than fighting pysnmp's USM cache over the old one.
+        self._sessions: dict[tuple[UUID, int], _Session] = {}
         # Machine key (its MAC, not its address) -> previous counter read.
         self._counters: dict[str, _CounterState] = {}
         # Address -> bulk size that host's path was found to tolerate. Keyed on
@@ -274,17 +364,52 @@ class PySnmpSampler:
         # than every interval.
         self._warned_diskio32: set[str] = set()
 
+    # ---- sessions -----------------------------------------------------------
+
+    def _session(self, credential: ResolvedCredential) -> _Session:
+        """The engine and auth object for one credential, built on first use."""
+        key = credential.cache_key
+        session = self._sessions.get(key)
+        if session is None:
+            session = _Session(
+                engine=SnmpEngine(),
+                auth=build_auth(credential),
+                context=ContextData(),
+            )
+            self._sessions[key] = session
+            # Superseded versions of the same credential are dead the moment a
+            # new one is used: nothing is polling with the old passphrase any
+            # more, and holding the engine would hold its decrypted USM keys too.
+            for stale in [
+                k for k in self._sessions if k[0] == key[0] and k[1] != key[1]
+            ]:
+                del self._sessions[stale]
+            log.info(
+                "snmp: opened an engine for credential %s (%s, v%s)",
+                credential.name,
+                f"SNMPv{credential.snmp_version}",
+                credential.secret_version,
+            )
+        return session
+
+    def forget_credential(self, credential_id: UUID) -> None:
+        """Drop every engine for a credential — it was deleted."""
+        for key in [k for k in self._sessions if k[0] == credential_id]:
+            del self._sessions[key]
+
     # ---- transport ----------------------------------------------------------
 
-    async def _walk_once(self, target, root_oid: str, repetitions: int) -> dict[str, Any]:
+    async def _walk_once(
+        self, session: _Session, target, root_oid: str, repetitions: int
+    ) -> dict[str, Any]:
         """GETBULK-walk one column, keyed by row index (the OID suffix)."""
         values: dict[str, Any] = {}
         prefix = root_oid + "."
         async for err_indication, err_status, err_index, var_binds in bulk_walk_cmd(
-            self._engine,
-            self._auth,
+            session.engine,
+            session.auth,
             target,
-            self._context,
+            session.context,
             0,
             repetitions,
             ObjectType(ObjectIdentity(root_oid)),
@@ -303,7 +428,9 @@ class PySnmpSampler:
                 values[oid_str[len(prefix) :]] = value
         return values
 
-    async def _walk(self, target, host: str, root_oid: str) -> dict[str, Any]:
+    async def _walk(
+        self, session: _Session, target, host: str, root_oid: str
+    ) -> dict[str, Any]:
         """Walk one column, backing off the bulk size if the reply never arrives.
 
         A response too large for the smallest MTU on the path is fragmented, and a
@@ -322,7 +449,7 @@ class PySnmpSampler:
         repetitions = self._repetitions.get(host, self._max_repetitions)
         while True:
             try:
-                return await self._walk_once(target, root_oid, repetitions)
+                return await self._walk_once(session, target, root_oid, repetitions)
             except _WalkTimeout:
                 if repetitions <= 1:
                     # One row per response and it still does not arrive: this is
@@ -338,17 +465,24 @@ class PySnmpSampler:
                     repetitions,
                 )
 
-    async def _walk_all(self, target, host: str, *root_oids: str) -> list[dict[str, Any]]:
+    async def _walk_all(
+        self, session: _Session, target, host: str, *root_oids: str
+    ) -> list[dict[str, Any]]:
         """Walk several columns at once. One round trip's latency, not N."""
         return list(
-            await asyncio.gather(*(self._walk(target, host, oid) for oid in root_oids))
+            await asyncio.gather(
+                *(self._walk(session, target, host, oid) for oid in root_oids)
+            )
         )
 
     # ---- host resources -----------------------------------------------------
 
-    async def _host_resources(self, target, host: str) -> dict[str, Any]:
+    async def _host_resources(
+        self, session: _Session, target, host: str
+    ) -> dict[str, Any]:
         """CPU load and the storage table: memory and mounted filesystems."""
         loads, types, descrs, units, sizes, used = await self._walk_all(
+            session,
             target,
             host,
             HR_PROCESSOR_LOAD,
@@ -410,7 +544,7 @@ class PySnmpSampler:
     # ---- network ------------------------------------------------------------
 
     async def _network(
-        self, target, host: str, now: float, state: _CounterState
+        self, session: _Session, target, host: str, now: float, state: _CounterState
     ) -> tuple[dict[str, Any], dict[str, tuple[int, int]]]:
         """Per-interface throughput, derived from the octet counters.
 
@@ -419,6 +553,7 @@ class PySnmpSampler:
         and the two would clobber each other's half of the state.
         """
         names, types, oper, hc_in, hc_out, high_speed, speed = await self._walk_all(
+            session,
             target,
             host,
             IF_NAME,
@@ -440,7 +575,7 @@ class PySnmpSampler:
             fallbacks.extend((IF_IN_OCTETS, IF_OUT_OCTETS))
         if fallbacks:
             answered = dict(
-                zip(fallbacks, await self._walk_all(target, host, *fallbacks))
+                zip(fallbacks, await self._walk_all(session, target, host, *fallbacks))
             )
             names = names or answered.get(IF_DESCR, {})
             low_in = answered.get(IF_IN_OCTETS, {})
@@ -513,7 +648,7 @@ class PySnmpSampler:
     # ---- disk i/o -----------------------------------------------------------
 
     async def _disk_io(
-        self, target, ipv4: str, now: float, state: _CounterState
+        self, session: _Session, target, ipv4: str, now: float, state: _CounterState
     ) -> tuple[dict[str, Any], dict[str, tuple[int, int, int, int]]]:
         """Per-device throughput and IOPS, derived from the diskIO counters.
 
@@ -521,6 +656,7 @@ class PySnmpSampler:
         remember, without touching `self._counters`.
         """
         devices, read_x, written_x, reads_c, writes_c, la1 = await self._walk_all(
+            session,
             target,
             ipv4,
             DISK_IO_DEVICE,
@@ -539,7 +675,7 @@ class PySnmpSampler:
         narrow_bytes = not read_x
         if narrow_bytes:
             read_x, written_x = await self._walk_all(
-                target, ipv4, DISK_IO_NREAD, DISK_IO_NWRITTEN
+                session, target, ipv4, DISK_IO_NREAD, DISK_IO_NWRITTEN
             )
             if ipv4 not in self._warned_diskio32:
                 self._warned_diskio32.add(ipv4)
@@ -637,7 +773,10 @@ class PySnmpSampler:
 
     # ---- entry point --------------------------------------------------------
 
-    async def sample(self, ipv4: str, key: str) -> dict[str, Any]:
+    async def sample(
+        self, ipv4: str, key: str, credential: ResolvedCredential
+    ) -> dict[str, Any]:
+        session = self._session(credential)
         target = await UdpTransportTarget.create(
             (ipv4, self._port), timeout=self._timeout, retries=self._retries
         )
@@ -648,11 +787,11 @@ class PySnmpSampler:
         state = self._counters.get(key) or _CounterState()
 
         tasks: list[Any] = [
-            self._host_resources(target, ipv4),
-            self._network(target, ipv4, now, state),
+            self._host_resources(session, target, ipv4),
+            self._network(session, target, ipv4, now, state),
         ]
         if self._diskio_enabled:
-            tasks.append(self._disk_io(target, ipv4, now, state))
+            tasks.append(self._disk_io(session, target, ipv4, now, state))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
         host_result, net_result = results[0], results[1]

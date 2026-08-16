@@ -10,6 +10,13 @@ user and flavor all come from the lookup, exactly as they would for a real one.
 `/machines` requires the `machines:write` scope, so this logs in first with
 ADMIN_USERNAME / ADMIN_PASSWORD — the same values the backend was started with.
 
+Registering is only half of it. A machine with no SNMP credential bound is not
+polled at all — there is no fallback community string — so this then binds every
+unbound machine to the `default-v2c` profile the backend seeds from
+SNMP_COMMUNITY on its first boot. Binding is a separate call because it needs a
+separate scope (`credentials:write`), which is the whole point of the split: see
+`app.security.scopes`.
+
 Run it inside the stack (`docker compose --profile seed run --rm seed`) or from
 the host against the published port:
 
@@ -97,26 +104,74 @@ def login() -> str:
         )
 
 
-def register(ipv4: str, label: str, token: str) -> str:
-    body = json.dumps({"ipv4": ipv4, "label": label}).encode()
+def call(method: str, path: str, token: str, body: dict | None = None):
+    """One authenticated JSON call. Returns the decoded body, or raises."""
+    headers = {"Authorization": f"Bearer {token}"}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
     request = urllib.request.Request(
-        f"{API_BASE}/machines",
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-        },
-        method="POST",
+        f"{API_BASE}{path}", data=data, headers=headers, method=method
     )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        if response.status == 204:
+            return None
+        return json.load(response)
+
+
+def register(ipv4: str, label: str, token: str) -> str:
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            payload = json.load(response)
-            return f"registered {payload['mac']}"
+        payload = call("POST", "/machines", token, {"ipv4": ipv4, "label": label})
+        return f"registered {payload['mac']}"
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")
         if exc.code == 409:
             return "already registered"
         return f"HTTP {exc.code}: {detail}"
+
+
+def default_credential_id(token: str) -> str | None:
+    """The profile the backend seeded from SNMP_COMMUNITY, if it did."""
+    try:
+        for credential in call("GET", "/snmp-credentials", token):
+            if credential["name"] == "default-v2c":
+                return credential["id"]
+    except urllib.error.HTTPError as exc:
+        print(f"could not list credentials: HTTP {exc.code}")
+    return None
+
+
+def bind_unbound(token: str) -> int:
+    """Bind every machine that has no credential. Returns how many were bound.
+
+    Re-runnable: a machine that is already bound is skipped, so this does not
+    undo a deliberate binding to some other profile.
+    """
+    credential_id = default_credential_id(token)
+    if credential_id is None:
+        print(
+            "\nno `default-v2c` credential: the backend was started without "
+            "SNMP_CREDENTIAL_KEYS, so nothing can be bound and nothing will be "
+            "polled. Set it in .env and restart — see .env.example."
+        )
+        return 0
+
+    bound = 0
+    for machine in call("GET", "/machines", token):
+        if machine["credential_id"] is not None:
+            continue
+        try:
+            call(
+                "PUT",
+                f"/machines/{machine['mac']}/snmp-credential",
+                token,
+                {"credential_id": credential_id},
+            )
+            bound += 1
+        except urllib.error.HTTPError as exc:
+            print(f"could not bind {machine['mac']}: HTTP {exc.code}")
+    return bound
 
 
 def main() -> int:
@@ -130,6 +185,7 @@ def main() -> int:
             failures += 1
         print(f"{label:<10} {ipv4:<12} {outcome}")
     print(f"\n{len(FLEET) - failures}/{len(FLEET)} machines present at {API_BASE}")
+    print(f"{bind_unbound(token)} machine(s) bound to default-v2c")
     return 1 if failures else 0
 
 

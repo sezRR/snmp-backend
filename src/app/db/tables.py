@@ -24,11 +24,14 @@ from datetime import UTC, datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
+    Integer,
+    LargeBinary,
     PrimaryKeyConstraint,
     Table,
     Text,
@@ -60,6 +63,97 @@ def _now() -> datetime:
 # --- Fleet -------------------------------------------------------------------
 
 
+class SnmpCredential(Base):
+    """How to authenticate to an agent. Shared by every machine bound to it.
+
+    Reusable on purpose: a fleet is usually polled with one or two credentials,
+    and re-entering a passphrase per host means it is never rotated. The cost is
+    blast radius, which the API answers by gating binding on its own scope — see
+    `app.api.routers.credentials`.
+
+    **`secret` is ciphertext**, never a passphrase. It holds
+    `nonce ‖ AES-256-GCM(json)` over `{"community": …}` for v2c or
+    `{"auth": …, "priv": …}` for v3, sealed against `key_id` and
+    `secret_version`; `app.security.crypto` is the only module that opens it.
+    `fingerprint` exists so a client can distinguish two profiles without the API
+    ever handing back what is inside.
+
+    Two "version" concepts live here and are deliberately not both called that:
+    `snmp_version` is the protocol, `secret_version` is a counter bumped on every
+    change to the secret. The second is what invalidates the sampler's decrypted
+    cache and its per-credential engine, so it must change even when nothing
+    else about the row does.
+    """
+
+    __tablename__ = "snmp_credentials"
+    __table_args__ = (
+        UniqueConstraint("name", name="uq_snmp_credentials_name"),
+        CheckConstraint("snmp_version IN ('2c', '3')", name="ck_snmp_credentials_version"),
+        CheckConstraint(
+            "security_level IS NULL OR security_level IN "
+            "('noAuthNoPriv', 'authNoPriv', 'authPriv')",
+            name="ck_snmp_credentials_security_level",
+        ),
+        CheckConstraint(
+            "auth_protocol IS NULL OR auth_protocol IN "
+            "('MD5', 'SHA', 'SHA224', 'SHA256', 'SHA384', 'SHA512')",
+            name="ck_snmp_credentials_auth_protocol",
+        ),
+        CheckConstraint(
+            "priv_protocol IS NULL OR priv_protocol IN "
+            "('DES', '3DES', 'AES128', 'AES192', 'AES256')",
+            name="ck_snmp_credentials_priv_protocol",
+        ),
+        # A v2c row carries no USM fields; a v3 row must name its user and level.
+        # The API validates this too, but the constraint is what makes a
+        # hand-edited row unable to reach the sampler as something half-formed.
+        CheckConstraint(
+            "(snmp_version = '2c' AND username IS NULL AND security_level IS NULL) "
+            "OR (snmp_version = '3' AND username IS NOT NULL "
+            "AND security_level IS NOT NULL)",
+            name="ck_snmp_credentials_version_shape",
+        ),
+        # The protocol columns are present exactly when the security level says
+        # they must be — the pairing USM itself requires.
+        CheckConstraint(
+            "(security_level IS NULL AND auth_protocol IS NULL "
+            "AND priv_protocol IS NULL) "
+            "OR (security_level = 'noAuthNoPriv' AND auth_protocol IS NULL "
+            "AND priv_protocol IS NULL) "
+            "OR (security_level = 'authNoPriv' AND auth_protocol IS NOT NULL "
+            "AND priv_protocol IS NULL) "
+            "OR (security_level = 'authPriv' AND auth_protocol IS NOT NULL "
+            "AND priv_protocol IS NOT NULL)",
+            name="ck_snmp_credentials_level_protocols",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    snmp_version: Mapped[str] = mapped_column(Text, nullable=False)
+    # The v3 securityName. Null for v2c, whose identity is the community string
+    # and therefore lives inside the ciphertext.
+    username: Mapped[str | None] = mapped_column(Text)
+    security_level: Mapped[str | None] = mapped_column(Text)
+    auth_protocol: Mapped[str | None] = mapped_column(Text)
+    priv_protocol: Mapped[str | None] = mapped_column(Text)
+    secret: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    key_id: Mapped[str] = mapped_column(Text, nullable=False)
+    secret_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("1")
+    )
+    fingerprint: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class Machine(Base):
     """A polled host. `mac` is the identity; OpenStack owns it for managed hosts."""
 
@@ -69,6 +163,7 @@ class Machine(Base):
         # An index rather than a UNIQUE constraint, because that is what
         # schema.sql created and what deployed databases already have.
         Index("machines_ipv4_key", "ipv4", unique=True),
+        Index("ix_machines_credential_id", "credential_id"),
     )
 
     mac: Mapped[str] = mapped_column(MACADDR)
@@ -79,6 +174,19 @@ class Machine(Base):
     )
     external: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
+    )
+    # Nullable, and an unbound machine is simply not polled — the collector says
+    # so per machine in /admin/collector rather than failing quietly. RESTRICT
+    # for the same reason `user_roles.role_id` uses it: deleting a credential
+    # that is still in use should be a 409 someone has to think about, not a
+    # silent mass-unbind that stops the fleet being sampled.
+    credential_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "snmp_credentials.id",
+            ondelete="RESTRICT",
+            name="fk_machines_credential_id_snmp_credentials",
+        ),
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

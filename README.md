@@ -24,9 +24,10 @@ local image instead of trying to reach Docker Hub.
 ## Design
 
 **OpenStack is the only source of truth for machine facts.** The database stores
-identity and polling address and nothing else: MAC, IPv4, the client's own label,
-an enabled flag. Server id, tenant, user, flavor and its specs are looked up per
-request and never persisted, so there is no second copy to drift.
+identity, polling address and how to authenticate, and nothing else: MAC, IPv4,
+the client's own label, an enabled flag, a credential reference. Server id,
+tenant, user, flavor and its specs are looked up per request and never persisted,
+so there is no second copy to drift.
 
 **MAC is identity; IPv4 is a polling address.** A client registers a machine by
 IPv4 and the backend resolves the MAC from OpenStack. Each collection cycle
@@ -48,6 +49,12 @@ during a lookup outage, or imported since — the next tick clears the flag.
 the sampler alone — no migration, no model edit, and aggregates over a metric that
 did not exist yet simply skip those rows.
 
+**SNMP credentials are rows, shared, and encrypted.** v2c and v3 are both
+credential profiles a machine is bound to, so there is one code path in the
+sampler and "which credential is this machine using" always has an answer.
+Sharing is what makes rotation feasible and what makes binding dangerous, so
+binding is a scope of its own — see [SNMP credentials](#snmp-credentials).
+
 **Both external systems are simulated, behind interfaces.** `SNMP_SIMULATE` and
 `OPENSTACK_SIMULATE` pick a fake sampler and a fake fleet; real `pysnmp` is
 already written and selected by the same flag, and a real `openstack.connect()`
@@ -66,34 +73,38 @@ rather than contradicting itself.
 | `src/app/db/migrate.py` | `alembic upgrade head` with retries and an advisory lock. Also `python -m app.db.migrate` |
 | `src/app/db/policies.py` | Compression and retention: settings, not schema, so re-applied every boot |
 | `src/app/db/pool.py` | SQLAlchemy engine over psycopg2 + threadpool query/session helpers |
-| `src/app/db/{machines,metrics}.py` | Fleet and metric repositories: hand-written SQL, no ORM |
+| `src/app/db/{machines,metrics,credentials}.py` | Fleet, metric and credential repositories: hand-written SQL, no ORM |
+| `src/app/db/reencrypt.py` | `python -m app.db.reencrypt` — moves stored credentials onto the active key |
 | `src/app/db/{users,roles,tokens}.py` | Identity repositories: ORM, one transaction per function |
 | `src/app/security/scopes.py` | The permission vocabulary. Fixed in code, no table |
+| `src/app/security/crypto.py` | AES-256-GCM over the credential key ring; the only module that opens a secret |
 | `src/app/api/security.py` | Bearer + scope checking, and the SSE stream tickets |
 | `src/app/services/auth.py` | Argon2 hashing and JWT minting |
-| `src/app/services/bootstrap.py` | Ensures the admin role and account exist, every boot |
+| `src/app/services/bootstrap.py` | Ensures the admin role, account and `default-v2c` credential exist |
+| `src/app/services/credentials.py` | Decrypted-credential cache, keyed on `(id, secret_version)` |
 | `src/app/services/openstack/` | `OpenStackLookup` protocol, TTL cache, simulated fleet |
 | `src/app/services/snmp/` | `SnmpSampler` protocol, pysnmp backend, simulator |
 | `src/app/services/collector.py` | The 15s loop |
 | `src/app/services/bus.py` | In-process pub/sub feeding SSE |
-| `src/app/api/routers/` | health, auth, users, roles, machines, metrics, stream, admin |
+| `src/app/api/routers/` | health, auth, users, roles, machines, credentials, metrics, stream, admin |
 | `alembic.ini` | Host CLI only; the app builds an equivalent config in code |
 | `.env.example` | Every setting with defaults; `.env` is git- and docker-ignored |
 | `compose.yaml` | Both processes on one host: the deployable shape |
 | `compose.override.yaml` | Development overlay — bind mount, `--reload`, published database |
-| `scripts/seed_dev.py` | Registers the simulated fleet against a running API |
-| `Makefile` | `up`, `seed`, `psql`, `logs`, `clean` for the Compose stack |
+| `scripts/seed_dev.py` | Registers the simulated fleet against a running API, then binds credentials |
+| `Makefile` | `up`, `seed`, `psql`, `logs`, `reencrypt`, `clean` for the Compose stack |
 | `k8s/timescaledb-*.yaml` | PVC, Secret, StatefulSet, Service |
 | `k8s/app-config.yaml` | Non-secret settings as a ConfigMap |
-| `k8s/api-secrets.yaml` | `JWT_SECRET` and `ADMIN_PASSWORD`, kept out of the database Secret |
+| `k8s/api-secrets.yaml` | `JWT_SECRET`, `ADMIN_PASSWORD` and `SNMP_CREDENTIAL_KEYS`, kept out of the database Secret |
 | `k8s/deployment.yaml`, `k8s/service.yaml` | The app |
 | `k8s/{middleware,ingressroute,ingressroutetcp}.yaml` | Traefik routing |
 | `k8s/traefik-values.yaml` | Helm values: `web` + `postgres` entryPoints, CRD provider only |
 
 ## Data model
 
-Owned by Alembic. Revision `0001` creates the fleet tables and `0002` the
-identity ones; the app runs `alembic upgrade head` on startup.
+Owned by Alembic. Revision `0001` creates the fleet tables, `0002` the identity
+ones and `0003` the SNMP credentials; the app runs `alembic upgrade head` on
+startup.
 
 ```sql
 CREATE TABLE machines (
@@ -102,6 +113,22 @@ CREATE TABLE machines (
     label      text,                     -- the client's own annotation
     enabled    boolean NOT NULL DEFAULT true,
     external   boolean NOT NULL DEFAULT false,  -- not an OpenStack server
+    credential_id uuid REFERENCES snmp_credentials (id) ON DELETE RESTRICT,
+    ...
+);
+
+CREATE TABLE snmp_credentials (
+    id             uuid PRIMARY KEY,
+    name           text NOT NULL UNIQUE,
+    snmp_version   text NOT NULL,        -- '2c' | '3'
+    username       text,                 -- v3 securityName
+    security_level text,                 -- noAuthNoPriv | authNoPriv | authPriv
+    auth_protocol  text,                 -- MD5 | SHA | SHA224 | SHA256 | SHA384 | SHA512
+    priv_protocol  text,                 -- DES | 3DES | AES128 | AES192 | AES256
+    secret         bytea NOT NULL,       -- nonce ‖ AES-256-GCM(passphrases)
+    key_id         text  NOT NULL,       -- which ring key sealed it
+    secret_version int   NOT NULL DEFAULT 1,
+    fingerprint    text  NOT NULL,       -- keyed HMAC, so a client can compare without reading
     ...
 );
 
@@ -124,7 +151,14 @@ deployed before Alembic is adopted by the same `upgrade head` that builds a fres
 one, with no manual `alembic stamp`.
 
 The identity tables are `users`, `roles`, `role_scopes`, `user_roles` and
-`refresh_tokens` — see [Authentication](#authentication).
+`refresh_tokens` — see [Authentication](#authentication). `snmp_credentials` has
+its own section: [SNMP credentials](#snmp-credentials).
+
+Revision `0003` creates the credential table but does not populate it. Seeding
+needs the encryption key ring, and Alembic deliberately loads only
+`DatabaseSettings` — so a migration Job never has to be handed one. The
+`default-v2c` row is written by `app.services.bootstrap` on the first boot that
+finds none.
 
 The FK is what makes "delete the MAC, delete its history" one statement. A
 hypertable may reference a regular table; the cascade touches every chunk, which
@@ -220,6 +254,39 @@ than trusting "active (running)".
 needs two reads of `/proc/stat` before it can report a load — so verify with a
 walk taken a moment later, not immediately.
 
+### SNMPv3 on the agent
+
+`rocommunity` is v2c, and v2c sends its community string in cleartext on every
+request. For v3, create the user and grant it the same view:
+
+```
+# in /var/lib/net-snmp/snmpd.conf, with snmpd stopped.
+# Consumed on first start: snmpd hashes the passphrases into the file and the
+# line is meant to be deleted afterwards.
+createUser  fleetmon SHA-256 "auth-passphrase" AES-128 "priv-passphrase"
+
+# in /etc/snmp/snmpd.conf
+rouser      fleetmon authPriv -V fleet
+```
+
+SHA-2 and AES-192/256 need net-snmp 5.8 or newer; 5.7 and earlier offer only
+MD5/SHA-1 and DES/AES-128. The API refuses MD5, DES and `noAuthNoPriv` on
+create unless the payload carries `"allow_weak": true`, which is the escape
+hatch for agents that genuinely support nothing better.
+
+Verify from the agent itself before blaming the collector:
+
+```bash
+snmpget -v3 -u fleetmon -l authPriv \
+  -a SHA-256 -A auth-passphrase \
+  -x AES-128 -X priv-passphrase \
+  127.0.0.1 1.3.6.1.2.1.1.1.0
+```
+
+`compose.override.yaml` has an `snmpd` service under the `snmp` profile that is
+exactly this, for testing without a real host:
+`docker compose --profile snmp up -d snmpd`.
+
 Disk I/O additionally needs an `snmpd` built with the `ucd-snmp/diskio` module,
 present in the Debian, Ubuntu and RHEL packages. Without it that walk returns
 nothing and the `disk_io` key is dropped from the sample; cpu, ram, disk and
@@ -268,7 +335,11 @@ scope in the third column. See [Authentication](#authentication).
 | PUT | `/users/{id}/password` | `users:write` | administrative reset; ends that user's sessions |
 | POST | `/machines` | `machines:write` | `{ipv4, mac?, label?}`; `mac` required — and only accepted — for an address OpenStack does not know; 404 without it, 409 if it disagrees with OpenStack or is already registered |
 | GET | `/machines` | `machines:read` | our rows enriched with server id, tenant, user, flavor + specs; `external` marks the machines that have none |
-| GET/PATCH/DELETE | `/machines/{mac}` | `machines:read` / `machines:write` | `PATCH {label?, enabled?, ipv4?}` — `ipv4` on external machines only, 409 otherwise; `DELETE` cascades the history |
+| GET/PATCH/DELETE | `/machines/{mac}` | `machines:read` / `machines:write` | `PATCH {label?, enabled?, ipv4?}` — `ipv4` on external machines only, and only while no credential is bound; 409 otherwise. `DELETE` cascades the history |
+| GET/POST | `/snmp-credentials` | `credentials:read` / `credentials:write` | reusable SNMP profiles. **No response ever contains a secret** — see [SNMP credentials](#snmp-credentials) |
+| GET/PATCH/DELETE | `/snmp-credentials/{id}` | `credentials:read` / `credentials:write` | `PATCH` of any USM field takes the whole shape and bumps `secret_version`; `DELETE` is 409 while machines are bound |
+| PUT/DELETE | `/machines/{mac}/snmp-credential` | `credentials:write` | bind / unbind. Deliberately **not** a field on `PATCH /machines/{mac}` |
+| POST | `/machines/{mac}/snmp-credential/test` | `credentials:write` | poll this machine once. Takes no address — `{credential?}` to dry-run an unsaved one |
 | GET | `/metrics` | `metrics:read` | `?mac=&since=&limit=` — repeat `mac` to filter on several |
 | GET | `/metrics/latest` | `metrics:read` | most recent sample per machine |
 | GET | `/metrics/stats` | `metrics:read` | `?bucket=1 minute&hours=1&mac=` — `time_bucket` over the jsonb |
@@ -288,12 +359,142 @@ published second, so subscribing changes nothing about what is stored, and event
 arrive at the collector's cadence rather than on demand. The bus is per-pod — with
 more than one replica a client only sees what its pod collected.
 
+## SNMP credentials
+
+How the collector authenticates to an agent is a row, not a setting. A
+credential is a named profile and machines are *bound* to one; several machines
+normally share a profile, because a fleet is usually polled with one or two
+credentials and re-entering a passphrase per host is how passphrases end up
+never being rotated.
+
+There is no fallback. A machine with no credential bound is not polled, and says
+so per machine in `GET /admin/collector`:
+
+```json
+{"mac": "aa:bb:cc:dd:ee:01", "credential": null, "ok_count": 0,
+ "last_error": "no credential bound: PUT /machines/{mac}/snmp-credential"}
+```
+
+Creating and binding one:
+
+```bash
+tok=$(make -s token)
+
+curl -fsS -X POST localhost:8000/snmp-credentials \
+  -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' \
+  -d '{"name":"fleet-v3","snmp_version":"3","username":"fleetmon",
+       "security_level":"authPriv",
+       "auth_protocol":"SHA256","auth_passphrase":"auth-passphrase",
+       "priv_protocol":"AES128","priv_passphrase":"priv-passphrase"}'
+
+curl -fsS -X PUT localhost:8000/machines/aa:bb:cc:00:00:01/snmp-credential \
+  -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' \
+  -d '{"credential_id":"<id from above>"}'
+
+# poll it once, now, instead of waiting for a tick
+curl -fsS -X POST localhost:8000/machines/aa:bb:cc:00:00:01/snmp-credential/test \
+  -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' -d '{}'
+```
+
+A failing test names the reason without echoing the secret — `Wrong SNMP PDU
+digest` for a bad passphrase, `Unknown USM user` for a bad `username`. When
+`SNMP_SIMULATE=true` the result carries `"simulated": true`, because the
+simulator authenticates to nothing and would otherwise report every credential
+as working.
+
+### Why binding has its own scope
+
+Sharing a credential is ordinary; what it changes is the blast radius of
+pointing one somewhere. Binding decides which host the collector will
+authenticate to with a secret the whole fleet depends on, and an SNMPv3 exchange
+captured by a hostile agent can be attacked offline for the passphrase.
+
+So registering a machine and aiming a credential at it are split across two
+scopes. `machines:write` can register a machine at any address — that is cheap
+and reversible. `credentials:write` is what binds:
+
+| Action | Scope | |
+| --- | --- | --- |
+| `POST /machines` at any address | `machines:write` | allowed |
+| `PUT /machines/{mac}/snmp-credential` | `credentials:write` | 403 without it |
+| `PATCH /machines/{mac}` `{ipv4}` while bound | — | **409**, always |
+
+The last row closes the same hole from the other side: repointing a bound
+machine would aim the next authenticated poll at a new address without anyone
+holding `credentials:write` being involved. Unbind, repoint, rebind — and the
+rebind is the step that needs the scope.
+
+The one case that is *not* blocked is OpenStack moving a managed machine's
+address, which the collector follows and logs with the credential's name.
+OpenStack is the address authority for those machines, and anyone who can re-IP
+a server there already holds more than the credential is worth.
+
+For the same reason the test endpoint takes no address. It polls the machine's
+stored one; `{"credential": {...}}` dry-runs an unsaved credential against it.
+An endpoint that probed an arbitrary address with a stored credential would be
+that attack as a supported, synchronous API.
+
+### Secrets in, never out
+
+pysnmp needs the plaintext passphrase on every request to localize a USM key, so
+these are encrypted, not hashed — `users.password_hash` is the wrong model and
+copying it would produce credentials the collector cannot use.
+
+AES-256-GCM per row, with `credential_id|key_id|secret_version` as additional
+authenticated data, so ciphertext copied from one row into another fails to
+decrypt rather than quietly authenticating as the wrong principal. What that
+protects against is a stolen dump, replica or backup. It does *not* protect
+against a compromised pod, which holds the key by construction — keep the
+Secret's RBAC as the thing guarding that.
+
+No endpoint returns a secret at any scope, and this is structural: the response
+model has no field one could occupy. Profiles carry a `fingerprint` — a keyed,
+truncated HMAC of the secret — so a client can tell two profiles apart, or tell
+whether a rotation changed anything, without reading either.
+
+### Rotating the encryption key
+
+`SNMP_CREDENTIAL_KEYS` is a ring, and each row records the key that sealed it:
+
+```bash
+SNMP_CREDENTIAL_KEYS='{"k1":"<hex>","k2":"<new hex>"}'   # 1. add, keep the old
+SNMP_CREDENTIAL_ACTIVE_KEY=k2                            # 2. flip, restart
+make reencrypt                                           # 3. move every row
+SNMP_CREDENTIAL_KEYS='{"k2":"<new hex>"}'                # 4. drop the old
+```
+
+Rows keep decrypting throughout, so step 4 can wait, and no passphrase is ever
+re-entered. `make reencrypt` (`python -m app.db.reencrypt`) is safe to re-run —
+rows already on the active key are skipped — and rewrapping leaves
+`secret_version` alone, since the plaintext has not changed and bumping it would
+re-localize every USM key in the fleet for a bookkeeping update.
+
+Generate keys with `openssl rand -hex 32`. Losing every key in the ring means
+every stored credential is unreadable and has to be entered again, so back the
+ring up wherever `JWT_SECRET` is backed up. A key that goes missing while rows
+still reference it is reported rather than hidden — the collector fails those
+machines with `credential is encrypted under key 'k2', which is not in
+SNMP_CREDENTIAL_KEYS`, and the endpoints answer 503 with the same message.
+
+### Upgrading a deployment that predates this
+
+Nothing to do. On the first boot after the upgrade, `SNMP_COMMUNITY` is copied
+into a `default-v2c` profile and every existing machine is bound to it, so a
+fleet that was being polled before is still being polled after. That happens
+once, guarded on the profile's creation — a later deliberate unbind is not
+undone on the next restart.
+
+`SNMP_COMMUNITY` is read at that moment and never again; the sampler has no path
+to it. It can be dropped from the environment once every deployment has had that
+boot.
+
 ## Configuration
 
 `.env.example` lists every setting. Real environment variables always win over the
 file, so in Kubernetes the values come from `k8s/app-config.yaml` (non-secret),
 `k8s/timescaledb-secret.yaml` (database credentials) and `k8s/api-secrets.yaml`
-(the signing key and the bootstrap password), all three mounted with `envFrom`.
+(the signing key, the bootstrap password and the SNMP credential key ring), all
+three mounted with `envFrom`.
 `.env` is in `.gitignore` and `.dockerignore`, so credentials reach neither git
 nor the image.
 
@@ -305,6 +506,15 @@ reason in [Authentication](#authentication). A blank value counts as missing:
 `ADMIN_PASSWORD=` is exactly what an unfilled ConfigMap key produces, and it
 would otherwise create an admin whose password is the empty string.
 
+`SNMP_CREDENTIAL_KEYS` and `SNMP_CREDENTIAL_ACTIVE_KEY` are required too, but
+only once `SNMP_SIMULATE=false` — the simulator authenticates to nothing, so a
+developer running the default stack needs no key. The moment real agents are
+polled the key becomes load-bearing and the app refuses to start without a
+usable one: without it every credential fails to decrypt, and a monitoring
+backend that reports itself healthy while collecting nothing is worse than one
+that will not boot. A malformed ring is rejected either way, so a typo surfaces
+locally rather than on the first real deployment.
+
 The settings worth knowing:
 
 | Setting | Default | Why it matters |
@@ -313,6 +523,9 @@ The settings worth knowing:
 | `COLLECTOR_CONCURRENCY` | 32 | Machines sampled in parallel. Bounds SNMP calls, not queries — see below |
 | `COLLECTOR_SAMPLE_TIMEOUT_SECONDS` | 0 | Ceiling on one machine's sample; 0 derives 80% of the interval |
 | `SNMP_SIMULATE` | true | false ⇒ real pysnmp against each machine's IPv4 |
+| `SNMP_COMMUNITY` | public | **Read once**, to seed the `default-v2c` credential. Not a live setting — see below |
+| `SNMP_CREDENTIAL_KEYS` | — | The AES-256 key ring that encrypts stored credentials. Required when `SNMP_SIMULATE=false` |
+| `SNMP_CREDENTIAL_ACTIVE_KEY` | — | Which key in the ring new writes use |
 | `SNMP_DISKIO_ENABLED` | true | ~6 extra walks per machine; needs the diskio view above |
 | `SNMP_MAX_REPETITIONS` | 10 | Rows per GETBULK reply. Lower it for agents behind a small-MTU path — see below |
 | `METRICS_COMPRESS_AFTER_HOURS` | 24 | 0 disables. TimescaleDB columnar compression |
@@ -399,10 +612,14 @@ trip per tick.
 Every endpoint except `/`, `/healthz` and `/readyz` needs a bearer token. The
 model has three pieces:
 
-**Scopes are fixed in code** (`src/app/security/scopes.py`) — ten of them, two
-per resource: `machines:*`, `metrics:*`, `admin:*`, `users:*`, `roles:*`. They
-name capabilities the API implements, so they change only with a deployment and
-have no table. `GET /scopes` returns the catalogue.
+**Scopes are fixed in code** (`src/app/security/scopes.py`) — twelve of them, two
+per resource: `machines:*`, `metrics:*`, `admin:*`, `users:*`, `roles:*`,
+`credentials:*`. They name capabilities the API implements, so they change only
+with a deployment and have no table. `GET /scopes` returns the catalogue.
+
+`credentials:*` is split from `machines:*` rather than folded into it because the
+two authorise different amounts of damage — see
+[SNMP credentials](#snmp-credentials).
 
 **Roles are data.** An admin composes them out of scopes through `/roles`, and
 `role_scopes` stores one row per grant. The built-in `admin` role holds every
@@ -487,6 +704,11 @@ unrecoverable state, so four things are refused outright:
 - **The system role.** `admin` cannot be deleted or have its scopes changed, and
   a role still granted to someone cannot be deleted.
 
+Two more guard the SNMP credentials rather than the permission model — binding
+takes `credentials:write`, and a bound machine's address cannot be patched. Both
+exist to stop a shared credential being aimed at a host of the caller's
+choosing; the reasoning is in [SNMP credentials](#snmp-credentials).
+
 ## Local development
 
 Kubernetes is how this is deployed, not how it is developed: a code change there
@@ -530,13 +752,38 @@ Both build the tag in `APP_VERSION`, which the Makefile derives from
 An empty `machines` table is why a fresh stack looks broken — the collector ticks
 against nothing and every endpoint returns `[]`. `make seed` registers the six
 hosts `app/services/openstack/simulated.py` serves, by address only, so their
-MACs and flavors come from the lookup exactly as a real machine's would.
+MACs and flavors come from the lookup exactly as a real machine's would. It then
+binds each one to the `default-v2c` credential, because registering alone leaves
+a machine unpolled — two calls, since binding needs its own scope. Re-running is
+a no-op on both halves.
+
+The overlay sets a committed `SNMP_CREDENTIAL_KEYS` even though the simulated
+stack does not strictly need one: without it there is nothing to seed
+`default-v2c` with, so nothing could be bound and the stack would come up
+healthy and collect nothing.
+
+To exercise real SNMPv3 rather than the simulator, the `snmp` profile starts
+net-snmp agents with an authPriv user:
+
+```bash
+docker compose --profile snmp up -d snmpd snmpd2
+# then set SNMP_SIMULATE=false in .env, restart, register them by address and
+# bind an authPriv credential — see SNMP credentials.
+```
+
+`snmpd2` carries the *same* `securityName` as `snmpd` with a different
+passphrase. That is not redundancy: pysnmp caches USM users on an engine under
+`(userName, securityEngineId)`, so two such credentials on one shared engine
+tear each other's registration down mid-tick. The sampler gives each credential
+its own `SnmpEngine`, and these two agents are the smallest setup that can prove
+it.
 
 The rest:
 
 ```bash
 make logs      # follow the app
 make psql      # psql inside the database container
+make reencrypt # move stored credentials onto the active encryption key
 make down      # stop, keep the data
 make clean     # stop and delete the volume
 ```
@@ -730,6 +977,13 @@ curl -s -X POST http://localhost/api/machines \
 curl -s -X POST http://localhost/api/machines \
   -H 'content-type: application/json' \
   -d '{"ipv4":"192.168.1.50","mac":"de:ad:be:ef:00:01","label":"nas"}'
+
+# registering does not start polling — bind a credential, which needs
+# credentials:write rather than machines:write
+curl -s http://localhost/api/snmp-credentials
+curl -s -X PUT http://localhost/api/machines/de:ad:be:ef:00:01/snmp-credential \
+  -H 'content-type: application/json' \
+  -d '{"credential_id":"<id>"}'
 
 curl -s http://localhost/api/machines               # rows + OpenStack details
 curl -s 'http://localhost/api/metrics?limit=5'

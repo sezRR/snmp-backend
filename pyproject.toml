@@ -15,6 +15,11 @@ dependencies = [
     # Alembic owns the schema; SQLAlchemy's metadata is what it diffs against.
     # Both go through psycopg2, which stays the driver.
     "alembic>=1.16",
+    # Two jobs, one library. pysnmp imports it at module load for SNMPv3
+    # privacy (proto/secmod/rfc3826/priv/aes.py), where it is only a `dev`
+    # extra of pysnmp's own and so would be missing at runtime; and
+    # app.security.crypto uses its AES-GCM to encrypt stored credentials.
+    "cryptography>=44.0.1",
     "fastapi[standard]>=0.140.0",
     "psycopg2-binary>=2.9",
     # Password hashing. passlib is effectively unmaintained and warns loudly

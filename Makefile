@@ -80,6 +80,9 @@ migrate: ## Apply migrations against the Compose database
 check: ## Fail if db/tables.py has drifted from the migrations
 	uv run alembic check
 
+reencrypt: ## Move stored SNMP credentials onto SNMP_CREDENTIAL_ACTIVE_KEY
+	$(COMPOSE) exec api python -m app.db.reencrypt
+
 revision: ## Autogenerate a revision — make revision m="add widgets"
 	@test -n "$(m)" || { echo 'usage: make revision m="what changed"'; exit 2; }
 	@# The api container bind-mounts ./src and reloads on change, and boots with

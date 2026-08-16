@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from ipaddress import IPv4Address
+from uuid import UUID
 
 from pydantic import BaseModel, Field, computed_field
 
@@ -49,6 +50,11 @@ class MachineRow(BaseModel):
     label: str | None
     enabled: bool
     external: bool
+    # Which SNMP credential the collector polls this machine with. None means it
+    # is not polled at all: there is no fallback community string any more, so an
+    # unbound machine waits for someone with `credentials:write` to bind one.
+    # Bound through PUT /machines/{mac}/snmp-credential, never through PATCH.
+    credential_id: UUID | None = None
     created_at: datetime
     updated_at: datetime
 

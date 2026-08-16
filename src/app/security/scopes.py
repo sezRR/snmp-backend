@@ -32,6 +32,8 @@ class Scope(StrEnum):
     USERS_WRITE = "users:write"
     ROLES_READ = "roles:read"
     ROLES_WRITE = "roles:write"
+    CREDENTIALS_READ = "credentials:read"
+    CREDENTIALS_WRITE = "credentials:write"
 
 
 ALL_SCOPES: frozenset[str] = frozenset(str(s) for s in Scope)
@@ -49,6 +51,10 @@ SCOPE_DESCRIPTIONS: dict[str, str] = {
     Scope.USERS_WRITE: "Create, edit and delete users, and assign their roles",
     Scope.ROLES_READ: "List and read roles and the scopes they hold",
     Scope.ROLES_WRITE: "Create, edit and delete roles",
+    Scope.CREDENTIALS_READ: "List and read SNMP credential profiles (never their secrets)",
+    Scope.CREDENTIALS_WRITE: (
+        "Create, edit and delete SNMP credentials, and bind them to machines"
+    ),
 }
 
 ADMIN_ROLE_NAME = "admin"
@@ -56,6 +62,16 @@ ADMIN_ROLE_NAME = "admin"
 # The scope that can mint more admins. Losing every holder of it is the one
 # unrecoverable state, so the user and role endpoints guard it specifically.
 ADMIN_GATE_SCOPE = str(Scope.USERS_WRITE)
+
+# `credentials:write` is separate from `machines:write` on purpose, and the
+# split is a security boundary rather than tidiness. Credentials are shared
+# across machines, so binding one to a machine decides which host the collector
+# will authenticate to with a fleet-wide secret. A holder of `machines:write`
+# alone can register a machine at any address they like; if that were also
+# enough to point a credential at it, they could stand up an agent, collect an
+# authenticated SNMPv3 exchange, and attack the passphrase offline. Registering
+# is therefore the low-privilege operation and binding is the high-privilege
+# one.
 
 
 def unknown_scopes(candidates: list[str]) -> list[str]:
