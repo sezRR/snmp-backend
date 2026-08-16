@@ -28,7 +28,7 @@ IMAGE := fastapi-demo:$(APP_VERSION)
 
 .DEFAULT_GOAL := help
 .PHONY: help version up down clean logs ps seed psql shell build watch restart smoke deploy-tag \
-        migrate check revision history token
+        migrate check test revision history token
 
 help: ## List targets
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[36m%-11s\033[0m %s\n", $$1, $$2}'
@@ -79,6 +79,9 @@ migrate: ## Apply migrations against the Compose database
 
 check: ## Fail if db/tables.py has drifted from the migrations
 	uv run alembic check
+
+test: ## Run unit tests
+	PYTHONPATH=src uv run python -m unittest discover -v
 
 reencrypt: ## Move stored SNMP credentials onto SNMP_CREDENTIAL_ACTIVE_KEY
 	$(COMPOSE) exec api python -m app.db.reencrypt

@@ -13,7 +13,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy.exc import IntegrityError
 
-from app.api.deps import DbDep, LookupDep
+from app.api.deps import CollectorDep, DbDep, LookupDep
 from app.api.security import requires
 from app.security.scopes import Scope
 from app.db import machines as machines_repo
@@ -225,9 +225,10 @@ async def update_machine(
     status_code=status.HTTP_204_NO_CONTENT,
     dependencies=[requires(Scope.MACHINES_WRITE)],
 )
-async def delete_machine(mac: str, db: DbDep) -> None:
+async def delete_machine(mac: str, collector: CollectorDep) -> None:
     """Deregister a machine. Its metric history is cascaded away with it."""
-    deleted = await db.run_query(machines_repo.delete, parse_mac(mac))
+    parsed = parse_mac(mac)
+    deleted = await collector.deregister_machine(parsed)
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="unknown machine")
-    log.info("deleted machine %s and its metrics", mac)
+    log.info("deleted machine %s and its metrics", parsed)

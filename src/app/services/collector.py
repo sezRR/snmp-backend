@@ -88,10 +88,10 @@ class Collector:
         self._credentials = credentials
         self._task: asyncio.Task[None] | None = None
         self._semaphore = asyncio.Semaphore(settings.collector_concurrency)
-        # The loop and POST /admin/collector/tick both call `tick()`. Two ticks
-        # running at once would interleave their reads of the same counter
-        # baselines and derive nonsense rates from them.
+        # Ticks must not interleave their counter baselines, and deletion must
+        # not race the foreign-key references in a tick's metric insert.
         self._tick_lock = asyncio.Lock()
+        self._pending_ticks = 0
 
         # Observability, all in memory.
         self.started_at: datetime | None = None
@@ -199,19 +199,33 @@ class Collector:
 
     async def tick(self) -> int:
         """One collection round. Returns how many samples were stored."""
-        async with self._tick_lock:
-            return await self._tick()
+        self._pending_ticks += 1
+        try:
+            async with self._tick_lock:
+                return await self._tick()
+        finally:
+            self._pending_ticks -= 1
 
     @property
     def ticking(self) -> bool:
         """Whether a round is in flight, so a forced tick can decline instead."""
-        return self._tick_lock.locked()
+        return self._pending_ticks > 0
+
+    async def deregister_machine(self, mac: str) -> bool:
+        """Delete a machine without racing an in-flight sample insert."""
+        async with self._tick_lock:
+            deleted = await self._db.run_query(machines_repo.delete, mac)
+            self.statuses.pop(mac, None)
+            return deleted
 
     async def _tick(self) -> int:
         self.tick_count += 1
         self.last_tick_at = datetime.now(timezone.utc)
 
         rows = await self._db.run_query(machines_repo.list_for_polling)
+        polled_macs = {row["mac"] for row in rows}
+        for mac in self.statuses.keys() - polled_macs:
+            del self.statuses[mac]
         if not rows:
             self.last_inserted = 0
             self.last_failed = 0
