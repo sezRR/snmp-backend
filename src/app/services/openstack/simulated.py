@@ -1,7 +1,7 @@
 """A fake OpenStack fleet.
 
-Stands in for `openstack.connect()` until real credentials exist. The fleet is
-static and deterministic so the same IPv4 always resolves to the same MAC,
+Selected instead of the read-only SDK adapter for local development. The fleet
+is static and deterministic so the same IPv4 always resolves to the same MAC,
 tenant, user and flavor across restarts — registrations survive a redeploy.
 """
 
@@ -54,3 +54,6 @@ class SimulatedOpenStack:
                 _FLEET, start=1
             )
         ]
+
+    def close(self) -> None:
+        pass

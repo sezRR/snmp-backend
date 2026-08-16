@@ -51,53 +51,63 @@ async def lifespan(app: FastAPI):
     db = Database(settings)
     db.connect()
     app.state.db = db
-
-    if settings.db_auto_migrate:
-        # Retries internally: on a cold cluster this pod is usually up before
-        # Postgres has finished initdb. Also takes an advisory lock, so replicas
-        # starting together do not race each other through the same revision.
-        await run_migrations(db.engine, settings)
-
-    # Not schema, and so not Alembic's: both windows are settings, re-applied on
-    # every boot so the configuration stays authoritative.
-    await apply_policies(db.engine, settings)
-
-    # Raises if it cannot guarantee an administrator, which aborts startup. An
-    # API with permissions enforced everywhere and nobody holding them is worse
-    # than one that refuses to come up.
-    await bootstrap_admin(db, settings)
-
-    app.state.cipher = CredentialCipher.from_settings(settings)
-    # Seeds the default v2c profile from SNMP_COMMUNITY on the first boot that
-    # finds none, and binds the machines that predate credentials. Not a
-    # migration: Alembic runs without the key ring, and this needs to encrypt.
-    await bootstrap_credentials(db, settings, app.state.cipher)
-    app.state.credentials = CredentialCache(db, app.state.cipher)
-
-    app.state.bus = MetricBus(queue_maxsize=settings.sse_queue_maxsize)
-    # In-process and per-pod, like the bus a stream reads from.
-    app.state.stream_tickets = StreamTickets(settings.stream_ticket_ttl_seconds)
-    app.state.lookup = build_lookup(settings)
-    # The simulated sampler sizes each host from its OpenStack flavor, so its
-    # reported cores/RAM/disk agree with what /machines returns.
-    app.state.sampler = build_sampler(settings, lookup=app.state.lookup)
-    app.state.collector = Collector(
-        settings=settings,
-        db=db,
-        sampler=app.state.sampler,
-        lookup=app.state.lookup,
-        bus=app.state.bus,
-        credentials=app.state.credentials,
-    )
-    if settings.collector_enabled:
-        app.state.collector.start()
-
+    lookup = None
+    collector = None
     try:
+        if settings.db_auto_migrate:
+            # Retries internally: on a cold cluster this pod is usually up before
+            # Postgres has finished initdb. Also takes an advisory lock, so replicas
+            # starting together do not race each other through the same revision.
+            await run_migrations(db.engine, settings)
+
+        # Not schema, and so not Alembic's: both windows are settings, re-applied on
+        # every boot so the configuration stays authoritative.
+        await apply_policies(db.engine, settings)
+
+        # Raises if it cannot guarantee an administrator, which aborts startup. An
+        # API with permissions enforced everywhere and nobody holding them is worse
+        # than one that refuses to come up.
+        await bootstrap_admin(db, settings)
+
+        app.state.cipher = CredentialCipher.from_settings(settings)
+        # Seeds the default v2c profile from SNMP_COMMUNITY on the first boot that
+        # finds none, and binds the machines that predate credentials. Not a
+        # migration: Alembic runs without the key ring, and this needs to encrypt.
+        await bootstrap_credentials(db, settings, app.state.cipher)
+        app.state.credentials = CredentialCache(db, app.state.cipher)
+
+        app.state.bus = MetricBus(queue_maxsize=settings.sse_queue_maxsize)
+        # In-process and per-pod, like the bus a stream reads from.
+        app.state.stream_tickets = StreamTickets(settings.stream_ticket_ttl_seconds)
+        lookup = build_lookup(settings)
+        app.state.lookup = lookup
+        # The simulated sampler sizes each host from its OpenStack flavor, so its
+        # reported cores/RAM/disk agree with what /machines returns.
+        app.state.sampler = build_sampler(settings, lookup=lookup)
+        collector = Collector(
+            settings=settings,
+            db=db,
+            sampler=app.state.sampler,
+            lookup=lookup,
+            bus=app.state.bus,
+            credentials=app.state.credentials,
+        )
+        app.state.collector = collector
+        if settings.collector_enabled:
+            collector.start()
+
         yield
     finally:
-        await app.state.collector.stop()
-        db.close()
-        app.state.db = None
+        try:
+            if collector is not None:
+                await collector.stop()
+        finally:
+            try:
+                if lookup is not None:
+                    lookup.close()
+            finally:
+                db.close()
+                app.state.db = None
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:

@@ -21,6 +21,7 @@ dependencies = [
     # app.security.crypto uses its AES-GCM to encrypt stored credentials.
     "cryptography>=44.0.1",
     "fastapi[standard]>=0.140.0",
+    "openstacksdk>=4.18.0",
     "psycopg2-binary>=2.9",
     # Password hashing. passlib is effectively unmaintained and warns loudly
     # against bcrypt 4.x; pwdlib is what FastAPI's own docs moved to.

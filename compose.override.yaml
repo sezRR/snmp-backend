@@ -37,7 +37,7 @@ services:
       # simulator produces the same payload shape. Set SNMP_SIMULATE=false in
       # `.env` to poll real agents — the container needs its own route to them,
       # which a Tailscale address on the host does not automatically give it.
-      SNMP_SIMULATE: ${SNMP_SIMULATE:-true}
+      SNMP_SIMULATE: ${SNMP_SIMULATE:-false}
       OPENSTACK_SIMULATE: ${OPENSTACK_SIMULATE:-true}
       # File events cross the macOS/Linux boundary on OrbStack and recent
       # Docker Desktop. If a save does not trigger a reload, set this to true.

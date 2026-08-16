@@ -21,9 +21,11 @@ log = logging.getLogger(__name__)
 
 
 class OpenStackLookup(Protocol):
-    """The seam a real `openstack.connect()` client plugs into."""
+    """Read-only fleet seam implemented by simulated and SDK backends."""
 
     async def servers(self) -> list[ServerInfo]: ...
+
+    def close(self) -> None: ...
 
 
 class CachedOpenStack:
@@ -123,6 +125,9 @@ class CachedOpenStack:
             last_error=self._last_error,
         )
 
+    def close(self) -> None:
+        self._upstream.close()
+
 
 def normalise_mac(mac: str) -> str:
     """Lowercase colon form, matching how Postgres renders `macaddr`.
@@ -142,10 +147,12 @@ def build_lookup(settings: Settings) -> CachedOpenStack:
 
         upstream: OpenStackLookup = SimulatedOpenStack()
         log.info("openstack: simulated fleet")
-    else:  # pragma: no cover - needs openstacksdk and real credentials
-        raise NotImplementedError(
-            "Real OpenStack lookup not wired up yet: install openstacksdk, add an "
-            "adapter implementing OpenStackLookup with openstack.connect(), and "
-            "select it here. Set OPENSTACK_SIMULATE=true to use the fake fleet."
+    else:
+        from app.services.openstack.sdk import build_sdk_lookup
+
+        upstream = build_sdk_lookup(settings)
+        log.info(
+            "openstack: read-only SDK lookup across all projects on network %r",
+            settings.openstack_network_name,
         )
     return CachedOpenStack(upstream, settings.openstack_cache_ttl_seconds)

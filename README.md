@@ -56,11 +56,18 @@ Sharing is what makes rotation feasible and what makes binding dangerous, so
 binding is a scope of its own — see [SNMP credentials](#snmp-credentials).
 
 **Both external systems are simulated, behind interfaces.** `SNMP_SIMULATE` and
-`OPENSTACK_SIMULATE` pick a fake sampler and a fake fleet; real `pysnmp` is
-already written and selected by the same flag, and a real `openstack.connect()`
-client drops in behind the `OpenStackLookup` protocol. The simulated agent sizes
-each host from its OpenStack flavor, so an `m1.small` reports 1 core and 2 GiB
-rather than contradicting itself.
+`OPENSTACK_SIMULATE` pick a fake sampler and a fake fleet. The real OpenStack
+adapter is deliberately read-only: it lists Nova servers across projects and
+Keystone projects/users, then translates those resources into the same
+`ServerInfo` returned by the simulator. It issues no create, update or delete
+operation. The simulated agent sizes each host from its OpenStack flavor, so an
+`m1.small` reports 1 core and 2 GiB rather than contradicting itself.
+
+The adapter's code path is read-only, but a credential's authority is still a
+cloud policy decision. Its role or application-credential access rules should
+permit only the required Nova and Keystone `GET` operations. Those permissions
+must also allow Nova's all-project server list and Keystone's project/user lists;
+a normal project-scoped reader often cannot see that cloud-wide inventory.
 
 ## Layout
 
@@ -82,7 +89,7 @@ rather than contradicting itself.
 | `src/app/services/auth.py` | Argon2 hashing and JWT minting |
 | `src/app/services/bootstrap.py` | Ensures the admin role, account and `default-v2c` credential exist |
 | `src/app/services/credentials.py` | Decrypted-credential cache, keyed on `(id, secret_version)` |
-| `src/app/services/openstack/` | `OpenStackLookup` protocol, TTL cache, simulated fleet |
+| `src/app/services/openstack/` | `OpenStackLookup` protocol, TTL cache, read-only SDK adapter and simulated fleet |
 | `src/app/services/snmp/` | `SnmpSampler` protocol, pysnmp backend, simulator |
 | `src/app/services/collector.py` | The 15s loop |
 | `src/app/services/bus.py` | In-process pub/sub feeding SSE |
@@ -95,7 +102,7 @@ rather than contradicting itself.
 | `Makefile` | `up`, `seed`, `psql`, `logs`, `reencrypt`, `clean` for the Compose stack |
 | `k8s/timescaledb-*.yaml` | PVC, Secret, StatefulSet, Service |
 | `k8s/app-config.yaml` | Non-secret settings as a ConfigMap |
-| `k8s/api-secrets.yaml` | `JWT_SECRET`, `ADMIN_PASSWORD` and `SNMP_CREDENTIAL_KEYS`, kept out of the database Secret |
+| `k8s/api-secrets.yaml` | API, SNMP encryption and OpenStack secrets, kept out of the database Secret |
 | `k8s/deployment.yaml`, `k8s/service.yaml` | The app |
 | `k8s/{middleware,ingressroute,ingressroutetcp}.yaml` | Traefik routing |
 | `k8s/traefik-values.yaml` | Helm values: `web` + `postgres` entryPoints, CRD provider only |
@@ -530,8 +537,13 @@ The settings worth knowing:
 | `SNMP_MAX_REPETITIONS` | 10 | Rows per GETBULK reply. Lower it for agents behind a small-MTU path — see below |
 | `METRICS_COMPRESS_AFTER_HOURS` | 24 | 0 disables. TimescaleDB columnar compression |
 | `METRICS_RETENTION_DAYS` | 30 | 0 disables. Chunks older than this are dropped |
-| `OPENSTACK_SIMULATE` | true | false ⇒ needs `openstacksdk` and a real adapter |
+| `OPENSTACK_SIMULATE` | true | false ⇒ read-only Nova/Keystone lookup using an application credential |
 | `OPENSTACK_CACHE_TTL_SECONDS` | 300 | How stale a tenant/flavor read may be |
+| `OPENSTACK_NETWORK_NAME` | — | Nova address-network key used to select one fixed IPv4/MAC pair; required for the real lookup |
+| `OPENSTACK_API_TIMEOUT_SECONDS` | 10 | Timeout applied to each SDK HTTP request, not to the complete paginated refresh |
+| `OS_APPLICATION_CREDENTIAL_ID` / `OS_APPLICATION_CREDENTIAL_SECRET` | — | Application credential constrained to the required read operations; required for the real lookup |
+| `OS_INTERFACE` | public | Service-catalog interface: public, internal or admin |
+| `OS_CACERT` | — | Optional CA bundle; TLS verification cannot be disabled |
 | `DB_AUTO_MIGRATE` | true | `alembic upgrade head` on startup, under an advisory lock |
 | `DB_POOL_MIN` | 5 | SQLAlchemy's persistent pool, not a floor — see below |
 | `JWT_SECRET` | **required** | No default. Blank or under 32 chars and the app refuses to start |

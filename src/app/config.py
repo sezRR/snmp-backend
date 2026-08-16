@@ -203,17 +203,22 @@ class Settings(DatabaseSettings):
     metrics_retention_days: float = 30.0
 
     # ---- OpenStack ----------------------------------------------------------
-    # Only the simulated lookup ships today; the real client goes behind the
-    # same Protocol and is selected by flipping this to false.
+    # The real lookup is read-only: it lists Nova servers across projects and
+    # uses Keystone solely to resolve the project/user names already present in
+    # the API contract. Nova's address entry under this network supplies the
+    # one fixed IPv4/MAC pair the collector needs.
     openstack_simulate: bool = True
     openstack_cache_ttl_seconds: float = 300.0
+    openstack_network_name: str = ""
+    openstack_api_timeout_seconds: float = Field(default=10.0, gt=0)
     os_auth_url: str = ""
-    os_project_name: str = ""
-    os_username: str = ""
-    os_password: str = ""
+    os_application_credential_id: str = ""
+    os_application_credential_secret: SecretStr = SecretStr("")
     os_region_name: str = ""
-    os_user_domain_name: str = "Default"
-    os_project_domain_name: str = "Default"
+    os_interface: str = Field(
+        default="public", pattern="^(public|internal|admin)$"
+    )
+    os_cacert: str = ""
 
     # ---- Auth ---------------------------------------------------------------
     # JWT_SECRET has no default and no fallback. Generating one would be worse
@@ -283,6 +288,30 @@ class Settings(DatabaseSettings):
             raise ValueError(
                 "JWT_SECRET must be at least 32 characters; "
                 "generate one with: openssl rand -hex 32"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _real_openstack_configuration_is_complete(self) -> "Settings":
+        if self.openstack_simulate:
+            return self
+        blank = [
+            name
+            for name, value in (
+                ("OS_AUTH_URL", self.os_auth_url),
+                ("OS_APPLICATION_CREDENTIAL_ID", self.os_application_credential_id),
+                (
+                    "OS_APPLICATION_CREDENTIAL_SECRET",
+                    self.os_application_credential_secret.get_secret_value(),
+                ),
+                ("OPENSTACK_NETWORK_NAME", self.openstack_network_name),
+            )
+            if not value.strip()
+        ]
+        if blank:
+            raise ValueError(
+                f"{', '.join(blank)} must be set and non-blank when "
+                "OPENSTACK_SIMULATE=false"
             )
         return self
 

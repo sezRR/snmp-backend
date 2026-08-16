@@ -48,9 +48,16 @@ data:
   METRICS_COMPRESS_AFTER_HOURS: "24"
   METRICS_RETENTION_DAYS: "30"
 
-  # Likewise for OpenStack: a fake fleet stands in for openstack.connect().
+  # Read-only Nova/Keystone inventory. Fill the cloud-specific values and the
+  # application credential in api-secrets before deploying with simulation off.
   OPENSTACK_SIMULATE: "false"
   OPENSTACK_CACHE_TTL_SECONDS: "300"
+  OPENSTACK_NETWORK_NAME: ""
+  OPENSTACK_API_TIMEOUT_SECONDS: "10"
+  OS_AUTH_URL: ""
+  OS_APPLICATION_CREDENTIAL_ID: ""
+  OS_REGION_NAME: ""
+  OS_INTERFACE: public
 
   SSE_HEARTBEAT_SECONDS: "15"
   SSE_QUEUE_MAXSIZE: "100"
