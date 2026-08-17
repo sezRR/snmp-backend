@@ -1,4 +1,4 @@
-# k8s-local-image-deployment
+# snmp-backend
 
 An SNMP metrics backend: FastAPI polls cpu, ram, disk capacity, disk throughput
 and IOPS, and network from a client-controlled set of machines every 5 seconds,
