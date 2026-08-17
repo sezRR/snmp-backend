@@ -18,14 +18,14 @@ _FLAVORS = {
     "m1.xlarge": FlavorInfo(name="m1.xlarge", vcpus=8, ram_mb=16384, disk_gb=160),
 }
 
-# (name, tenant, user, flavor, mac, ipv4, status)
+# (name, tenant, user, flavor, mac, ipv4, subnet, status)
 _FLEET = [
-    ("web-01", "acme-prod", "alice", "m1.small", "fa:16:3e:00:00:01", "10.0.0.11", "ACTIVE"),
-    ("web-02", "acme-prod", "alice", "m1.small", "fa:16:3e:00:00:02", "10.0.0.12", "ACTIVE"),
-    ("api-01", "acme-prod", "bob", "m1.medium", "fa:16:3e:00:00:03", "10.0.0.13", "ACTIVE"),
-    ("db-01", "acme-prod", "bob", "m1.large", "fa:16:3e:00:00:04", "10.0.0.14", "ACTIVE"),
-    ("batch-01", "acme-staging", "carol", "m1.medium", "fa:16:3e:00:00:05", "10.0.1.21", "ACTIVE"),
-    ("gpu-01", "acme-research", "dave", "m1.xlarge", "fa:16:3e:00:00:06", "10.0.2.31", "SHUTOFF"),
+    ("web-01", "acme-prod", "alice", "m1.small", "fa:16:3e:00:00:01", "10.0.0.11", "prod-mgmt", "ACTIVE"),
+    ("web-02", "acme-prod", "alice", "m1.small", "fa:16:3e:00:00:02", "10.0.0.12", "prod-mgmt", "ACTIVE"),
+    ("api-01", "acme-prod", "bob", "m1.medium", "fa:16:3e:00:00:03", "10.0.0.13", "prod-mgmt", "ACTIVE"),
+    ("db-01", "acme-prod", "bob", "m1.large", "fa:16:3e:00:00:04", "10.0.0.14", "prod-mgmt", "ACTIVE"),
+    ("batch-01", "acme-staging", "carol", "m1.medium", "fa:16:3e:00:00:05", "10.0.1.21", "staging-mgmt", "ACTIVE"),
+    ("gpu-01", "acme-research", "dave", "m1.xlarge", "fa:16:3e:00:00:06", "10.0.2.31", "research-mgmt", "SHUTOFF"),
 ]
 
 
@@ -48,11 +48,19 @@ class SimulatedOpenStack:
                 status=status,
                 mac=mac,
                 ipv4=ipv4,
+                subnet_name=subnet,
                 flavor=_FLAVORS[flavor],
             )
-            for i, (name, tenant, user, flavor, mac, ipv4, status) in enumerate(
-                _FLEET, start=1
-            )
+            for i, (
+                name,
+                tenant,
+                user,
+                flavor,
+                mac,
+                ipv4,
+                subnet,
+                status,
+            ) in enumerate(_FLEET, start=1)
         ]
 
     def close(self) -> None:

@@ -31,6 +31,7 @@ from app.services.bus import MetricBus
 from app.services.collector import Collector
 from app.services.credentials import CredentialCache
 from app.services.openstack import build_lookup
+from app.services.ratelimit import LoginRateLimiter
 from app.services.snmp import build_sampler
 
 log = logging.getLogger(__name__)
@@ -79,6 +80,14 @@ async def lifespan(app: FastAPI):
         app.state.bus = MetricBus(queue_maxsize=settings.sse_queue_maxsize)
         # In-process and per-pod, like the bus a stream reads from.
         app.state.stream_tickets = StreamTickets(settings.stream_ticket_ttl_seconds)
+        # Also per-pod: with more than one replica each carries its own counters,
+        # so the effective limit is this times the replica count.
+        app.state.login_limiter = LoginRateLimiter(
+            max_per_user=settings.login_rate_limit_max_per_user,
+            max_per_ip=settings.login_rate_limit_max_per_ip,
+            window_seconds=settings.login_rate_limit_window_seconds,
+            enabled=settings.login_rate_limit_enabled,
+        )
         lookup = build_lookup(settings)
         app.state.lookup = lookup
         # The simulated sampler sizes each host from its OpenStack flavor, so its

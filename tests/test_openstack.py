@@ -15,6 +15,16 @@ def sdk_server(**attrs: Any) -> SimpleNamespace:
     return SimpleNamespace(**attrs)
 
 
+def sdk_network(
+    subnets: list[SimpleNamespace] | None = None,
+    ports: list[SimpleNamespace] | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        subnets=Mock(return_value=iter(subnets or [])),
+        ports=Mock(return_value=iter(ports or [])),
+    )
+
+
 class SDKOpenStackTests(IsolatedAsyncioTestCase):
     async def test_servers_returns_existing_contract_from_read_only_lookups(
         self,
@@ -73,10 +83,30 @@ class SDKOpenStackTests(IsolatedAsyncioTestCase):
                     return_value=iter([SimpleNamespace(id="user-1", name="alice")])
                 ),
             ),
+            network=sdk_network(
+                subnets=[
+                    SimpleNamespace(id="subnet-1", name="prod-mgmt"),
+                    SimpleNamespace(id="subnet-2", name="prod-storage"),
+                ],
+                ports=[
+                    SimpleNamespace(
+                        mac_address="FA:16:3E:00:00:01",
+                        fixed_ips=[
+                            {"ip_address": "10.0.0.11", "subnet_id": "subnet-1"}
+                        ],
+                    ),
+                    SimpleNamespace(
+                        mac_address="fa:16:3e:00:00:09",
+                        fixed_ips=[
+                            {"ip_address": "10.9.0.9", "subnet_id": "subnet-2"}
+                        ],
+                    ),
+                ],
+            ),
             close=Mock(),
         )
 
-        lookup = SDKOpenStack(connection, network_name="management")
+        lookup = SDKOpenStack(connection)
 
         result = await lookup.servers()
 
@@ -91,6 +121,7 @@ class SDKOpenStackTests(IsolatedAsyncioTestCase):
                     "status": "ACTIVE",
                     "mac": "fa:16:3e:00:00:01",
                     "ipv4": "10.0.0.11",
+                    "subnet_name": "prod-mgmt",
                     "flavor": {
                         "name": "m1.small",
                         "vcpus": 1,
@@ -198,10 +229,11 @@ class SDKOpenStackTests(IsolatedAsyncioTestCase):
                     return_value=iter([SimpleNamespace(id="user-1", name="alice")])
                 ),
             ),
+            network=sdk_network(),
             close=Mock(),
         )
 
-        result = await SDKOpenStack(connection, network_name="management").servers()
+        result = await SDKOpenStack(connection).servers()
 
         self.assertEqual(result, [])
 
@@ -267,14 +299,15 @@ class SDKOpenStackTests(IsolatedAsyncioTestCase):
                     return_value=iter([SimpleNamespace(id="user-1", name="alice")])
                 ),
             ),
+            network=sdk_network(),
             close=Mock(),
         )
 
-        result = await SDKOpenStack(connection, network_name="management").servers()
+        result = await SDKOpenStack(connection).servers()
 
         self.assertEqual(result, [])
 
-    async def test_servers_skips_ambiguous_management_addresses(self) -> None:
+    async def test_servers_take_the_first_fixed_address_on_any_network(self) -> None:
         server = SimpleNamespace(
             id="server-1",
             name="web-01",
@@ -282,6 +315,17 @@ class SDKOpenStackTests(IsolatedAsyncioTestCase):
             user_id="user-1",
             status="ACTIVE",
             addresses={
+                # No network is named in the configuration, so the walk starts at
+                # whichever one Nova lists first — and skips the floating address
+                # on it, because only a fixed address belongs to a port.
+                "public": [
+                    {
+                        "addr": "192.0.2.11",
+                        "version": 4,
+                        "OS-EXT-IPS:type": "floating",
+                        "OS-EXT-IPS-MAC:mac_addr": "fa:16:3e:00:00:01",
+                    }
+                ],
                 "management": [
                     {
                         "addr": "10.0.0.11",
@@ -295,6 +339,61 @@ class SDKOpenStackTests(IsolatedAsyncioTestCase):
                         "OS-EXT-IPS:type": "fixed",
                         "OS-EXT-IPS-MAC:mac_addr": "fa:16:3e:00:00:02",
                     },
+                ],
+                "storage": [
+                    {
+                        "addr": "10.7.0.11",
+                        "version": 4,
+                        "OS-EXT-IPS:type": "fixed",
+                        "OS-EXT-IPS-MAC:mac_addr": "fa:16:3e:00:00:03",
+                    }
+                ],
+            },
+            flavor={
+                "original_name": "m1.small",
+                "vcpus": 1,
+                "ram": 2048,
+                "disk": 20,
+            },
+        )
+        connection = SimpleNamespace(
+            compute=SimpleNamespace(servers=Mock(return_value=iter([server]))),
+            identity=SimpleNamespace(
+                projects=Mock(
+                    return_value=iter(
+                        [SimpleNamespace(id="project-1", name="acme-prod")]
+                    )
+                ),
+                users=Mock(
+                    return_value=iter([SimpleNamespace(id="user-1", name="alice")])
+                ),
+            ),
+            network=sdk_network(),
+            close=Mock(),
+        )
+
+        result = await SDKOpenStack(connection).servers()
+
+        self.assertEqual(
+            [(server.mac, server.ipv4, server.subnet_name) for server in result],
+            [("fa:16:3e:00:00:01", "10.0.0.11", None)],
+        )
+
+    async def test_servers_survive_an_unreadable_neutron(self) -> None:
+        server = SimpleNamespace(
+            id="server-1",
+            name="web-01",
+            project_id="project-1",
+            user_id="user-1",
+            status="ACTIVE",
+            addresses={
+                "management": [
+                    {
+                        "addr": "10.0.0.11",
+                        "version": 4,
+                        "OS-EXT-IPS:type": "fixed",
+                        "OS-EXT-IPS-MAC:mac_addr": "fa:16:3e:00:00:01",
+                    }
                 ]
             },
             flavor={
@@ -316,12 +415,19 @@ class SDKOpenStackTests(IsolatedAsyncioTestCase):
                     return_value=iter([SimpleNamespace(id="user-1", name="alice")])
                 ),
             ),
+            network=SimpleNamespace(
+                subnets=Mock(side_effect=RuntimeError("403 Forbidden")),
+                ports=Mock(return_value=iter([])),
+            ),
             close=Mock(),
         )
 
-        result = await SDKOpenStack(connection, network_name="management").servers()
+        result = await SDKOpenStack(connection).servers()
 
-        self.assertEqual(result, [])
+        self.assertEqual(
+            [(server.ipv4, server.subnet_name) for server in result],
+            [("10.0.0.11", None)],
+        )
 
     def test_cache_close_releases_upstream_connection(self) -> None:
         upstream = SimpleNamespace(close=Mock())
@@ -333,7 +439,22 @@ class SDKOpenStackTests(IsolatedAsyncioTestCase):
 
 
 class OpenStackSettingsTests(TestCase):
-    def test_real_lookup_requires_application_credential_and_network(self) -> None:
+    def _settings(self, **overrides: Any) -> Settings:
+        base: dict[str, Any] = {
+            "_env_file": None,
+            "jwt_secret": "x" * 32,
+            "admin_username": "admin",
+            "admin_password": "admin-password",
+            "openstack_simulate": False,
+            "os_auth_url": "https://keystone.example/v3",
+            "os_username": "metrics-reader",
+            "os_password": "reader-password",
+            "os_project_id": "project-uuid",
+        }
+        base.update(overrides)
+        return Settings(**base)
+
+    def test_real_lookup_requires_password_credentials_and_network(self) -> None:
         with self.assertRaises(ValidationError) as raised:
             Settings(
                 _env_file=None,
@@ -345,26 +466,33 @@ class OpenStackSettingsTests(TestCase):
 
         message = str(raised.exception)
         self.assertIn("OS_AUTH_URL", message)
-        self.assertIn("OS_APPLICATION_CREDENTIAL_ID", message)
-        self.assertIn("OS_APPLICATION_CREDENTIAL_SECRET", message)
-        self.assertIn("OPENSTACK_NETWORK_NAME", message)
+        self.assertIn("OS_PASSWORD", message)
+        self.assertIn("OS_PROJECT_ID", message)
 
-    @patch("app.services.openstack.sdk.Connection")
-    def test_factory_builds_application_credential_connection(
-        self, connection_type: Mock
-    ) -> None:
-        connection = connection_type.return_value
-        settings = Settings(
-            _env_file=None,
-            jwt_secret="x" * 32,
-            admin_username="admin",
-            admin_password="admin-password",
-            openstack_simulate=False,
-            openstack_network_name="management",
+    def test_real_lookup_requires_a_user_name_or_a_user_id(self) -> None:
+        with self.assertRaises(ValidationError) as raised:
+            self._settings(os_username="")
+
+        self.assertIn("OS_USER_ID or OS_USERNAME", str(raised.exception))
+
+    def test_a_user_name_without_a_domain_is_rejected(self) -> None:
+        with self.assertRaises(ValidationError) as raised:
+            self._settings(os_user_domain_id="")
+
+        self.assertIn("OS_USER_DOMAIN_ID", str(raised.exception))
+
+    def test_a_user_id_needs_no_domain(self) -> None:
+        settings = self._settings(
+            os_username="", os_user_id="user-uuid", os_user_domain_id=""
+        )
+
+        self.assertEqual(settings.os_user_id, "user-uuid")
+
+    @patch("app.services.openstack.sdk.openstack")
+    def test_factory_builds_a_password_connection(self, sdk: Mock) -> None:
+        settings = self._settings(
             openstack_api_timeout_seconds=12.5,
-            os_auth_url="https://keystone.example/v3",
-            os_application_credential_id="credential-id",
-            os_application_credential_secret="credential-secret",
+            os_user_domain_id="default",
             os_region_name="RegionOne",
             os_interface="internal",
             os_cacert="/var/run/secrets/openstack/ca.crt",
@@ -373,15 +501,16 @@ class OpenStackSettingsTests(TestCase):
         lookup = build_sdk_lookup(settings)
         lookup.close()
 
-        connection_type.assert_called_once_with(
+        sdk.connect.assert_called_once_with(
             app_name="snmp-metrics-api",
             app_version="0.7.0",
-            auth_type="v3applicationcredential",
-            auth={
-                "auth_url": "https://keystone.example/v3",
-                "application_credential_id": "credential-id",
-                "application_credential_secret": "credential-secret",
-            },
+            load_yaml_config=False,
+            load_envvars=False,
+            auth_url="https://keystone.example/v3",
+            username="metrics-reader",
+            password="reader-password",
+            project_id="project-uuid",
+            user_domain_id="default",
             region_name="RegionOne",
             interface="internal",
             cacert="/var/run/secrets/openstack/ca.crt",
@@ -389,21 +518,22 @@ class OpenStackSettingsTests(TestCase):
             compute_api_version="2",
             compute_default_microversion="2.47",
         )
-        connection.close.assert_called_once_with()
+        sdk.connect.return_value.close.assert_called_once_with()
+
+    @patch("app.services.openstack.sdk.openstack")
+    def test_a_user_id_replaces_the_name_and_domain(self, sdk: Mock) -> None:
+        settings = self._settings(os_username="", os_user_id="user-uuid")
+
+        build_sdk_lookup(settings)
+
+        credentials = sdk.connect.call_args.kwargs
+        self.assertEqual(credentials["user_id"], "user-uuid")
+        self.assertNotIn("username", credentials)
+        self.assertNotIn("user_domain_id", credentials)
 
     @patch("app.services.openstack.sdk.build_sdk_lookup")
     def test_lookup_factory_selects_real_adapter(self, sdk_factory: Mock) -> None:
-        settings = Settings(
-            _env_file=None,
-            jwt_secret="x" * 32,
-            admin_username="admin",
-            admin_password="admin-password",
-            openstack_simulate=False,
-            openstack_network_name="management",
-            os_auth_url="https://keystone.example/v3",
-            os_application_credential_id="credential-id",
-            os_application_credential_secret="credential-secret",
-        )
+        settings = self._settings()
 
         lookup = build_lookup(settings)
 

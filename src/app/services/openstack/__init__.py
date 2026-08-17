@@ -151,8 +151,5 @@ def build_lookup(settings: Settings) -> CachedOpenStack:
         from app.services.openstack.sdk import build_sdk_lookup
 
         upstream = build_sdk_lookup(settings)
-        log.info(
-            "openstack: read-only SDK lookup across all projects on network %r",
-            settings.openstack_network_name,
-        )
+        log.info("openstack: read-only SDK lookup across all projects and networks")
     return CachedOpenStack(upstream, settings.openstack_cache_ttl_seconds)

@@ -57,17 +57,31 @@ binding is a scope of its own — see [SNMP credentials](#snmp-credentials).
 
 **Both external systems are simulated, behind interfaces.** `SNMP_SIMULATE` and
 `OPENSTACK_SIMULATE` pick a fake sampler and a fake fleet. The real OpenStack
-adapter is deliberately read-only: it lists Nova servers across projects and
-Keystone projects/users, then translates those resources into the same
-`ServerInfo` returned by the simulator. It issues no create, update or delete
-operation. The simulated agent sizes each host from its OpenStack flavor, so an
-`m1.small` reports 1 core and 2 GiB rather than contradicting itself.
+adapter is deliberately read-only: it lists Nova servers across projects,
+Keystone projects/users and Neutron ports/subnets, then translates those
+resources into the same `ServerInfo` returned by the simulator. It issues no
+create, update or delete operation. The simulated agent sizes each host from its
+OpenStack flavor, so an `m1.small` reports 1 core and 2 GiB rather than
+contradicting itself.
+
+No network is singled out. Every network a server is attached to is walked in
+Nova's own order and the first *fixed* IPv4 carrying a MAC is taken — floating
+addresses are skipped, because only a fixed address belongs to the port whose MAC
+the collector joins on. The trade for not naming a network is that a server
+rewired onto a new network ahead of its old one is tracked at the new address.
+
+Nova's address entry supplies the MAC and the IPv4 but names no subnet, so
+`subnet_name` comes from the Neutron port that owns the address — two fleet-wide
+listings per cache refresh, not two per server. It is a label rather than a join
+key, so a Neutron the credential cannot read costs the label alone: the server is
+still returned, with `subnet_name` null.
 
 The adapter's code path is read-only, but a credential's authority is still a
-cloud policy decision. Its role or application-credential access rules should
-permit only the required Nova and Keystone `GET` operations. Those permissions
-must also allow Nova's all-project server list and Keystone's project/user lists;
-a normal project-scoped reader often cannot see that cloud-wide inventory.
+cloud policy decision. The user's roles should permit only the required Nova,
+Keystone and Neutron `GET` operations. Those permissions must also allow Nova's
+all-project server list, Keystone's project/user lists and Neutron's cloud-wide
+port and subnet lists; a normal project-scoped reader often cannot see that
+inventory.
 
 ## Layout
 
@@ -326,11 +340,11 @@ scope in the third column. See [Authentication](#authentication).
 | GET | `/` | — | service info and which backends are simulated |
 | GET | `/healthz` | — | no dependencies — backs liveness |
 | GET | `/readyz` | — | queries Postgres — backs readiness |
-| POST | `/auth/login` | — | form-encoded OAuth2 password grant ⇒ access + refresh token |
+| POST | `/auth/login` | — | form-encoded OAuth2 password grant ⇒ access + refresh token; throttled, 429 with `Retry-After` |
 | POST | `/auth/refresh` | — | rotates the refresh token; replaying one revokes the whole chain |
 | POST | `/auth/logout` | any | revokes the presented refresh token |
 | GET | `/auth/me` | any | your account, roles and effective scopes |
-| PATCH | `/auth/me/password` | any | needs the current password; ends your other sessions |
+| PATCH | `/auth/me/password` | any | needs the current password, and a different new one; ends your other sessions |
 | POST | `/auth/stream-ticket` | `metrics:read` | single-use credential for `EventSource` |
 | GET | `/scopes` | `roles:read` | the fixed catalogue, for building a role editor |
 | GET/POST | `/roles` | `roles:read` / `roles:write` | 422 on an unknown scope name |
@@ -339,7 +353,7 @@ scope in the third column. See [Authentication](#authentication).
 | GET/POST | `/users` | `users:read` / `users:write` | |
 | GET/PATCH/DELETE | `/users/{id}` | `users:read` / `users:write` | `PATCH {is_active}` |
 | PUT | `/users/{id}/roles` | `users:write` | replace a user's roles |
-| PUT | `/users/{id}/password` | `users:write` | administrative reset; ends that user's sessions |
+| PUT | `/users/{id}/password` | `users:write` | administrative reset; ends that user's sessions; 422 if unchanged |
 | POST | `/machines` | `machines:write` | `{ipv4, mac?, label?}`; `mac` required — and only accepted — for an address OpenStack does not know; 404 without it, 409 if it disagrees with OpenStack or is already registered |
 | GET | `/machines` | `machines:read` | our rows enriched with server id, tenant, user, flavor + specs; `external` marks the machines that have none |
 | GET/PATCH/DELETE | `/machines/{mac}` | `machines:read` / `machines:write` | `PATCH {label?, enabled?, ipv4?}` — `ipv4` on external machines only, and only while no credential is bound; 409 otherwise. `DELETE` cascades the history |
@@ -537,11 +551,14 @@ The settings worth knowing:
 | `SNMP_MAX_REPETITIONS` | 10 | Rows per GETBULK reply. Lower it for agents behind a small-MTU path — see below |
 | `METRICS_COMPRESS_AFTER_HOURS` | 24 | 0 disables. TimescaleDB columnar compression |
 | `METRICS_RETENTION_DAYS` | 30 | 0 disables. Chunks older than this are dropped |
-| `OPENSTACK_SIMULATE` | true | false ⇒ read-only Nova/Keystone lookup using an application credential |
+| `OPENSTACK_SIMULATE` | true | false ⇒ read-only Nova/Keystone/Neutron lookup using a Keystone password |
 | `OPENSTACK_CACHE_TTL_SECONDS` | 300 | How stale a tenant/flavor read may be |
-| `OPENSTACK_NETWORK_NAME` | — | Nova address-network key used to select one fixed IPv4/MAC pair; required for the real lookup |
 | `OPENSTACK_API_TIMEOUT_SECONDS` | 10 | Timeout applied to each SDK HTTP request, not to the complete paginated refresh |
-| `OS_APPLICATION_CREDENTIAL_ID` / `OS_APPLICATION_CREDENTIAL_SECRET` | — | Application credential constrained to the required read operations; required for the real lookup |
+| `OS_AUTH_URL` | — | Keystone endpoint, `/v3` included; required for the real lookup |
+| `OS_USERNAME` / `OS_USER_ID` | — | Identify the user by name or by UUID. Exactly one is required; a user id wins if both are set |
+| `OS_USER_DOMAIN_ID` | default | Domain the username lives in. Ignored, and not required, when `OS_USER_ID` is used |
+| `OS_PASSWORD` | — | Password for that user; required for the real lookup |
+| `OS_PROJECT_ID` | — | Project UUID the session is scoped to; required for the real lookup |
 | `OS_INTERFACE` | public | Service-catalog interface: public, internal or admin |
 | `OS_CACERT` | — | Optional CA bundle; TLS verification cannot be disabled |
 | `DB_AUTO_MIGRATE` | true | `alembic upgrade head` on startup, under an advisory lock |
@@ -551,6 +568,9 @@ The settings worth knowing:
 | `ADMIN_PASSWORD_RESET` | false | One-shot: rewrites the admin password from the environment |
 | `ACCESS_TOKEN_TTL_SECONDS` | 900 | Access tokens cannot be revoked, so they are short |
 | `REFRESH_TOKEN_TTL_SECONDS` | 1209600 | These are tracked per session and *can* be revoked |
+| `LOGIN_RATE_LIMIT_MAX_PER_USER` | 5 | Failed logins per username per window before 429 |
+| `LOGIN_RATE_LIMIT_MAX_PER_IP` | 20 | Same per client address; both are per replica |
+| `LOGIN_RATE_LIMIT_WINDOW_SECONDS` | 300 | The window both counters slide over |
 | `ROOT_PATH` | `/api` in-cluster | Must match the IngressRoute path and its StripPrefix |
 
 ### Holding the cadence
@@ -646,6 +666,16 @@ worse than one that will not come up. The account is created once. A password
 changed through the API is *not* reverted on the next restart — set
 `ADMIN_PASSWORD_RESET=true` for one boot to force-rotate a lost one.
 
+**A password change has to change the password.** Both routes to one — the
+self-service `PATCH /auth/me/password` and the administrative
+`PUT /users/{id}/password` — answer 422 if the new password is the one already
+in force, on top of the `PASSWORD_MIN_LENGTH` policy. Otherwise the reset would
+revoke every session that account has and leave the credential untouched, which
+is an outage dressed as a rotation. The self-service route compares plaintexts,
+having just verified the current one; the administrative route has only the
+stored hash and verifies against it, and logs the refusal — answering at all
+confirms a guess to a caller who did not already know the password.
+
 ```bash
 # a token
 TOKEN=$(curl -fsS -X POST localhost:8000/auth/login \
@@ -684,6 +714,39 @@ Anything that must take effect immediately (disabling a user, changing a
 password) revokes refresh tokens. Role changes are visible within one access
 token's lifetime, or at once on the next refresh, which re-reads the roles.
 
+### Failed logins
+
+A 401 that says nothing and costs nothing is still an invitation to keep
+guessing, so failures are counted (`src/app/services/ratelimit.py`) and past a
+limit `/auth/login` answers **429** with `Retry-After` instead of checking the
+password at all. Every attempt is counted twice:
+
+- **Per username** — 5 failures in 5 minutes. Follows the account wherever the
+  attempts come from, so spreading them across hosts buys nothing.
+- **Per client address** — 20 in the same window. Catches a spray across many
+  usernames, none of which is near its own limit.
+
+Neither alone is enough: the username counter on its own would let anyone lock
+any account out by failing five logins against it, which is why it is paired
+with an address that also has to run out of budget. A successful login clears
+the username's count and deliberately leaves the address's alone — otherwise one
+valid account would reset the attacker's budget between guesses at another.
+
+The check runs *before* the Argon2 verification, so a throttled attempt costs a
+dictionary lookup rather than 19 MiB and a hash. That makes this a
+denial-of-service bound as much as a credential-stuffing one.
+
+Two things to know before relying on it. The counters are **in-process**, like
+stream tickets and the metric bus, so at `replicas > 1` the effective limit is
+these numbers times the replica count — a weaker bound, not a broken one, and
+the fix is a shared store this deployment does not have. And the per-address
+half depends on the app seeing the real address: requests arrive from Traefik,
+so `FORWARDED_ALLOW_IPS` on the Deployment is what lets uvicorn believe
+`X-Forwarded-For`. Without it every caller shares Traefik's pod address and the
+20-per-address limit becomes one bucket for the whole cluster. The header is
+never read in application code, only by uvicorn's middleware, which trusts it
+solely from the addresses listed there.
+
 ### Streaming
 
 `EventSource` cannot set an `Authorization` header. Putting the access token in
@@ -705,10 +768,17 @@ just use the bearer token and skip this.
 ### Guardrails
 
 Permissions are the one part of a system that can be edited into an
-unrecoverable state, so four things are refused outright:
+unrecoverable state, so five things are refused outright:
 
 - **Amplification.** You cannot grant a role holding scopes you do not hold, nor
   create one. Without this, `users:write` would silently be every permission.
+- **Editing upwards.** The same subset test aimed at the target: you cannot
+  edit, delete, deactivate, re-role or reset the password of an account holding
+  scopes you do not, nor edit or delete a *role* holding them. Granting is not
+  the only route to authority you lack — resetting the admin's password reaches
+  it just as well. Since the admin role holds every scope, the practical effect
+  is that **the admin account and the admin role can only be touched by another
+  admin**. Peers can still administer peers, and an admin can edit anyone.
 - **Editing yourself.** Not your own roles, not your own account's existence.
 - **The last administrator.** Any change leaving no active user with
   `users:write` is refused — checked *after* the mutation inside the same

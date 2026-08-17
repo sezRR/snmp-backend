@@ -13,18 +13,22 @@ Two habits run through this module:
   transaction.** Access tokens cannot be revoked, so a few minutes of residual
   authority is unavoidable; leaving a refresh token alive would make it
   indefinite.
+* **Failed logins are counted, and past a limit answered 429 without doing the
+  work.** The counters live in `app.services.ratelimit`; the reason they exist
+  is that a constant-time 401 is still an invitation to keep guessing.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 
-from app.api.deps import DbDep, SettingsDep
+from app.api.deps import ClientIpDep, DbDep, LoginLimiterDep, SettingsDep
 from app.api.security import (
     AuthenticatedDep,
     Principal,
@@ -53,6 +57,7 @@ from app.services.auth import (
     hash_password,
     hash_password_blocking,
     verify_password,
+    verify_password_blocking,
 )
 
 log = logging.getLogger(__name__)
@@ -71,12 +76,35 @@ _BAD_CREDENTIALS = HTTPException(
 )
 
 
+_SAME_PASSWORD = HTTPException(
+    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+    detail="the new password must be different from the current one",
+)
+
+
 def check_password_policy(settings: Settings, password: str) -> None:
     if len(password) < settings.password_min_length:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"password must be at least {settings.password_min_length} characters",
         )
+
+
+def refuse_password_reuse(new_password: str, current_hash: str) -> None:
+    """Refuse a password change that changes nothing. Blocking.
+
+    For the administrative reset, which never sees the current plaintext and so
+    has to ask the hash. Blocking on purpose: the caller is `users`' `_reset`,
+    which already runs inside `run_session`'s worker thread, and doing it there
+    keeps the check in the same transaction as the write it guards.
+
+    A hash this build cannot parse verifies as False, so an unreadable one lets
+    the reset through — which is right: that account needs a new password more
+    than most.
+    """
+    ok, _ = verify_password_blocking(new_password, current_hash)
+    if ok:
+        raise _SAME_PASSWORD
 
 
 async def issue_pair(db: Database, settings: Settings, user: User) -> TokenPair:
@@ -102,21 +130,54 @@ async def issue_pair(db: Database, settings: Settings, user: User) -> TokenPair:
 async def login(
     db: DbDep,
     settings: SettingsDep,
+    limiter: LoginLimiterDep,
+    client_ip: ClientIpDep,
     form: Annotated[OAuth2PasswordRequestForm, Depends()],
 ) -> TokenPair:
-    """Exchange a username and password for an access/refresh pair."""
+    """Exchange a username and password for an access/refresh pair.
+
+    Rejected attempts are counted per username and per client address; past
+    either limit this answers 429 with `Retry-After` and does no work. Checked
+    before the password is verified, so a throttled attempt costs a dictionary
+    lookup rather than an Argon2 hash — the limit bounds CPU as well as guesses.
+    """
+    wait = limiter.retry_after(form.username, client_ip)
+    if wait is not None:
+        # Same answer whether or not the username exists, like _BAD_CREDENTIALS:
+        # a counter that only ever appeared for real accounts would enumerate
+        # them.
+        log.warning(
+            "throttled login for %r from %s (%.0fs remaining)",
+            form.username,
+            client_ip or "an unknown address",
+            wait,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="too many failed login attempts; try again later",
+            headers={"Retry-After": str(math.ceil(wait))},
+        )
+
     user = await db.run_session(users_repo.get_by_username, form.username)
     stored_hash = user.password_hash if user is not None else _DUMMY_HASH
     ok, new_hash = await verify_password(form.password, stored_hash)
 
     if user is None or not ok:
         log.info("failed login for %r", form.username)
+        limiter.record_failure(form.username, client_ip)
         raise _BAD_CREDENTIALS
     if not user.is_active:
         # Same response as a wrong password: whether an account is disabled is
-        # not something an unauthenticated caller needs to learn.
+        # not something an unauthenticated caller needs to learn. Counted too —
+        # a disabled account is exactly what a stolen password looks like.
         log.info("login refused for inactive user %r", user.username)
+        limiter.record_failure(form.username, client_ip)
         raise _BAD_CREDENTIALS
+
+    # The password was right, so the failures before it were this user's own
+    # typing. The address keeps its count: clearing it would give anyone holding
+    # one valid account an unlimited budget against every other.
+    limiter.record_success(form.username)
 
     if new_hash is not None:
         # The stored hash predates a cost increase; upgrade it while we have the
@@ -228,12 +289,18 @@ async def me(db: DbDep, principal: AuthenticatedDep) -> Me:
 async def change_own_password(
     db: DbDep, settings: SettingsDep, principal: AuthenticatedDep, payload: PasswordChange
 ) -> TokenPair:
-    """Change your own password. Requires the current one.
+    """Change your own password. Requires the current one, and a different one.
 
     Every other session is ended, and a fresh pair is returned so the caller is
     not logged out of the session they made the change from.
     """
     check_password_policy(settings, payload.new_password)
+    # Plaintext comparison rather than a second Argon2 verify: the current
+    # password is checked against the stored hash below, so two equal plaintexts
+    # is exactly the case where the change is a no-op. Both strings came from
+    # this caller, so there is nothing to leak by comparing them directly.
+    if payload.new_password == payload.current_password:
+        raise _SAME_PASSWORD
 
     user = await db.run_session(users_repo.get, principal.user_id)
     if user is None:

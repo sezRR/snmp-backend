@@ -8,6 +8,13 @@ The same no-amplification rule as `users` applies: a caller cannot create or
 edit a role holding scopes they do not themselves hold. Without it, `roles:write`
 would silently be every permission, since its holder could mint an admin-shaped
 role and have someone with `users:write` grant it.
+
+It is checked in both directions, as in `users`. The scopes *going in* to a role
+must be ones the caller holds, and so must the ones already *on* the role being
+edited or deleted — otherwise `roles:write` would still let its holder rewrite
+the authority of people above them, which is a different attack with the same
+ending. The built-in admin role is doubly covered: it holds every scope, so only
+an admin passes the subset test, and its scopes are fixed regardless.
 """
 
 from __future__ import annotations
@@ -48,6 +55,25 @@ def _refuse_amplification(scopes: list[str], caller: Principal) -> None:
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
                 f"cannot grant scope(s) you do not hold: {', '.join(sorted(excess))}"
+            ),
+        )
+
+
+def _refuse_editing_privileged_role(role: Role, caller: Principal) -> None:
+    """Refuse touching a role that carries more authority than the caller.
+
+    `_refuse_amplification` guards what goes into a role; this guards what is
+    already there. Both are needed: rewriting the scopes of a role you do not
+    hold is an edit to somebody else's authority even when every scope you write
+    is one of your own.
+    """
+    excess = role.scope_set - caller.scopes
+    if excess:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"cannot edit the {role.name} role: it holds "
+                f"{', '.join(sorted(excess))}, which you do not"
             ),
         )
 
@@ -102,11 +128,14 @@ async def update_role(
 ) -> RoleOut:
     """Edit the description. Scopes go through `PUT /roles/{name}/scopes`.
 
-    Allowed on system roles: a description is documentation, not authority.
+    Allowed on system roles — a description is documentation, not authority —
+    but not on a role holding scopes the caller does not: the admin role's
+    description is still the admin role's.
     """
 
     def _update(session) -> Role:
         role = _load(session, name)
+        _refuse_editing_privileged_role(role, principal)
         roles_repo.set_description(session, role, payload.description)
         return role
 
@@ -120,14 +149,15 @@ async def set_role_scopes(
 ) -> RoleOut:
     """Replace a role's scopes.
 
-    Refused on the built-in admin role, and refused if the result would leave
-    nobody able to administer users — editing a widely-granted role is the other
-    way to lock everyone out.
+    Refused on the built-in admin role, on any role holding scopes the caller
+    does not, and if the result would leave nobody able to administer users —
+    editing a widely-granted role is the other way to lock everyone out.
     """
     _refuse_amplification(payload.scopes, principal)
 
     def _set(session) -> Role:
         role = _load(session, name)
+        _refuse_editing_privileged_role(role, principal)
         roles_repo.set_scopes(session, role, payload.scopes)
         return role
 
@@ -149,10 +179,12 @@ async def set_role_scopes(
 
 @router.delete("/roles/{name}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_role(name: str, db: DbDep, principal: WriteDep) -> None:
-    """Delete a role. Refused if it is built in or still granted to anyone."""
+    """Delete a role. Refused if it is built in, still granted, or above you."""
 
     def _delete(session) -> None:
-        roles_repo.delete(session, _load(session, name))
+        role = _load(session, name)
+        _refuse_editing_privileged_role(role, principal)
+        roles_repo.delete(session, role)
 
     try:
         await db.run_session(_delete)

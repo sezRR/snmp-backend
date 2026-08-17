@@ -48,14 +48,18 @@ data:
   METRICS_COMPRESS_AFTER_HOURS: "24"
   METRICS_RETENTION_DAYS: "30"
 
-  # Read-only Nova/Keystone inventory. Fill the cloud-specific values and the
-  # application credential in api-secrets before deploying with simulation off.
+  # Read-only Nova/Keystone/Neutron inventory. Fill the cloud-specific values
+  # here and OS_PASSWORD in api-secrets before deploying with simulation off.
   OPENSTACK_SIMULATE: "false"
   OPENSTACK_CACHE_TTL_SECONDS: "300"
-  OPENSTACK_NETWORK_NAME: ""
   OPENSTACK_API_TIMEOUT_SECONDS: "10"
   OS_AUTH_URL: ""
-  OS_APPLICATION_CREDENTIAL_ID: ""
+  # Either OS_USER_ID (a UUID) or OS_USERNAME plus OS_USER_DOMAIN_ID. A user id
+  # takes precedence and makes the name and domain irrelevant.
+  OS_USERNAME: ""
+  OS_USER_ID: ""
+  OS_USER_DOMAIN_ID: default
+  OS_PROJECT_ID: ""
   OS_REGION_NAME: ""
   OS_INTERFACE: public
 
@@ -81,3 +85,22 @@ data:
   # token for a single-use ticket. Short enough that one captured in Traefik's
   # access log is already spent.
   STREAM_TICKET_TTL_SECONDS: "30"
+
+  # Failed logins are counted per username and per client address; either limit
+  # reached answers 429 with Retry-After for the rest of the window. Checked
+  # before the password is verified, so a throttled attempt costs no Argon2.
+  # Counters are per process — at replicas > 1 the real limit is these times the
+  # replica count, which is a weaker bound, not a broken one.
+  LOGIN_RATE_LIMIT_ENABLED: "true"
+  LOGIN_RATE_LIMIT_WINDOW_SECONDS: "300"
+  LOGIN_RATE_LIMIT_MAX_PER_USER: "5"
+  LOGIN_RATE_LIMIT_MAX_PER_IP: "20"
+
+  # Read by uvicorn, not by Settings. Requests arrive from Traefik, so without
+  # this every caller shares Traefik's pod address and the per-address limit
+  # above becomes one bucket for the whole cluster. Uvicorn only believes
+  # X-Forwarded-For from an address listed here; "*" trusts whatever reaches
+  # port 8000, which in this cluster is Traefik — the Service is the only route
+  # in from outside. Narrow it to the Traefik pod's CIDR if anything else in the
+  # cluster is ever allowed to call the API directly.
+  FORWARDED_ALLOW_IPS: "*"

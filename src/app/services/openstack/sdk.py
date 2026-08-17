@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from ipaddress import IPv4Address
 from typing import Any
 
-from openstack.connection import Connection
+import openstack
 from starlette.concurrency import run_in_threadpool
 
 from app import __version__
@@ -21,33 +21,44 @@ log = logging.getLogger(__name__)
 
 
 def build_sdk_lookup(settings: Settings) -> "SDKOpenStack":
-    connection = Connection(
+    # Keystone v3 password authentication. The user is given as a UUID when
+    # OS_USER_ID is set and as a name-in-a-domain otherwise; sending both would
+    # be ambiguous, so only one goes on the wire.
+    credentials: dict[str, object] = {
+        "auth_url": settings.os_auth_url,
+        "password": settings.os_password.get_secret_value(),
+        "project_id": settings.os_project_id,
+    }
+    if settings.os_user_id:
+        credentials["user_id"] = settings.os_user_id
+    else:
+        credentials["username"] = settings.os_username
+        credentials["user_domain_id"] = settings.os_user_domain_id
+
+    connection = openstack.connect(
         app_name="snmp-metrics-api",
         app_version=__version__,
-        auth_type="v3applicationcredential",
-        auth={
-            "auth_url": settings.os_auth_url,
-            "application_credential_id": settings.os_application_credential_id,
-            "application_credential_secret": (
-                settings.os_application_credential_secret.get_secret_value()
-            ),
-        },
+        # The deployment's environment is the only source of configuration:
+        # a clouds.yaml that happens to exist in the image, or a stray OS_*
+        # variable, must not be able to redirect the lookup at another cloud.
+        load_yaml_config=False,
+        load_envvars=False,
         region_name=settings.os_region_name or None,
         interface=settings.os_interface,
         cacert=settings.os_cacert or None,
         api_timeout=settings.openstack_api_timeout_seconds,
         compute_api_version="2",
         compute_default_microversion="2.47",
+        **credentials,
     )
-    return SDKOpenStack(connection, network_name=settings.openstack_network_name)
+    return SDKOpenStack(connection)
 
 
 class SDKOpenStack:
     """Translate read-only SDK responses into the application's fleet contract."""
 
-    def __init__(self, connection: Any, network_name: str) -> None:
+    def __init__(self, connection: Any) -> None:
         self._connection = connection
-        self._network_name = network_name
 
     async def servers(self) -> list[ServerInfo]:
         # SDK iterators perform blocking HTTP requests while they are consumed,
@@ -73,16 +84,17 @@ class SDKOpenStack:
         for server in self._connection.compute.servers(
             details=True, all_projects=True
         ):
-            target = _management_target(server.addresses, self._network_name)
+            target = _management_target(server.addresses)
             if target is None:
                 log.warning(
-                    "openstack server %s skipped: expected one fixed IPv4 with a "
-                    "MAC on network %r",
+                    "openstack server %s skipped: no fixed IPv4 with a MAC on "
+                    "any of its networks",
                     server.id,
-                    self._network_name,
                 )
                 continue
             discovered.append((server, target))
+
+        subnet_names = self._subnet_names_by_port_ip() if discovered else {}
 
         mac_counts = Counter(target[0] for _, target in discovered)
         ipv4_counts = Counter(target[1] for _, target in discovered)
@@ -125,38 +137,85 @@ class SDKOpenStack:
                     status=str(server.status),
                     mac=target[0],
                     ipv4=target[1],
+                    subnet_name=subnet_names.get(target),
                     flavor=flavor,
                 )
             )
         return result
 
+    def _subnet_names_by_port_ip(self) -> dict[tuple[str, str], str]:
+        """`(mac, ipv4)` -> subnet name, from Neutron.
 
-def _management_target(
-    addresses: Any, network_name: str
-) -> tuple[str, str] | None:
+        Nova's address entry carries no subnet, so the name has to come from the
+        port that owns the address. Both listings are fleet-wide and run once per
+        cache refresh rather than once per server, which is what keeps this to two
+        extra calls per TTL window instead of two per machine.
+
+        Descriptive data only: a Neutron failure — no `network:list` role, an
+        endpoint missing from the catalog — costs the label and nothing else, so
+        it is logged and swallowed rather than failing the whole refresh.
+        """
+        try:
+            subnets = {
+                str(subnet.id): str(subnet.name)
+                for subnet in self._connection.network.subnets()
+                if subnet.id and subnet.name
+            }
+            names: dict[tuple[str, str], str] = {}
+            for port in self._connection.network.ports():
+                raw_mac = _value(port, "mac_address")
+                if not raw_mac:
+                    continue
+                mac = normalise_mac(str(raw_mac))
+                for fixed_ip in _value(port, "fixed_ips") or []:
+                    ip = _value(fixed_ip, "ip_address")
+                    name = subnets.get(str(_value(fixed_ip, "subnet_id")))
+                    if ip and name:
+                        names[(mac, str(ip))] = name
+            return names
+        except Exception as exc:  # network call; the label is not load-bearing
+            log.warning(
+                "openstack subnet names unavailable (%s: %s); servers will be "
+                "returned without one",
+                type(exc).__name__,
+                exc,
+            )
+            return {}
+
+
+def _management_target(addresses: Any) -> tuple[str, str] | None:
+    """First usable fixed IPv4/MAC pair Nova lists, across every network.
+
+    No network is singled out: every network the server is attached to is walked
+    in the order Nova returns them, and the first fixed IPv4 carrying a MAC wins.
+    Nova's ordering is stable, so "the first" is the same address on every
+    refresh — but a server rewired onto a new network ahead of its old one will
+    be tracked at the new address, which is the cost of not naming a network.
+
+    Floating IPs are still ignored: only a fixed address belongs to the port
+    whose MAC the collector joins on.
+    """
     if not isinstance(addresses, Mapping):
         return None
-    candidates: set[tuple[str, str]] = set()
-    for address in addresses.get(network_name, []):
-        if _value(address, "version") != 4:
-            continue
-        if _value(address, "OS-EXT-IPS:type") != "fixed":
-            continue
-        raw_ip = _value(address, "addr")
-        raw_mac = _value(address, "OS-EXT-IPS-MAC:mac_addr")
-        if not raw_ip or not raw_mac:
-            continue
-        try:
-            ipv4 = str(IPv4Address(str(raw_ip)))
-        except ValueError:
-            continue
-        mac = normalise_mac(str(raw_mac))
-        if re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac) is None:
-            continue
-        candidates.add((mac, ipv4))
-    if len(candidates) != 1:
-        return None
-    return candidates.pop()
+    for network_addresses in addresses.values():
+        for address in network_addresses or []:
+            if _value(address, "version") != 4:
+                continue
+            if _value(address, "OS-EXT-IPS:type") != "fixed":
+                continue
+            raw_ip = _value(address, "addr")
+            raw_mac = _value(address, "OS-EXT-IPS-MAC:mac_addr")
+            if not raw_ip or not raw_mac:
+                continue
+            try:
+                ipv4 = str(IPv4Address(str(raw_ip)))
+            except ValueError:
+                continue
+            mac = normalise_mac(str(raw_mac))
+            if re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac) is None:
+                continue
+            return (mac, ipv4)
+    return None
 
 
 def _flavor_info(flavor: Any) -> FlavorInfo | None:

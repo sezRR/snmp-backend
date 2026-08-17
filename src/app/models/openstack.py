@@ -15,6 +15,10 @@ class ServerInfo(BaseModel):
 
     Never persisted — looked up per request so it cannot go stale against the
     real fleet. `mac` and `ipv4` are the join keys onto our `machines` table.
+
+    `subnet_name` is descriptive only. It comes from Neutron rather than Nova,
+    so it is None whenever the port or subnet behind `ipv4` is not readable —
+    losing a label must not cost us a server record.
     """
 
     server_id: str
@@ -24,6 +28,7 @@ class ServerInfo(BaseModel):
     status: str
     mac: str
     ipv4: str
+    subnet_name: str | None = None
     flavor: FlavorInfo
 
 

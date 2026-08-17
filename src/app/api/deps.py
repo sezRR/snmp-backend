@@ -17,6 +17,7 @@ from app.services.bus import MetricBus
 from app.services.collector import Collector
 from app.services.credentials import CredentialCache
 from app.services.openstack import CachedOpenStack
+from app.services.ratelimit import LoginRateLimiter
 from app.services.snmp import SnmpSampler
 
 
@@ -50,6 +51,26 @@ def get_credentials(request: Request) -> CredentialCache:
     return request.app.state.credentials
 
 
+def get_login_limiter(request: Request) -> LoginRateLimiter:
+    return request.app.state.login_limiter
+
+
+def get_client_ip(request: Request) -> str | None:
+    """The caller's address as the ASGI server reports it, or None.
+
+    Deliberately `request.client` and not the `X-Forwarded-For` header: reading
+    that header here would let any caller pick its own rate-limit bucket by
+    inventing one. Uvicorn's own `ProxyHeadersMiddleware` does the same job
+    safely because it only believes the header when the *connection* comes from
+    a trusted address — which is why the Deployment sets `FORWARDED_ALLOW_IPS`.
+    Without that, every request behind Traefik shares Traefik's address and the
+    per-address limit becomes a per-cluster one.
+
+    None when the scope carries no client, as with an in-process test transport.
+    """
+    return request.client.host if request.client is not None else None
+
+
 def get_cipher(request: Request) -> CredentialCipher:
     """The credential cipher, or a 503 if this deployment has no key ring.
 
@@ -77,3 +98,5 @@ SettingsDep = Annotated[Settings, Depends(get_settings)]
 SamplerDep = Annotated[SnmpSampler, Depends(get_sampler)]
 CredentialCacheDep = Annotated[CredentialCache, Depends(get_credentials)]
 CipherDep = Annotated[CredentialCipher, Depends(get_cipher)]
+LoginLimiterDep = Annotated[LoginRateLimiter, Depends(get_login_limiter)]
+ClientIpDep = Annotated[str | None, Depends(get_client_ip)]

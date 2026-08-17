@@ -205,15 +205,21 @@ class Settings(DatabaseSettings):
     # ---- OpenStack ----------------------------------------------------------
     # The real lookup is read-only: it lists Nova servers across projects and
     # uses Keystone solely to resolve the project/user names already present in
-    # the API contract. Nova's address entry under this network supplies the
-    # one fixed IPv4/MAC pair the collector needs.
+    # the API contract. Every network a server is attached to is considered, and
+    # the first fixed IPv4/MAC pair Nova lists is the one the collector needs.
     openstack_simulate: bool = True
     openstack_cache_ttl_seconds: float = 300.0
-    openstack_network_name: str = ""
     openstack_api_timeout_seconds: float = Field(default=10.0, gt=0)
     os_auth_url: str = ""
-    os_application_credential_id: str = ""
-    os_application_credential_secret: SecretStr = SecretStr("")
+    # Keystone password authentication. The user is identified by *either*
+    # OS_USER_ID or OS_USERNAME — a name is only unique inside a domain, so a
+    # name additionally needs OS_USER_DOMAIN_ID, while a UUID stands alone. The
+    # scope is the project UUID, which is likewise domain-unambiguous.
+    os_username: str = ""
+    os_user_id: str = ""
+    os_password: SecretStr = SecretStr("")
+    os_project_id: str = ""
+    os_user_domain_id: str = "default"
     os_region_name: str = ""
     os_interface: str = Field(
         default="public", pattern="^(public|internal|admin)$"
@@ -238,6 +244,21 @@ class Settings(DatabaseSettings):
     # seconds is enough to redeem one and short enough that a ticket leaked into
     # an access log is inert by the time anyone reads it.
     stream_ticket_ttl_seconds: float = 30.0
+
+    # ---- Login rate limiting -------------------------------------------------
+    # Failed /auth/login attempts are counted per username and per client
+    # address; either limit reached blocks further attempts for the rest of the
+    # window. Both are needed: the username counter alone would let anyone lock
+    # any account out, and the address counter alone would ignore a distributed
+    # attack on one account. See app/services/ratelimit.py.
+    #
+    # The per-user figure is sized for a human who has fat-fingered a password a
+    # few times; the per-address one for an office or a NAT behind which several
+    # of them are doing it at once.
+    login_rate_limit_enabled: bool = True
+    login_rate_limit_window_seconds: float = Field(default=300.0, gt=0)
+    login_rate_limit_max_per_user: int = Field(default=5, ge=0)
+    login_rate_limit_max_per_ip: int = Field(default=20, ge=0)
 
     # ---- Admin bootstrap ----------------------------------------------------
     # Both required: without an admin account nothing can be administered, so a
@@ -299,12 +320,8 @@ class Settings(DatabaseSettings):
             name
             for name, value in (
                 ("OS_AUTH_URL", self.os_auth_url),
-                ("OS_APPLICATION_CREDENTIAL_ID", self.os_application_credential_id),
-                (
-                    "OS_APPLICATION_CREDENTIAL_SECRET",
-                    self.os_application_credential_secret.get_secret_value(),
-                ),
-                ("OPENSTACK_NETWORK_NAME", self.openstack_network_name),
+                ("OS_PASSWORD", self.os_password.get_secret_value()),
+                ("OS_PROJECT_ID", self.os_project_id),
             )
             if not value.strip()
         ]
@@ -312,6 +329,15 @@ class Settings(DatabaseSettings):
             raise ValueError(
                 f"{', '.join(blank)} must be set and non-blank when "
                 "OPENSTACK_SIMULATE=false"
+            )
+        if not self.os_user_id.strip() and not self.os_username.strip():
+            raise ValueError(
+                "OS_USER_ID or OS_USERNAME must be set when OPENSTACK_SIMULATE=false"
+            )
+        if not self.os_user_id.strip() and not self.os_user_domain_id.strip():
+            raise ValueError(
+                "OS_USER_DOMAIN_ID must be set when the user is identified by "
+                "OS_USERNAME; a username is only unique within its domain"
             )
         return self
 
