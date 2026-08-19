@@ -14,10 +14,10 @@ a botnet grinding a single account. Both are checked, and the longer wait wins.
 leaves the address's alone — otherwise anyone holding one valid account could
 reset their own budget between guesses at another.
 
-**In-process, on `app.state`**, like `StreamTickets`. With one replica that is
-the whole picture; with several, each pod carries its own counters and the
-effective limit multiplies by the replica count. That is a weaker bound, not a
-broken one, and the alternative is a shared store this deployment does not have.
+**In-process, on `app.state`**, like `StreamTickets`. With one process that is
+the whole picture; with several, each carries its own counters and the effective
+limit multiplies by the process count. That is a weaker bound, not a broken one,
+and the alternative is a shared store this installation does not have.
 Moving to one means replacing the dict below and nothing else.
 
 The counters are what protect the Argon2 verification, which is deliberately

@@ -56,9 +56,9 @@ async def lifespan(app: FastAPI):
     collector = None
     try:
         if settings.db_auto_migrate:
-            # Retries internally: on a cold cluster this pod is usually up before
-            # Postgres has finished initdb. Also takes an advisory lock, so replicas
-            # starting together do not race each other through the same revision.
+            # Retries internally because Postgres may still be finishing initdb.
+            # Also takes an advisory lock, so processes starting together do not
+            # race each other through the same revision.
             await run_migrations(db.engine, settings)
 
         # Not schema, and so not Alembic's: both windows are settings, re-applied on
@@ -78,10 +78,10 @@ async def lifespan(app: FastAPI):
         app.state.credentials = CredentialCache(db, app.state.cipher)
 
         app.state.bus = MetricBus(queue_maxsize=settings.sse_queue_maxsize)
-        # In-process and per-pod, like the bus a stream reads from.
+        # In-process, like the bus a stream reads from.
         app.state.stream_tickets = StreamTickets(settings.stream_ticket_ttl_seconds)
-        # Also per-pod: with more than one replica each carries its own counters,
-        # so the effective limit is this times the replica count.
+        # Also per-process: with more than one each carries its own counters, so
+        # the effective limit is multiplied by the process count.
         app.state.login_limiter = LoginRateLimiter(
             max_per_user=settings.login_rate_limit_max_per_user,
             max_per_ip=settings.login_rate_limit_max_per_ip,
@@ -127,8 +127,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         title="SNMP metrics API",
         version=__version__,
         summary="Polls SNMP metrics into TimescaleDB; OpenStack is the source of truth for machine facts.",
-        # Traefik strips /api before the request arrives; root_path puts the
-        # prefix back into the docs and OpenAPI `servers` URLs.
+        # root_path restores a prefix stripped by an optional reverse proxy.
         root_path=settings.root_path,
         lifespan=lifespan,
     )

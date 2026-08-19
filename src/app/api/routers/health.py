@@ -1,8 +1,7 @@
 """Liveness and readiness.
 
-Split on purpose: `/healthz` touches nothing, so a database outage never gets the
-container restarted, while `/readyz` queries Postgres, so the pod leaves the
-Service endpoints for as long as it cannot serve data.
+Split on purpose: `/healthz` touches nothing, while `/readyz` queries Postgres so
+health-aware tooling can stop routing requests while data cannot be served.
 """
 
 from __future__ import annotations

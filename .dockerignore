@@ -1,5 +1,5 @@
 .venv
-# Credentials stay out of the image; Kubernetes injects them as env vars.
+# Credentials stay out of the image; Compose injects them at runtime.
 .env
 .env.*
 __pycache__/
@@ -10,11 +10,9 @@ __pycache__/
 .dockerignore
 Dockerfile
 compose.yaml
-compose.override.yaml
 Makefile
-# Mounted into the seed container at run time; never baked in.
+# Mounted into the API container at run time; never baked in.
 scripts/
-k8s/
 README.md
 build/
 dist/

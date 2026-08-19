@@ -11,7 +11,7 @@ Two decisions are visible in what this revision does *not* do.
 because that value would have to be encrypted, and Alembic loads
 `DatabaseSettings` (see `app.config`) — which deliberately carries no key ring.
 Reaching for the app's crypto from inside a revision would drag the encryption
-key into every migration Job that was designed not to need one. The seeding
+key into every migration process that was designed not to need one. The seeding
 happens in `app.services.bootstrap` instead, which already runs once per boot
 with the full `Settings` in hand and already reconciles data of exactly this
 kind.

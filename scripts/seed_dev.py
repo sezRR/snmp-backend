@@ -17,8 +17,8 @@ SNMP_COMMUNITY on its first boot. Binding is a separate call because it needs a
 separate scope (`credentials:write`), which is the whole point of the split: see
 `app.security.scopes`.
 
-Run it inside the stack (`docker compose --profile seed run --rm seed`) or from
-the host against the published port:
+Run it inside the API container (`docker compose exec api python
+/app/scripts/seed_dev.py`) or from the host against the published port:
 
     API_BASE=http://127.0.0.1:8000 ADMIN_PASSWORD=... python scripts/seed_dev.py
 
@@ -57,7 +57,7 @@ FLEET = [
 
 
 def wait_for_api(attempts: int = 30, delay: float = 2.0) -> None:
-    """`depends_on` already gates on health; this covers running from the host."""
+    """Wait through startup for host runs and manual container execution."""
     for attempt in range(1, attempts + 1):
         try:
             with urllib.request.urlopen(f"{API_BASE}/readyz", timeout=3) as response:
@@ -153,7 +153,8 @@ def bind_unbound(token: str) -> int:
         print(
             "\nno `default-v2c` credential: the backend was started without "
             "SNMP_CREDENTIAL_KEYS, so nothing can be bound and nothing will be "
-            "polled. Set it in .env and restart — see .env.example."
+            "polled. Set it in .env and recreate the API container — see "
+            ".env.example."
         )
         return 0
 
@@ -175,6 +176,13 @@ def bind_unbound(token: str) -> int:
 
 
 def main() -> int:
+    if sys.argv[1:] == ["--token"]:
+        wait_for_api()
+        print(login())
+        return 0
+    if sys.argv[1:]:
+        sys.exit("usage: seed_dev.py [--token]")
+
     # /readyz stays public, so this still works before authenticating.
     wait_for_api()
     token = login()

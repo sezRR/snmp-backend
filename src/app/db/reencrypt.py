@@ -5,7 +5,8 @@
 Key rotation is four steps, and only the third one is this:
 
 1. add a new key to `SNMP_CREDENTIAL_KEYS` — the old one stays;
-2. point `SNMP_CREDENTIAL_ACTIVE_KEY` at it and restart, so new writes use it;
+2. point `SNMP_CREDENTIAL_ACTIVE_KEY` at it and recreate the app container, so
+   new writes use it;
 3. run this, which rewraps every row that is still on an older key;
 4. drop the old key from the ring.
 

@@ -19,7 +19,7 @@ sooner revokes refresh tokens; see `app.services.auth`.
 
 **Streams are the exception to Bearer.** A browser's `EventSource` cannot set an
 `Authorization` header, and the usual workaround — the access token in the query
-string — puts a credential with full API authority into Traefik's access log,
+string — puts a credential with full API authority into proxy access logs,
 the browser's history, and every proxy in between. Instead a client exchanges
 its token for a single-use ticket that is worth thirty seconds and one
 connection.
@@ -121,8 +121,8 @@ class StreamTickets:
     """Single-use, short-lived credentials for `EventSource`.
 
     In-process, on `app.state`. That is not the limitation it looks like: the
-    `MetricBus` a stream reads from is per-pod already, so a subscriber is
-    pinned to the pod it connected to whatever we do here. If the bus ever
+    `MetricBus` a stream reads from is per-process already, so a subscriber is
+    pinned to the process it connected to whatever we do here. If the bus ever
     becomes shared, this moves with it.
     """
 

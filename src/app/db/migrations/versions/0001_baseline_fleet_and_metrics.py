@@ -8,7 +8,7 @@ Transcribed from the `src/app/db/schema.sql` this replaces, so that a database
 built by either route ends up identical.
 
 The `has_table` guard exists because two very different databases have to
-converge here. A cluster deployed before Alembic already has both tables, filled
+converge here. An installation created before Alembic already has both tables, filled
 with metrics, and no `alembic_version` row; a fresh one has nothing. Guarding on
 introspection lets `alembic upgrade head` adopt the former without a manual
 `alembic stamp` and build the latter from scratch — the same command either way,

@@ -15,7 +15,7 @@ password — revokes refresh tokens and waits out the access token's few minutes
 
 Argon2 is tuned to OWASP's floor (19 MiB, t=2, p=1) rather than the library
 default (64 MiB, t=3, p=4). Two concurrent logins at the default would ask for
-128 MiB inside a pod limited to 512 MiB while the collector is also running.
+128 MiB inside a container limited to 512 MiB while the collector is also running.
 """
 
 from __future__ import annotations

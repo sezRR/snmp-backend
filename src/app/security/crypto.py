@@ -7,9 +7,9 @@ copying it would produce credentials the collector cannot use.
 
 What that buys and what it does not: the ciphertext is useless to anyone who
 walks off with a `pg_dump`, a replica, or a backup. It is *not* protection
-against a compromised pod, which by construction holds the key in its
-environment. Treat this as raising the cost of a database-only breach, and keep
-the Secret's RBAC as the thing that guards the other case.
+against a compromised app container, which by construction holds the key in its
+environment. Treat this as raising the cost of a database-only breach, and
+protect access to `.env` and the container runtime.
 
 Three details are load-bearing:
 

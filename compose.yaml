@@ -1,59 +1,34 @@
-# The same two processes the Kubernetes manifests run — TimescaleDB and the
-# FastAPI app — wired the same way, on one host.
-#
-# This file on its own is the "deployed" shape: built image, no source mounted,
-# no database port published, restart policies on. `docker compose up` also
-# loads compose.override.yaml, which turns it into a development environment
-# (source bind-mounted, --reload, simulated SNMP, database published to
-# localhost). Anything that is not a developer's machine opts out explicitly:
-#
-#   docker compose -f compose.yaml up -d --wait
-#
-# Config comes from the same `.env` the host-run uvicorn uses (see .env.example).
-# Everything has a working default except JWT_SECRET and ADMIN_PASSWORD, which
-# have none by design — see the api service below. Note that `.env` is read
-# twice: Compose expands ${...} from it, and the api container reads it as an
-# env file. The handful of variables that describe container topology rather
-# than preference are set under `environment:` so a `.env` written for running
-# uvicorn on the host — where PGHOST is localhost — cannot break the containers.
-#
-# Requires Compose v2.24+ (`env_file: required: false`).
+# Local development stack. Copy `.env.example` to `.env` before starting it;
+# Compose uses that file both for YAML interpolation and as the API container's
+# environment. Container-only topology stays here so the same `.env` can also
+# be used by host tools, where Postgres is reached through localhost.
 
 name: snmp-metrics
 
 services:
   timescaledb:
-    # Same pin as k8s/timescaledb-statefulset.yaml.
     image: timescale/timescaledb:2.22.1-pg17
     environment:
-      POSTGRES_DB: ${PGDATABASE:-app}
-      POSTGRES_USER: ${PGUSER:-app}
-      POSTGRES_PASSWORD: ${PGPASSWORD:-dev-only-not-a-secret}
+      POSTGRES_DB: ${PGDATABASE:?Set PGDATABASE in .env}
+      POSTGRES_USER: ${PGUSER:?Set PGUSER in .env}
+      POSTGRES_PASSWORD: ${PGPASSWORD:?Set PGPASSWORD in .env}
       # A subdirectory, so initdb never sees the volume's lost+found.
       PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "127.0.0.1:${PGPORT:-15432}:5432"
     volumes:
       - timescale-data:/var/lib/postgresql/data
-    # No /docker-entrypoint-initdb.d mount, for the same reason the StatefulSet
-    # has none: the schema is owned by the app (Alembic revisions under
-    # src/app/db/migrations, applied by src/app/db/migrate.py) and brought to
-    # head on every startup. Entrypoint init scripts only ever run once, against
-    # an empty data directory.
+    # Alembic owns the schema and applies it from the API startup path. Init
+    # scripts would only run against an empty volume and could not evolve it.
     healthcheck:
-      # -h localhost keeps this on TCP, so it only passes once the server is
-      # really accepting connections — during initdb the entrypoint runs a
-      # temporary unix-socket-only server that pg_isready would call ready.
+      # TCP only becomes ready after initdb's temporary socket-only server exits.
       test:
         ["CMD-SHELL", 'pg_isready -h localhost -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
       interval: 5s
       timeout: 3s
       retries: 20
       start_period: 30s
-    restart: unless-stopped
-    # Unlike the StatefulSet this keeps the image's own root entrypoint: it
-    # chowns PGDATA and steps down to postgres itself, which needs the very
-    # capabilities the pod drops. The pod works around that with runAsUser 999
-    # plus fsGroup; on a bind- or volume-mounted Docker volume there is nothing
-    # to work around.
+    restart: "no"
     security_opt:
       - no-new-privileges:true
     deploy:
@@ -64,50 +39,38 @@ services:
   api:
     build:
       context: .
-    # The Makefile exports APP_VERSION, read from src/app/__init__.py — the one
-    # place the version is written — so `make build` produces exactly the tag
-    # k8s/deployment.yaml pins and `make deploy-tag` names.
-    #
-    # The fallback is deliberately not a version number. Run bare, this builds
-    # `fastapi-demo:dev`, which cannot overwrite the tag the cluster is pinned
-    # to: with imagePullPolicy IfNotPresent, a laptop build sitting on that tag
-    # is what the next rollout would pick up.
     image: fastapi-demo:${APP_VERSION:-dev}
     depends_on:
       timescaledb:
         condition: service_healthy
     env_file:
-      - path: .env
-        required: false
+      - .env
     environment:
-      # Topology, not preference — these must win over anything in `.env`,
-      # which is written for uvicorn running on the host.
+      # These values describe the Compose network, not application preference.
       PGHOST: timescaledb
       PGPORT: "5432"
-      PGDATABASE: ${PGDATABASE:-app}
-      PGUSER: ${PGUSER:-app}
-      PGPASSWORD: ${PGPASSWORD:-dev-only-not-a-secret}
-      # Nothing terminates TLS in front of this app here, and there is no
-      # Traefik stripping a prefix, so no ROOT_PATH either. Everything else
-      # falls through to `.env` and then to the defaults in src/app/config.py.
-      ROOT_PATH: ${ROOT_PATH:-}
-      # No defaults, on purpose: there is no safe stand-in for a signing key or
-      # an administrator's password. Left empty, the app refuses to start and
-      # says which value is missing — see the validator in src/app/config.py.
-      #
-      # Not `${VAR:?message}`, tempting as that is: Compose interpolates each
-      # file on its own before merging them, so a `:?` here would fire even when
-      # compose.override.yaml supplies a value, and `make up` would never run.
-      JWT_SECRET: ${JWT_SECRET:-}
-      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
-      ADMIN_PASSWORD_RESET: ${ADMIN_PASSWORD_RESET:-false}
+      # Keep shell overrides aligned with the values used to initialize Postgres.
+      PGDATABASE: ${PGDATABASE:?Set PGDATABASE in .env}
+      PGUSER: ${PGUSER:?Set PGUSER in .env}
+      PGPASSWORD: ${PGPASSWORD:?Set PGPASSWORD in .env}
     ports:
-      - "${API_PORT:-8000}:8000"
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    volumes:
+      - ./src:/app/src:ro
+      - ./scripts:/app/scripts:ro
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --reload
+      - --reload-dir
+      - /app/src
     healthcheck:
-      # /readyz rather than /healthz: it queries Postgres, so `up --wait` means
-      # "serving requests it can actually answer". Docker does not restart an
-      # unhealthy container, so a database blip only shows up in `compose ps`.
+      # /readyz queries Postgres, so `up --wait` only succeeds when requests can
+      # be served. Docker reports an unhealthy container but does not restart it.
       test:
         - CMD
         - python
@@ -118,11 +81,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 6
-      # The app applies its schema on startup and retries while Postgres is
-      # still initialising. This is the startupProbe's job in the Deployment.
       start_period: 90s
-    restart: unless-stopped
-    read_only: true
+    restart: "no"
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -131,8 +91,68 @@ services:
       resources:
         limits:
           memory: 512M
+    develop:
+      watch:
+        # Source is bind-mounted; dependencies still require an image rebuild.
+        - action: rebuild
+          path: ./pyproject.toml
+        - action: rebuild
+          path: ./uv.lock
+
+  # Real SNMP agents for exercising v2c and v3 behavior locally. They are
+  # profile-gated because the default stack uses the simulator.
+  snmpd:
+    profiles:
+      - snmp
+    image: docker.io/library/alpine:3.20
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        apk add --no-cache net-snmp net-snmp-tools >/dev/null
+        mkdir -p /var/lib/net-snmp
+        cat > /var/lib/net-snmp/snmpd.conf <<'EOF'
+        createUser fleetmon SHA-256 "dev-auth-passphrase" AES-128 "dev-priv-passphrase"
+        EOF
+        cat > /etc/snmp/snmpd.conf <<'EOF'
+        rouser fleetmon authPriv -V fleet
+        rocommunity public default -V fleet
+        view fleet included .1.3.6.1.2.1.1
+        view fleet included .1.3.6.1.2.1.2
+        view fleet included .1.3.6.1.2.1.25
+        view fleet included .1.3.6.1.2.1.31
+        view fleet included .1.3.6.1.4.1.2021.13.15
+        EOF
+        exec snmpd -f -Lo -c /etc/snmp/snmpd.conf udp:0.0.0.0:161
+    restart: "no"
+
+  # Same securityName as snmpd with a different passphrase, which exercises the
+  # per-engine pysnmp credential cache behavior.
+  snmpd2:
+    profiles:
+      - snmp
+    image: docker.io/library/alpine:3.20
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        apk add --no-cache net-snmp net-snmp-tools >/dev/null
+        mkdir -p /var/lib/net-snmp
+        cat > /var/lib/net-snmp/snmpd.conf <<'EOF'
+        createUser fleetmon SHA-256 "second-auth-passphrase" AES-128 "second-priv-passphrase"
+        EOF
+        cat > /etc/snmp/snmpd.conf <<'EOF'
+        rouser fleetmon authPriv -V fleet
+        view fleet included .1.3.6.1.2.1.1
+        view fleet included .1.3.6.1.2.1.2
+        view fleet included .1.3.6.1.2.1.25
+        view fleet included .1.3.6.1.2.1.31
+        EOF
+        exec snmpd -f -Lo -c /etc/snmp/snmpd.conf udp:0.0.0.0:161
+    restart: "no"
 
 volumes:
-  # Survives `docker compose down`; `down -v` is what deletes the data, the
-  # same split as `kubectl delete -k` leaving the PVC behind.
+  # `docker compose down` keeps data; `down -v` removes it.
   timescale-data:

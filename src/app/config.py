@@ -1,8 +1,7 @@
 """Application settings.
 
 Values are read from the process environment first and from a `.env` file
-second, so the Kubernetes ConfigMap and Secret always win over a developer's
-local file. See `.env.example` for the full list with defaults.
+second. See `.env.example` for the full list with defaults.
 
 Split in two on purpose. `DatabaseSettings` is everything needed to reach the
 database and nothing else; `Settings` adds the rest of the application. Alembic
@@ -72,8 +71,7 @@ class DatabaseSettings(BaseSettings):
     )
 
     # ---- Database -----------------------------------------------------------
-    # Names match libpq's own variables, which is also what the TigerData
-    # Kubernetes guide puts in its Secret.
+    # Names match libpq's own environment variables.
     pghost: str = "timescaledb"
     pgport: int = 5432
     pgdatabase: str = "app"
@@ -89,14 +87,14 @@ class DatabaseSettings(BaseSettings):
     db_pool_max: int = 16
     db_connect_timeout_seconds: int = 5
     db_statement_timeout_ms: int = 15_000
-    # Run `alembic upgrade head` on startup. Turn off to migrate out of band,
-    # e.g. from a Kubernetes Job running `python -m app.db.migrate`.
-    # The old name is still accepted so an unupdated ConfigMap keeps working.
+    # Run `alembic upgrade head` on startup. Turn off to migrate separately with
+    # `python -m app.db.migrate`. The old environment name remains accepted for
+    # existing installations.
     db_auto_migrate: bool = Field(
         default=True, validation_alias=AliasChoices("DB_AUTO_MIGRATE", "DB_AUTO_INIT")
     )
     # How long the migration step waits out a database that is still doing
-    # initdb. 30 x 2s covers a cold cluster comfortably.
+    # initdb. 30 x 2s covers a cold database comfortably.
     db_init_max_attempts: int = 30
     db_init_retry_seconds: float = 2.0
 
@@ -228,10 +226,10 @@ class Settings(DatabaseSettings):
 
     # ---- Auth ---------------------------------------------------------------
     # JWT_SECRET has no default and no fallback. Generating one would be worse
-    # than failing: it would differ between replicas, so a token minted by one
-    # pod would be rejected by the next, and it would rotate on every restart,
-    # logging every user out on every rollout. Generate one with
-    # `openssl rand -hex 32` and put it in the Secret.
+    # than failing: it would differ between processes, so a token minted by one
+    # would be rejected by the next, and it would rotate on every restart,
+    # logging every user out. Generate one with `openssl rand -hex 32` and put it
+    # in `.env`.
     jwt_secret: SecretStr
     jwt_algorithm: str = "HS256"
     jwt_issuer: str = "snmp-metrics-api"
@@ -271,8 +269,7 @@ class Settings(DatabaseSettings):
     admin_password_reset: bool = False
 
     # ---- API ----------------------------------------------------------------
-    # Traefik strips /api before the request arrives; this puts the prefix back
-    # into the URLs FastAPI generates (docs, OpenAPI `servers`).
+    # Restores a prefix stripped by a reverse proxy in URLs FastAPI generates.
     root_path: str = ""
     sse_heartbeat_seconds: float = 15.0
     sse_queue_maxsize: int = 100
@@ -283,8 +280,8 @@ class Settings(DatabaseSettings):
         """Reject blank required values, which typing alone cannot.
 
         A required `str` field is satisfied by an empty string, and an empty
-        string is exactly what an unfilled ConfigMap key or a `KEY=` line in a
-        `.env` produces. Without this, `ADMIN_PASSWORD=` starts the backend with
+        string is exactly what an unfilled `KEY=` line in `.env` produces.
+        Without this, `ADMIN_PASSWORD=` starts the backend with
         an admin account whose password is "".
         """
         blank = [
@@ -347,7 +344,7 @@ class Settings(DatabaseSettings):
 
         Gated on `snmp_simulate` because the simulated sampler never decrypts a
         credential, so demanding a key from a developer running the default
-        stack would be ceremony. The moment the deployment polls real agents the
+        stack would be ceremony. The moment the app polls real agents the
         key becomes load-bearing: without it every v3 machine fails every tick,
         and a monitoring backend that reports itself healthy while collecting
         nothing is worse than one that will not boot.

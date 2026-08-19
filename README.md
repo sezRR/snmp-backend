@@ -2,24 +2,8 @@
 
 An SNMP metrics backend: FastAPI polls cpu, ram, disk capacity, disk throughput
 and IOPS, and network from a client-controlled set of machines every 5 seconds,
-stores the samples in TimescaleDB, and streams them live over SSE. It runs on a local OrbStack Kubernetes cluster with no container
-registry involved at any point, behind Traefik — HTTP under `/api`, raw Postgres
-over an `IngressRouteTCP`.
-
-## Why no registry is needed
-
-OrbStack's Kubernetes runs on the *same* Docker daemon as your `docker` CLI:
-
-```
-$ kubectl get nodes -o wide
-NAME       STATUS   VERSION          CONTAINER-RUNTIME
-orbstack   Ready    v1.34.8+orb1     docker://29.4.0
-```
-
-So an image built with `docker build` is already in the cluster's image store.
-There is no `docker push`, no `kind load docker-image`, no `minikube image load`.
-The Deployment just sets `imagePullPolicy: IfNotPresent` so the kubelet uses the
-local image instead of trying to reach Docker Hub.
+stores the samples in TimescaleDB, and streams them live over SSE. Docker Compose
+runs the API and database locally, with configuration and credentials in `.env`.
 
 ## Design
 
@@ -110,16 +94,9 @@ inventory.
 | `src/app/api/routers/` | health, auth, users, roles, machines, credentials, metrics, stream, admin |
 | `alembic.ini` | Host CLI only; the app builds an equivalent config in code |
 | `.env.example` | Every setting with defaults; `.env` is git- and docker-ignored |
-| `compose.yaml` | Both processes on one host: the deployable shape |
-| `compose.override.yaml` | Development overlay — bind mount, `--reload`, published database |
-| `scripts/seed_dev.py` | Registers the simulated fleet against a running API, then binds credentials |
+| `compose.yaml` | Local API, TimescaleDB, and profile-gated SNMP test agents |
+| `scripts/seed_dev.py` | Registers the simulated fleet, binds credentials, and prints login tokens |
 | `Makefile` | `up`, `seed`, `psql`, `logs`, `reencrypt`, `clean` for the Compose stack |
-| `k8s/timescaledb-*.yaml` | PVC, Secret, StatefulSet, Service |
-| `k8s/app-config.yaml` | Non-secret settings as a ConfigMap |
-| `k8s/api-secrets.yaml` | API, SNMP encryption and OpenStack secrets, kept out of the database Secret |
-| `k8s/deployment.yaml`, `k8s/service.yaml` | The app |
-| `k8s/{middleware,ingressroute,ingressroutetcp}.yaml` | Traefik routing |
-| `k8s/traefik-values.yaml` | Helm values: `web` + `postgres` entryPoints, CRD provider only |
 
 ## Data model
 
@@ -165,9 +142,9 @@ Deliberately *not* loaded through `/docker-entrypoint-initdb.d`: that only runs
 against an empty data directory, so it could never be evolved. Migrations run on
 every startup instead, under a Postgres advisory lock so replicas starting
 together do not race. `DB_AUTO_MIGRATE=false` hands the schema to something else
-— a Job running `python -m app.db.migrate`, say.
+— a separate process running `python -m app.db.migrate`, say.
 
-Revision `0001` no-ops on a database that already has `machines`, so a cluster
+Revision `0001` no-ops on a database that already has `machines`, so an installation
 deployed before Alembic is adopted by the same `upgrade head` that builds a fresh
 one, with no manual `alembic stamp`.
 
@@ -177,7 +154,7 @@ its own section: [SNMP credentials](#snmp-credentials).
 
 Revision `0003` creates the credential table but does not populate it. Seeding
 needs the encryption key ring, and Alembic deliberately loads only
-`DatabaseSettings` — so a migration Job never has to be handed one. The
+`DatabaseSettings` — so a migration process never has to be handed one. The
 `default-v2c` row is written by `app.services.bootstrap` on the first boot that
 finds none.
 
@@ -304,7 +281,7 @@ snmpget -v3 -u fleetmon -l authPriv \
   127.0.0.1 1.3.6.1.2.1.1.1.0
 ```
 
-`compose.override.yaml` has an `snmpd` service under the `snmp` profile that is
+`compose.yaml` has an `snmpd` service under the `snmp` profile that is
 exactly this, for testing without a real host:
 `docker compose --profile snmp up -d snmpd`.
 
@@ -320,7 +297,7 @@ fleets that will never serve it.
 reply, and the ceiling on it is the path's, not SNMP's: a reply larger than the
 smallest MTU between collector and agent is fragmented, and any hop that drops
 fragments — a tunnel, a NAT out of a VM — turns that into a walk that simply
-times out. Polling over Tailscale (1280-byte MTU) from a pod, 25 rows of
+times out. Polling over Tailscale (1280-byte MTU) from a container, 25 rows of
 `hrStorageDescr` on a container host is already past the line, while 10 is not:
 the mount paths are long and it is the bytes, not the row count, that decide.
 
@@ -377,8 +354,8 @@ scope in the third column. See [Authentication](#authentication).
 
 Streaming is a side channel: samples are written to TimescaleDB first and
 published second, so subscribing changes nothing about what is stored, and events
-arrive at the collector's cadence rather than on demand. The bus is per-pod — with
-more than one replica a client only sees what its pod collected.
+arrive at the collector's cadence rather than on demand. The bus is per-process,
+so with more than one process a client only sees what its process collected.
 
 ## SNMP credentials
 
@@ -465,8 +442,8 @@ AES-256-GCM per row, with `credential_id|key_id|secret_version` as additional
 authenticated data, so ciphertext copied from one row into another fails to
 decrypt rather than quietly authenticating as the wrong principal. What that
 protects against is a stolen dump, replica or backup. It does *not* protect
-against a compromised pod, which holds the key by construction — keep the
-Secret's RBAC as the thing guarding that.
+against a compromised app container, which holds the key by construction —
+protect access to `.env` and the container runtime.
 
 No endpoint returns a secret at any scope, and this is structural: the response
 model has no field one could occupy. Profiles carry a `fingerprint` — a keyed,
@@ -478,10 +455,13 @@ whether a rotation changed anything, without reading either.
 `SNMP_CREDENTIAL_KEYS` is a ring, and each row records the key that sealed it:
 
 ```bash
-SNMP_CREDENTIAL_KEYS='{"k1":"<hex>","k2":"<new hex>"}'   # 1. add, keep the old
-SNMP_CREDENTIAL_ACTIVE_KEY=k2                            # 2. flip, restart
-make reencrypt                                           # 3. move every row
-SNMP_CREDENTIAL_KEYS='{"k2":"<new hex>"}'                # 4. drop the old
+# 1. Add the new key to SNMP_CREDENTIAL_KEYS in .env, keeping the old key.
+# 2. Set SNMP_CREDENTIAL_ACTIVE_KEY to the new key id, then apply it:
+make restart
+# 3. Move every row to the new key:
+make reencrypt
+# 4. Remove the old key from SNMP_CREDENTIAL_KEYS in .env, then apply it:
+make restart
 ```
 
 Rows keep decrypting throughout, so step 4 can wait, and no passphrase is ever
@@ -497,7 +477,7 @@ still reference it is reported rather than hidden — the collector fails those
 machines with `credential is encrypted under key 'k2', which is not in
 SNMP_CREDENTIAL_KEYS`, and the endpoints answer 503 with the same message.
 
-### Upgrading a deployment that predates this
+### Upgrading an installation that predates this
 
 Nothing to do. On the first boot after the upgrade, `SNMP_COMMUNITY` is copied
 into a `default-v2c` profile and every existing machine is bound to it, so a
@@ -511,21 +491,19 @@ boot.
 
 ## Configuration
 
-`.env.example` lists every setting. Real environment variables always win over the
-file, so in Kubernetes the values come from `k8s/app-config.yaml` (non-secret),
-`k8s/timescaledb-secret.yaml` (database credentials) and `k8s/api-secrets.yaml`
-(the signing key, the bootstrap password and the SNMP credential key ring), all
-three mounted with `envFrom`.
+`.env.example` lists every setting. Copy it to `.env` before starting Compose.
+Compose uses the file for YAML interpolation and injects it into the API
+container; real environment variables take precedence during interpolation.
 `.env` is in `.gitignore` and `.dockerignore`, so credentials reach neither git
-nor the image.
+nor the image, but they remain visible to users who can inspect the host file or
+the container runtime.
 
 Three settings have no default and no fallback. `JWT_SECRET` is not generated
-when missing, because a generated key would differ between replicas — a token
-minted by one pod rejected by the next — and would rotate on every restart,
+when missing, because a generated key would differ between processes — a token
+minted by one rejected by the next — and would rotate on every restart,
 logging everyone out. `ADMIN_USERNAME` and `ADMIN_PASSWORD` are required for the
 reason in [Authentication](#authentication). A blank value counts as missing:
-`ADMIN_PASSWORD=` is exactly what an unfilled ConfigMap key produces, and it
-would otherwise create an admin whose password is the empty string.
+`ADMIN_PASSWORD=` would otherwise create an admin whose password is empty.
 
 `SNMP_CREDENTIAL_KEYS` and `SNMP_CREDENTIAL_ACTIVE_KEY` are required too, but
 only once `SNMP_SIMULATE=false` — the simulator authenticates to nothing, so a
@@ -569,9 +547,9 @@ The settings worth knowing:
 | `ACCESS_TOKEN_TTL_SECONDS` | 900 | Access tokens cannot be revoked, so they are short |
 | `REFRESH_TOKEN_TTL_SECONDS` | 1209600 | These are tracked per session and *can* be revoked |
 | `LOGIN_RATE_LIMIT_MAX_PER_USER` | 5 | Failed logins per username per window before 429 |
-| `LOGIN_RATE_LIMIT_MAX_PER_IP` | 20 | Same per client address; both are per replica |
+| `LOGIN_RATE_LIMIT_MAX_PER_IP` | 20 | Same per client address; both are per process |
 | `LOGIN_RATE_LIMIT_WINDOW_SECONDS` | 300 | The window both counters slide over |
-| `ROOT_PATH` | `/api` in-cluster | Must match the IngressRoute path and its StripPrefix |
+| `ROOT_PATH` | empty | Optional prefix when a reverse proxy strips a path prefix |
 
 ### Holding the cadence
 
@@ -737,21 +715,18 @@ dictionary lookup rather than 19 MiB and a hash. That makes this a
 denial-of-service bound as much as a credential-stuffing one.
 
 Two things to know before relying on it. The counters are **in-process**, like
-stream tickets and the metric bus, so at `replicas > 1` the effective limit is
-these numbers times the replica count — a weaker bound, not a broken one, and
-the fix is a shared store this deployment does not have. And the per-address
-half depends on the app seeing the real address: requests arrive from Traefik,
-so `FORWARDED_ALLOW_IPS` on the Deployment is what lets uvicorn believe
-`X-Forwarded-For`. Without it every caller shares Traefik's pod address and the
-20-per-address limit becomes one bucket for the whole cluster. The header is
-never read in application code, only by uvicorn's middleware, which trusts it
-solely from the addresses listed there.
+stream tickets and the metric bus, so multiple API processes multiply the
+effective limit — a weaker bound, not a broken one, and the fix is a shared
+store. The per-address half also depends on the app seeing the real address. If
+you add a reverse proxy, configure uvicorn's `FORWARDED_ALLOW_IPS` with only the
+trusted proxy addresses; otherwise every proxied caller shares one rate-limit
+bucket. Application code never trusts `X-Forwarded-For` directly.
 
 ### Streaming
 
 `EventSource` cannot set an `Authorization` header. Putting the access token in
 the query string would be the obvious fix and the wrong one — a credential with
-full API authority would land in Traefik's access log, the browser's history and
+full API authority would land in proxy access logs, the browser's history and
 every proxy between. So a client exchanges its token for a ticket:
 
 ```bash
@@ -793,457 +768,129 @@ choosing; the reasoning is in [SNMP credentials](#snmp-credentials).
 
 ## Local development
 
-Kubernetes is how this is deployed, not how it is developed: a code change there
-costs a build, a tag bump and a rollout. Compose runs the same two processes with
-the source mounted, so a save reloads the server.
+Compose is the only runtime setup. It requires `.env`, mounts `./src` read-only,
+and runs uvicorn with reload enabled.
 
 ```bash
-make up      # build, start, wait until /readyz answers
-make seed    # register the simulated OpenStack fleet
-make smoke   # readyz, then machines and collector status with a token
-make token   # print an admin access token, for pasting into curl
+cp .env.example .env
+# Fill JWT_SECRET (openssl rand -hex 32) and ADMIN_PASSWORD in .env.
+
+make up      # build, start, and wait until /readyz answers
+make seed    # register and bind the simulated OpenStack fleet
+make smoke   # check readiness, machines, and collector status
+make token   # print an admin access token
 open http://localhost:8000/docs
 ```
 
-`compose.override.yaml` supplies committed dev values for `JWT_SECRET` and
-`ADMIN_PASSWORD`, so this works on a clean checkout with no `.env` at all. The
-admin account is `admin` / `dev-only-admin-password`. Override either in `.env`;
-`compose.yaml` on its own invents neither, so the deployed shape fails loudly
-instead of running on a signing key that is in this repository.
-
-Without `make`, that is `docker compose up -d --build --wait` and
-`docker compose --profile seed run --rm seed`. Requires Compose v2.24 or newer.
-
-`compose.yaml` holds the stack; `compose.override.yaml`, which Compose loads
-automatically, is what makes it a development environment:
-
-| | `docker compose up` | `docker compose -f compose.yaml up` |
-| --- | --- | --- |
-| Source | `./src` mounted read-only over the image's copy, `uvicorn --reload` | Baked into the image |
-| Database port | published on `127.0.0.1:15432` | not published |
-| SNMP / OpenStack | simulated | whatever `.env` says |
-| Restart policy | none | `unless-stopped` |
-| `JWT_SECRET` / `ADMIN_PASSWORD` | committed dev defaults | must be supplied |
-| Root filesystem | writable | read-only, `cap_drop: ALL` |
-
-Both build the tag in `APP_VERSION`, which the Makefile derives from
-`src/app/__init__.py` — see [Build](#build). Invoked without `make`, and with no
-`APP_VERSION` set, they build `fastapi-demo:dev` instead, so a bare
-`docker compose build` can never land on the tag the cluster is pinned to.
-
-An empty `machines` table is why a fresh stack looks broken — the collector ticks
-against nothing and every endpoint returns `[]`. `make seed` registers the six
-hosts `app/services/openstack/simulated.py` serves, by address only, so their
-MACs and flavors come from the lookup exactly as a real machine's would. It then
-binds each one to the `default-v2c` credential, because registering alone leaves
-a machine unpolled — two calls, since binding needs its own scope. Re-running is
-a no-op on both halves.
-
-The overlay sets a committed `SNMP_CREDENTIAL_KEYS` even though the simulated
-stack does not strictly need one: without it there is nothing to seed
-`default-v2c` with, so nothing could be bound and the stack would come up
-healthy and collect nothing.
-
-To exercise real SNMPv3 rather than the simulator, the `snmp` profile starts
-net-snmp agents with an authPriv user:
+Without Make, use:
 
 ```bash
-docker compose --profile snmp up -d snmpd snmpd2
-# then set SNMP_SIMULATE=false in .env, restart, register them by address and
-# bind an authPriv credential — see SNMP credentials.
+docker compose up -d --build --wait
+docker compose exec api python /app/scripts/seed_dev.py
 ```
 
-`snmpd2` carries the *same* `securityName` as `snmpd` with a different
-passphrase. That is not redundancy: pysnmp caches USM users on an engine under
-`(userName, securityEngineId)`, so two such credentials on one shared engine
-tear each other's registration down mid-tick. The sampler gives each credential
-its own `SnmpEngine`, and these two agents are the smallest setup that can prove
-it.
+An empty `machines` table is valid but not useful. `make seed` registers the six
+hosts from `app/services/openstack/simulated.py` and binds them to the
+`default-v2c` credential. Keep `SNMP_CREDENTIAL_KEYS` configured in `.env`; the
+bootstrap needs it to create that encrypted credential even when sampling is
+simulated.
 
-The rest:
+### Environment
+
+Compose reads `.env` for interpolation and injects it into the API container.
+`PGHOST=localhost` and `PGPORT=15432` are for host tools;
+`compose.yaml` overrides them inside the API container with the Compose service
+address and port. All other application settings flow directly from `.env` and
+then fall back to defaults in `src/app/config.py`.
+
+After changing an API setting in `.env`, run `make restart`. This recreates the
+API container; `docker compose restart` alone would retain its old environment.
+`PGDATABASE`, `PGUSER`, and `PGPASSWORD` initialize a new database volume and
+cannot be rotated this way. Alter the database role separately, or run the
+destructive `make clean` before starting with new values.
+
+The database is published on `127.0.0.1:15432`, so host-side Alembic commands
+and a host-run debugger use the same configuration:
 
 ```bash
-make logs      # follow the app
-make psql      # psql inside the database container
-make reencrypt # move stored credentials onto the active encryption key
-make down      # stop, keep the data
-make clean     # stop and delete the volume
-```
-
-The database is on `127.0.0.1:15432` for host tools — 15432 rather than 5432 so
-it never collides with the cluster's `IngressRouteTCP`, which already owns the
-Mac's 5432, and loopback-only because OrbStack publishes on every interface and
-that password is committed in plaintext. Running uvicorn on the host against it
-still works, and is the faster loop for debugger work:
-
-```bash
-cp .env.example .env      # PGPORT is already 15432; fill in the blank values
-printf 'JWT_SECRET=%s\n' "$(openssl rand -hex 32)" >> .env
-printf 'ADMIN_PASSWORD=dev-only-admin-password\n' >> .env
+make check
+make history
 PYTHONPATH=src uv run uvicorn app.main:app --port 8099
 ```
 
-The same `.env` is what the Alembic targets read — `make revision`, `make check`
-and `make history` run on the host against the published database port.
+Dependency changes still require an image rebuild. Run `make build`, or
+`make watch` to rebuild when `pyproject.toml` or `uv.lock` changes.
 
-Dependency changes are the one thing a save cannot pick up, since they live in
-the image: `make build`, or `make watch` to have Compose rebuild whenever
-`pyproject.toml` or `uv.lock` changes.
+### SNMP test agents
 
-### Where the settings come from
-
-Compose reads `.env` twice — once to expand `${...}` in the YAML, once as the
-api container's env file — and the file is optional, so a clean checkout starts
-without one. The three variables that describe container topology rather than
-preference (`PGHOST`, `PGPORT`, `ROOT_PATH`) are pinned under `environment:` in
-`compose.yaml`, because a `.env` written for host-run uvicorn says
-`PGHOST=localhost` and `PGPORT=15432`, which would send the container to itself.
-Everything else falls through to `.env` and then to the defaults in
-`src/app/config.py`.
-
-Real SNMP polling from Compose needs one more thing than `SNMP_SIMULATE=false`:
-a route from the container to the agents. A Tailscale address that resolves on
-the Mac does not automatically resolve inside a bridge-network container, which
-is the same reason the cluster's polling is verified from inside the pod rather
-than from the host.
-
-### Can this deploy the app too?
-
-It can, on a single host, and `compose.yaml` alone is written to be that shape —
-that is why the dev conveniences are quarantined in the override rather than
-sprinkled through the base file. On a machine that is not a laptop:
+The `snmp` profile starts two real net-snmp agents with authPriv users:
 
 ```bash
-docker compose -f compose.yaml up -d --build --wait
+docker compose --profile snmp up -d snmpd snmpd2
+# Set SNMP_SIMULATE=false in .env, then:
+make restart
 ```
 
-What you keep: identical images, pinned database version, health-gated startup
-ordering, restart-on-failure, a named volume, a read-only root filesystem and
-dropped capabilities. Which is close to feature parity with what `k8s/` actually
-provides here, because that cluster is a single node with a single replica and a
-standalone PVC — there is no HA to lose.
+`snmpd2` uses the same `securityName` as `snmpd` with a different passphrase.
+This exercises pysnmp's per-engine user cache behavior. Real polling also
+requires a route from the API container to each agent; host-only VPN routes do
+not automatically exist inside the Compose network.
 
-What you give up, and what to weigh it against:
+### Common commands
 
-* **No rolling update.** `compose up` stops the old container before starting the
-  new one, so a deploy is a few seconds of downtime; `kubectl rollout` gates the
-  new pod on its probes and never drops the old one until it passes. With
-  `replicas: 1` and a collector that resumes on the next tick, that gap is
-  cheap — but it is a real difference, and a `--wait` failure leaves you rolling
-  back by hand.
-* **No ingress, no TLS.** The app is published straight on a host port. The
-  Traefik `IngressRoute`, its `StripPrefix` middleware and the `ROOT_PATH=/api`
-  that pairs with it have no equivalent here; a Compose deployment behind a
-  reverse proxy has to reproduce both.
-* **Secrets are environment variables.** `PGPASSWORD` comes from `.env` on disk
-  next to the compose file, visible in `docker inspect`. A Secret is not much
-  better, but it is at least a separate object with its own access path.
-* **Two places to change a setting.** `k8s/app-config.yaml` and `.env` describe
-  the same `Settings`, and nothing keeps them in step. This is the maintenance
-  cost of having both, and the reason not to grow a third.
-
-The recommendation is to treat `k8s/` as the deployment target of record and
-Compose as the development environment, with single-host Compose deployment as a
-deliberate fallback rather than a parallel path — because keeping two full
-deployment stories honest costs more than either is worth here. Do not try to
-generate one from the other (`kompose` and friends): the manifests encode
-things Compose cannot express, such as the `startupProbe` that keeps a slow
-database from restart-looping the app, and the deliberate `secretKeyRef` that
-keeps `PGHOST` out of the database container.
+```bash
+make logs      # follow API logs
+make psql      # open psql in the database container
+make reencrypt # move stored credentials onto the active encryption key
+make down      # stop containers and keep data
+make clean     # stop containers and delete the database volume
+```
 
 ## Build
 
-The version lives in exactly one place — `src/app/__init__.py`, which is also
-what the running app reports from `GET /` — and the image tag is derived from it:
+The application version lives in `src/app/__init__.py`, which is also what
+`GET /` reports. The Makefile derives the image tag from it:
 
 ```bash
-make version   # 0.7.0  ->  fastapi-demo:0.7.0
-make build     # docker compose build, tagged fastapi-demo:0.7.0
+make version   # print version and image tag
+make build     # build fastapi-demo:<version>
 ```
 
-The Makefile reads that string with `sed` and exports it as `APP_VERSION`, which
-`compose.yaml` expands into the `image:` tag. So an image built for the
-development stack is also the one `kubectl set image` points the Deployment at,
-and `make deploy-tag` prints that command with the derived tag filled in.
-
-Bare `docker compose build`, with no `APP_VERSION` in the environment, falls back
-to `fastapi-demo:dev`. That is deliberate: `imagePullPolicy: IfNotPresent` means
-whatever sits on the cluster's tag is what the next rollout runs, so a laptop
-build must not be able to land there by accident. Build the cluster's tag on
-purpose, with `make build` or `APP_VERSION=0.7.0 docker compose build`.
-
-The `version` in `pyproject.toml` is a different number and is meant to stay
-that way — it is the virtual project's own metadata, `uv.lock` records it, and
-raising it to match only makes `uv sync --locked` fail the image build until
-`uv lock` is re-run. Nothing installs this package, so that relock buys nothing.
-
-Or without any of that:
-
-```bash
-docker build -t fastapi-demo:0.7.0 .
-```
-
-## Deploy
-
-Traefik goes in first — `ingressroute.yaml`, `middleware.yaml` and
-`ingressroutetcp.yaml` are `traefik.io/v1alpha1` objects, so `kubectl apply -k`
-fails until the chart has installed the CRDs.
-
-```bash
-kubectl config use-context orbstack
-
-helm repo add traefik https://traefik.github.io/charts
-helm repo update traefik
-helm upgrade --install traefik traefik/traefik \
-  --namespace traefik --create-namespace \
-  -f k8s/traefik-values.yaml --wait
-```
-
-Then the database and the app:
-
-```bash
-kubectl apply -k k8s/
-kubectl rollout status statefulset/timescaledb --timeout=180s
-kubectl rollout status deploy/fastapi --timeout=180s
-```
-
-The app applies its schema during startup and retries while Postgres is still
-running `initdb`, which is why the Deployment has a `startupProbe` — liveness and
-readiness stay suppressed until the first `/healthz` succeeds, so a slow database
-cannot cause a restart loop.
-
-Confirm nothing was pulled from a registry — the event should read
-`already present on machine`, never `Pulling`:
-
-```bash
-kubectl describe pod -l app=fastapi | grep -i pull
-```
-
-### The TimescaleDB manifests
-
-They follow [TigerData's Kubernetes install][k8s-doc] for a single node: a
-standalone `PersistentVolumeClaim` (not `volumeClaimTemplates`), a Secret of
-`PG*`/`POSTGRES_*` literals, a ClusterIP Service, `replicas: 1`, no HA and no
-operator. Two deliberate departures:
-
-* the image stays `timescale/timescaledb:2.22.1-pg17` rather than the doc's
-  `timescale/timescaledb-ha:pg18`;
-* everything stays in the `default` namespace instead of `tigerdata`, so the
-  `IngressRouteTCP` service reference and the Secret stay local.
-
-The database container gets its three `POSTGRES_*` keys by explicit
-`secretKeyRef`, **not** `envFrom` the whole Secret. The Secret also carries the
-app's `PGHOST`, and this image's own init scripts call `psql` — given `PGHOST`
-they dial the Service over TCP while only the temporary unix-socket server is up,
-fail with `connection refused`, and the container restarts.
-
-[k8s-doc]: https://www.tigerdata.com/docs/get-started/choose-your-path/install-timescaledb#tab=kubernetes
+Running `docker compose build` directly uses `fastapi-demo:dev` unless
+`APP_VERSION` is set. The separate `version` in `pyproject.toml` is virtual
+project metadata recorded by `uv.lock`; it is not the application version.
 
 ## Access
 
-### HTTP, from this Mac
+The API and Postgres are bound to loopback. `API_PORT` defaults to 8000 and
+`PGPORT` defaults to 15432.
 
 ```bash
-curl -s http://localhost/api/                       # service info
-curl -s http://localhost/api/readyz                 # {"status":"ok","timescaledb":"2.22.1"}
-open http://localhost/api/docs                      # Swagger UI
-
-# which addresses can be registered
-curl -s http://localhost/api/admin/openstack/servers
-
-curl -s -X POST http://localhost/api/machines \
-  -H 'content-type: application/json' \
-  -d '{"ipv4":"10.0.0.11","label":"web-1"}'
-
-# a machine outside OpenStack: no record to resolve, so give the MAC
-curl -s -X POST http://localhost/api/machines \
-  -H 'content-type: application/json' \
-  -d '{"ipv4":"192.168.1.50","mac":"de:ad:be:ef:00:01","label":"nas"}'
-
-# registering does not start polling — bind a credential, which needs
-# credentials:write rather than machines:write
-curl -s http://localhost/api/snmp-credentials
-curl -s -X PUT http://localhost/api/machines/de:ad:be:ef:00:01/snmp-credential \
-  -H 'content-type: application/json' \
-  -d '{"credential_id":"<id>"}'
-
-curl -s http://localhost/api/machines               # rows + OpenStack details
-curl -s 'http://localhost/api/metrics?limit=5'
-curl -s 'http://localhost/api/metrics/stats?bucket=1%20minute&hours=1'
-curl -sN http://localhost/api/metrics/stream        # live, one batch per 15s
+curl -s http://localhost:8000/
+curl -s http://localhost:8000/readyz
+open http://localhost:8000/docs
+make psql
 ```
 
-Anything outside `/api` has no route and Traefik answers `404 page not found`.
-
-```bash
-kubectl get ingressroute,ingressroutetcp,middleware    # the routing objects
-```
-
-### Postgres, from this Mac
-
-Through the `IngressRouteTCP` on port 5432 — any Postgres client works:
-
-```bash
-PGPASSWORD=dev-only-not-a-secret psql -h localhost -p 5432 -U app -d app \
-  -c 'SELECT mac, count(*), max(ts) FROM metrics GROUP BY 1;'
-```
-
-No local `psql`? Reuse the image, and reach the host from inside the container:
-
-```bash
-docker run --rm -e PGPASSWORD=dev-only-not-a-secret \
-  timescale/timescaledb:2.22.1-pg17 \
-  psql -h host.docker.internal -p 5432 -U app -d app -c 'SELECT count(*) FROM metrics;'
-```
-
-Or skip the network entirely:
-
-```bash
-kubectl exec -it timescaledb-0 -- psql -U app -d app
-kubectl exec timescaledb-0 -- psql -U app -d app \
-  -c 'SELECT * FROM timescaledb_information.hypertables;'
-```
-
-> ⚠️ **Port 5432 is published on every interface, with no TLS.** The committed
-> password is the only access control, and it is in git. Anyone on the network can
-> connect as `app`, which owns the database. Override the Secret (instructions
-> inside `k8s/timescaledb-secret.yaml`) before running this anywhere but a trusted
-> machine, or drop the `postgres` entryPoint from `k8s/traefik-values.yaml` and use
-> `kubectl port-forward` instead.
-
-### Routing
-
-```
-localhost/api/metrics -> Traefik (web) -> StripPrefix(/api) -> svc/fastapi:80 -> pod:8000 /metrics
-localhost:5432        -> Traefik (postgres)                 -> svc/timescaledb:5432 -> timescaledb-0
-```
-
-Routing is expressed as Traefik CRDs (`IngressRoute`, `IngressRouteTCP`,
-`Middleware`) rather than a `networking.k8s.io/v1` Ingress. A plain Ingress cannot
-strip a prefix on its own, so the `Middleware` CRD is required either way — and
-referencing it from an Ingress means a stringly-typed annotation
-(`traefik.ingress.kubernetes.io/router.middlewares: default-fastapi-stripprefix@kubernetescrd`)
-where a typo is silently ignored and the app sees an unstripped `/api/...` path.
-The trade is portability: another controller means rewriting these objects, and
-`Ingress`-shaped tooling (cert-manager's ingress-shim, external-dns) cannot see
-them.
-
-The TCP route matches `HostSNI(`*`)`, the only matcher a non-TLS TCP route
-accepts. Postgres cannot be SNI-routed anyway — its TLS upgrade is negotiated
-inside the wire protocol — so that entryPoint serves exactly one backend; a second
-database would need another port.
-
-The app does **not** use the TCP route: it talks to `svc/timescaledb:5432` over
-cluster DNS.
-
-### From other devices on the LAN
-
-Because `orb config` has `docker.expose_ports_to_lan: true`, OrbStack binds those
-ports on *all* interfaces, not just loopback:
-
-```bash
-ipconfig getifaddr en0        # this Mac's LAN address
-```
-
-```
-http://<MAC_LAN_IP>/api/          -> service info
-http://<MAC_LAN_IP>/api/docs      -> Swagger UI
-<MAC_LAN_IP>:5432                 -> Postgres
-```
-
-> **Plain HTTP.** Endpoints need a bearer token, but nothing is encrypted in
-> transit — a password posted to `/api/auth/login` and every token after it cross
-> the network in the clear, and `k8s/api-secrets.yaml` ships a committed demo
-> signing key that anyone reading this repository can forge tokens with. Replace
-> both Secrets and put TLS in front of Traefik before running anywhere that is
-> not a trusted machine. If the macOS firewall is enabled it will block this and
-> you will need an inbound allow rule for OrbStack.
-
-### Port-forward
-
-Independent of host networking — it tunnels through the Kubernetes API server, so
-it works even when OrbStack's routing does not.
-
-```bash
-kubectl port-forward svc/fastapi 8080:80          # straight to the app, no /api prefix
-curl -s localhost:8080/healthz
-
-kubectl port-forward -n traefik svc/traefik 8080:80   # through Traefik, prefix intact
-curl -s localhost:8080/api/healthz
-
-kubectl port-forward svc/timescaledb 15432:5432       # database, without publishing 5432
-```
-
-### Known OrbStack quirk
-
-Container and Service IPs themselves (`192.168.194.x`, `192.168.139.2`) and
-`*.orb.local` / `*.svc.cluster.local` names may fail from macOS with
-`No route to host`, even while the published ports above work perfectly. That is
-OrbStack's host↔VM routing being down, not a problem with these manifests —
-plain `docker` container IPs will be unreachable too. Restarting OrbStack
-restores it.
+The API uses plain HTTP. Put a TLS-terminating reverse proxy in front before
+exposing it beyond a trusted development machine. If that proxy strips a path
+prefix, set `ROOT_PATH` in `.env` to the same prefix.
 
 ## Iterating
 
-Tags are deliberately versioned rather than `latest`. With `latest` plus
-`imagePullPolicy: IfNotPresent`, a rebuild leaves the old image running and the
-rollout silently does nothing.
-
-Bumping one is a single edit — `__version__` in `src/app/__init__.py` — after
-which the build tag, the rollout command and what `GET /` reports all follow:
+Source changes reload uvicorn automatically. Schema changes require a revision:
 
 ```bash
-make build         # fastapi-demo:<new version>
-make deploy-tag    # prints the two kubectl lines with that tag
+make revision m="add widgets"
+make check
 ```
 
-```bash
-kubectl set image deploy/fastapi fastapi=fastapi-demo:0.7.1
-kubectl rollout status deploy/fastapi
-```
-
-`deploy-tag` prints rather than runs: a Make target should not mutate a cluster.
-`k8s/deployment.yaml` still carries the tag it was last deployed with, so update
-it there too when the bump is meant to be permanent.
-
-If you do reuse a tag while experimenting, force the swap:
-
-```bash
-kubectl rollout restart deploy/fastapi
-```
-
-Changing the schema means editing `src/app/db/tables.py` and generating a
-revision from it:
-
-```bash
-make revision m="add widgets"   # autogenerated from the diff, on the host
-make check                      # passes when tables.py and the migrations agree
-```
-
-Read the generated file before it runs. The dev container bind-mounts `./src`,
-reloads on change and boots with `DB_AUTO_MIGRATE=true`, so a revision is applied
-to the dev database the moment it lands — `make clean` if you then change your
-mind. Revisions are authored on the host, not in the container: `read_only: true`
-here and `readOnlyRootFilesystem: true` in Kubernetes both forbid writing them.
-
-Adding a *metric* still needs no migration at all: the `jsonb` column takes any
-shape, and `metrics/stats` skips samples that lack a key.
+Read the generated revision immediately. With `DB_AUTO_MIGRATE=true`, the
+reloading API applies it to the development database as soon as it starts again.
+Adding a metric still needs no migration because samples are stored as `jsonb`.
 
 ## Teardown
 
-`kubectl delete -k` removes the StatefulSet but **not** the PVC — that is
-Kubernetes' deliberate default, so the data survives. Delete it explicitly to
-start from an empty database:
-
-```bash
-kubectl delete -k k8s/
-kubectl delete pvc timescaledb-pvc
-helm uninstall traefik -n traefik && kubectl delete ns traefik
-```
-
-`helm uninstall` leaves the Traefik CRDs behind by design (they are unlabelled, so
-there is no selector for them); if you want the cluster back to how it started:
-
-```bash
-kubectl get crd -o name | grep traefik.io | xargs kubectl delete
-```
+`make down` removes the containers and network but keeps the named database
+volume. `make clean` also removes that volume and starts the next run with an
+empty database.

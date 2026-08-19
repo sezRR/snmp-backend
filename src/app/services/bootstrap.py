@@ -3,7 +3,7 @@
 Runs on every boot, after migrations and before the app serves anything.
 
 This runs after migrations and before the app serves anything, and it raises on
-failure — which crashes the pod. That is the intent: an API whose permission
+failure so the process exits. That is the intent: an API whose permission
 model is enforced everywhere is unusable if nobody holds the scopes, so a
 backend that cannot guarantee an administrator must not pretend to be up.
 
@@ -15,7 +15,7 @@ and it heals a hand-edited database on the next restart.
 The user is *not* reconciled. Its password is written once, at creation. Anyone
 can change it afterwards through `/auth/me/password`, and rewriting it from the
 environment on every boot would silently revert that — while also requiring the
-plaintext to stay in the Secret forever. `ADMIN_PASSWORD_RESET=true` forces one
+plaintext to stay in `.env`. `ADMIN_PASSWORD_RESET=true` forces one
 rotation, for the case where the password is genuinely lost.
 
 The account is always re-activated and always re-granted the role, because an
@@ -160,7 +160,7 @@ def seed_default_credential_blocking(
         cipher.fingerprint(payload),
     )
     if row is None:
-        # Another replica won the race between the read and this insert.
+        # Another process won the race between the read and this insert.
         return
 
     bound = machines_repo.bind_unbound(conn, credential_id)

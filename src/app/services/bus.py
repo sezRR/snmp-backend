@@ -5,8 +5,8 @@ streaming is a side channel: with no subscribers the writes still happen, and a
 subscriber that cannot keep up loses events rather than growing a queue without
 bound.
 
-In-process means per-pod. With more than one replica a client only sees samples
-collected by the pod it connected to; a shared bus (Redis, NATS, or Postgres
+With more than one process a client only sees samples collected by the process
+it connected to; a shared bus (Redis, NATS, or Postgres
 LISTEN/NOTIFY) would be the fix.
 """
 

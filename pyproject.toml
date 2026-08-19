@@ -8,7 +8,7 @@ name = "snmp-backend"
 # at runtime. The version the app reports, and the one its image tag is built
 # from, is `__version__` in src/app/__init__.py.
 version = "0.1.0"
-description = "SNMP metrics backend: FastAPI and TimescaleDB, deployed to a local Kubernetes cluster with no container registry"
+description = "SNMP metrics backend using FastAPI, TimescaleDB, and Docker Compose"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

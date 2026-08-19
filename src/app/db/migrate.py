@@ -4,20 +4,20 @@ Runnable two ways, exactly as `schema.sql` was before it:
 
 * from the app's lifespan when `DB_AUTO_MIGRATE=true` (the default), reusing the
   application's own engine, and
-* standalone, `python -m app.db.migrate`, e.g. as a Kubernetes Job for a
-  deployment that would rather not have its pods touch DDL at all.
+* standalone, `python -m app.db.migrate`, for an installation that would rather
+  not have its application processes touch DDL at all.
 
 Two things wrap the upgrade.
 
-**Retries.** On a cold cluster the app is up before Postgres finishes `initdb`,
+**Retries.** On a cold start the app may run before Postgres finishes `initdb`,
 so a refused connection is expected rather than fatal for the first few seconds.
 
 **An advisory lock.** `alembic upgrade` is not safe to run concurrently: two
-replicas starting together both read the same current revision, both run the
+processes starting together both read the same current revision, both run the
 same migration, and the loser gets a duplicate key on `alembic_version` — or,
 worse, half-applies DDL that the first replica already applied. A session-level
-advisory lock serialises them, and the replica that waits finds the work already
-done and does nothing. There is one replica today; the lock costs a round trip
+advisory lock serialises them, and the process that waits finds the work already
+done and does nothing. There is one process today; the lock costs a round trip
 and removes the trap before someone scales up.
 """
 
@@ -107,7 +107,7 @@ def main() -> None:
     from app.db.pool import Database
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
-    # DatabaseSettings, not Settings: a migration Job should not need the API's
+    # DatabaseSettings, not Settings: a migration process should not need the API's
     # signing key or an admin password to do its one job.
     settings = get_database_settings()
     db = Database(settings)

@@ -62,9 +62,9 @@ def get_client_ip(request: Request) -> str | None:
     that header here would let any caller pick its own rate-limit bucket by
     inventing one. Uvicorn's own `ProxyHeadersMiddleware` does the same job
     safely because it only believes the header when the *connection* comes from
-    a trusted address — which is why the Deployment sets `FORWARDED_ALLOW_IPS`.
-    Without that, every request behind Traefik shares Traefik's address and the
-    per-address limit becomes a per-cluster one.
+    a trusted address. Configure `FORWARDED_ALLOW_IPS` when placing the app
+    behind a trusted reverse proxy; otherwise all proxied requests share the
+    proxy's address for rate limiting.
 
     None when the scope carries no client, as with an in-process test transport.
     """
