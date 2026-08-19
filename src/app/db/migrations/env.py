@@ -45,11 +45,20 @@ TIMESCALE_SCHEMAS = {
 }
 
 
+# The continuous aggregates. Each is a view backed by its own hypertable, and
+# revision 0004 creates both with op.execute, so `Base.metadata` knows nothing
+# about them. Reflection, however, sees the view — and a table Alembic can see
+# but the metadata cannot means every autogenerate run proposes dropping it.
+CONTINUOUS_AGGREGATES = {"metrics_1m", "metrics_1h"}
+
+
 def include_object(obj, name, type_, reflected, compare_to) -> bool:
     """Keep TimescaleDB's own objects out of the diff."""
     if getattr(obj, "schema", None) in TIMESCALE_SCHEMAS:
         return False
     if type_ == "table" and name.startswith(("_hyper_", "compress_hyper_")):
+        return False
+    if type_ == "table" and name in CONTINUOUS_AGGREGATES:
         return False
     return True
 

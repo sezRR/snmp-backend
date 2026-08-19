@@ -29,9 +29,13 @@ in OpenStack" and "deleted from OpenStack after registration" are different
 answers; if such a machine later turns up in the fleet — registered external
 during a lookup outage, or imported since — the next tick clears the flag.
 
-**Metrics are one `jsonb` column.** Adding or removing a metric is a change to
-the sampler alone — no migration, no model edit, and aggregates over a metric that
-did not exist yet simply skip those rows.
+**Metrics are one column each, and every one is nullable.** A sample missing a
+metric — an SNMP walk that failed, a rate with no previous reading behind it, a
+machine polled before the metric existed — stores NULL, and aggregates skip it
+rather than erroring or averaging in a zero. Adding a metric now costs a
+migration; what it buys is [a twentieth of the
+storage](#why-the-metrics-table-is-wide) and continuous aggregates, which the
+jsonb shape could not have at all.
 
 **SNMP credentials are rows, shared, and encrypted.** v2c and v3 are both
 credential profiles a machine is bound to, so there is one code path in the
@@ -76,7 +80,8 @@ inventory.
 | `src/app/db/tables.py` | Every table as SQLAlchemy sees it — what Alembic diffs against |
 | `src/app/db/migrations/` | Alembic revisions. Inside the package, so they ship in the image |
 | `src/app/db/migrate.py` | `alembic upgrade head` with retries and an advisory lock. Also `python -m app.db.migrate` |
-| `src/app/db/policies.py` | Compression and retention: settings, not schema, so re-applied every boot |
+| `src/app/db/policies.py` | Chunk interval, compression, retention and rollup refresh: settings, not schema, so re-applied every boot |
+| `src/app/db/rollups.py` | The continuous aggregate spec, and which source a range is read from |
 | `src/app/db/pool.py` | SQLAlchemy engine over psycopg2 + threadpool query/session helpers |
 | `src/app/db/{machines,metrics,credentials}.py` | Fleet, metric and credential repositories: hand-written SQL, no ORM |
 | `src/app/db/reencrypt.py` | `python -m app.db.reencrypt` — moves stored credentials onto the active key |
@@ -89,7 +94,8 @@ inventory.
 | `src/app/services/credentials.py` | Decrypted-credential cache, keyed on `(id, secret_version)` |
 | `src/app/services/openstack/` | `OpenStackLookup` protocol, TTL cache, read-only SDK adapter and simulated fleet |
 | `src/app/services/snmp/` | `SnmpSampler` protocol, pysnmp backend, simulator |
-| `src/app/services/collector.py` | The 15s loop |
+| `src/app/services/snmp/flatten.py` | The only place that maps a nested reading onto columns, and back |
+| `src/app/services/collector.py` | The polling loop, and the last full reading per machine |
 | `src/app/services/bus.py` | In-process pub/sub feeding SSE |
 | `src/app/api/routers/` | health, auth, users, roles, machines, credentials, metrics, stream, admin |
 | `alembic.ini` | Host CLI only; the app builds an equivalent config in code |
@@ -131,12 +137,30 @@ CREATE TABLE snmp_credentials (
 );
 
 CREATE TABLE metrics (
-    ts      timestamptz NOT NULL,
-    mac     macaddr     NOT NULL REFERENCES machines (mac) ON DELETE CASCADE,
-    metrics jsonb       NOT NULL
+    ts   timestamptz NOT NULL,
+    mac  macaddr     NOT NULL REFERENCES machines (mac) ON DELETE CASCADE,
+
+    cpu_usage_pct         real,      cpu_cores           smallint,
+    ram_total_bytes       bigint,    ram_used_bytes      bigint,
+    ram_used_pct          real,      ram_available_bytes bigint,
+    disk_root_total_bytes bigint,    disk_root_used_bytes bigint,
+    disk_root_used_pct    real,      disk_max_used_pct    real,
+    dio_read_bps  double precision,  dio_write_bps double precision,
+    dio_read_iops real,              dio_write_iops real,
+    dio_read_bytes bigint,           dio_write_bytes bigint,
+    dio_reads      bigint,           dio_writes      bigint,
+    dio_busy_pct   real,
+    net_rx_bps double precision,     net_tx_bps double precision,
+    net_rx_bytes bigint,             net_tx_bytes bigint,
+    net_rx_util_pct real,            net_tx_util_pct real,
+    net_speed_bps bigint,            interval_ms   integer
 );
 SELECT create_hypertable('metrics', by_range('ts'));
 ```
+
+One column per metric, all nullable, and no jsonb. Revision `0004` made that
+change; see [Why the metrics table is wide](#why-the-metrics-table-is-wide) for
+the measurements behind it and what stopped being stored.
 
 Deliberately *not* loaded through `/docker-entrypoint-initdb.d`: that only runs
 against an empty data directory, so it could never be evolved. Migrations run on
@@ -162,7 +186,8 @@ The FK is what makes "delete the MAC, delete its history" one statement. A
 hypertable may reference a regular table; the cascade touches every chunk, which
 is fine at this scale — time-ranged purges use `drop_chunks` instead.
 
-A sample looks like:
+`app.services.snmp.flatten` maps the sampler's nested reading onto those
+columns and back. A reading, before flattening, looks like:
 
 ```json
 {"cpu":  {"usage_percent": 22.93, "cores": 1},
@@ -188,6 +213,13 @@ A sample looks like:
                              "speed_bps": 1000000000,
                              "rx_util_percent": 0.65, "tx_util_percent": 1.52}]}}
 ```
+
+The three arrays — `disk`, `disk_io.devices` and `network.interfaces` — reach
+subscribers over SSE and `GET /metrics/latest`, and are **not** stored. What is
+kept from them is the root filesystem, the fullest real filesystem, and totals
+over the machine's physical interfaces and counted block devices. A sample read
+back out of the database therefore comes back with `disk` holding root alone and
+no `devices` or `interfaces` keys, in the same nested shape otherwise.
 
 `ram.used_bytes` is not the agent's own figure. `hrStorageUsed` for physical
 memory is `MemTotal - MemFree`, which counts the page cache as used and therefore
@@ -340,7 +372,7 @@ scope in the third column. See [Authentication](#authentication).
 | POST | `/machines/{mac}/snmp-credential/test` | `credentials:write` | poll this machine once. Takes no address — `{credential?}` to dry-run an unsaved one |
 | GET | `/metrics` | `metrics:read` | `?mac=&since=&limit=` — repeat `mac` to filter on several |
 | GET | `/metrics/latest` | `metrics:read` | most recent sample per machine |
-| GET | `/metrics/stats` | `metrics:read` | `?bucket=1 minute&hours=1&mac=` — `time_bucket` over the jsonb |
+| GET | `/metrics/stats` | `metrics:read` | `?bucket=1 minute&hours=1&mac=` — `time_bucket`, read from the raw table or a rollup depending on the range |
 | GET | `/metrics/counts` | `metrics:read` | rows and latest sample per machine |
 | GET | `/metrics/stream` | `metrics:read` | SSE firehose, `?mac=` to filter |
 | GET | `/machines/{mac}/metrics/stream` | `metrics:read` | SSE for one machine |
@@ -527,8 +559,14 @@ The settings worth knowing:
 | `SNMP_CREDENTIAL_ACTIVE_KEY` | — | Which key in the ring new writes use |
 | `SNMP_DISKIO_ENABLED` | true | ~6 extra walks per machine; needs the diskio view above |
 | `SNMP_MAX_REPETITIONS` | 10 | Rows per GETBULK reply. Lower it for agents behind a small-MTU path — see below |
-| `METRICS_COMPRESS_AFTER_HOURS` | 24 | 0 disables. TimescaleDB columnar compression |
-| `METRICS_RETENTION_DAYS` | 30 | 0 disables. Chunks older than this are dropped |
+| `METRICS_COMPRESS_AFTER_HOURS` | 8 | 0 disables. TimescaleDB columnar compression |
+| `METRICS_RETENTION_DAYS` | 3 | 0 disables. Raw chunks older than this are dropped |
+| `METRICS_CHUNK_INTERVAL_HOURS` | 4 | New chunks only; existing ones age out |
+| `METRICS_ROLLUP_1M_RETENTION_DAYS` | 90 | 0 disables. How long `metrics_1m` is kept |
+| `METRICS_ROLLUP_1H_RETENTION_DAYS` | 730 | 0 disables. How long `metrics_1h` is kept |
+| `METRICS_ROLLUP_REFRESH_LAG_DAYS` | 2 | How far back a rollup refresh reaches; clamped to 75% of retention |
+| `METRICS_PSEUDO_MOUNT_PREFIXES` | `/run,/dev/shm,…` | Mounts excluded from `disk_max_used_pct` |
+| `METRICS_VIRTUAL_IFACE_PREFIXES` | `veth,cni,…` | Interfaces excluded from the network totals |
 | `OPENSTACK_SIMULATE` | true | false ⇒ read-only Nova/Keystone/Neutron lookup using a Keystone password |
 | `OPENSTACK_CACHE_TTL_SECONDS` | 300 | How stale a tenant/flavor read may be |
 | `OPENSTACK_API_TIMEOUT_SECONDS` | 10 | Timeout applied to each SDK HTTP request, not to the complete paginated refresh |
@@ -579,20 +617,126 @@ to raise `COLLECTOR_CONCURRENCY` or lengthen the interval.
 rounds at once would read the same counter baselines milliseconds apart and every
 rate in the second one would be noise.
 
+### Why the metrics table is wide
+
+`docs/metrics-storage.md` carries the full detail behind this section: the
+collector and stress-test data paths, every chunk / compression / retention
+policy and why it is set where it is, the continuous aggregates and the
+hierarchical one that is not there, the read-path routing, and the measured
+results of a 37-machine / 90-day load.
+
+A machine writes 17,280 samples a day at a five second interval, so the size of
+one sample is the whole storage question. It used to be a single jsonb blob.
+Measured on a Kubernetes node, that blob averaged **4.8 KB**, and three arrays
+were 73% of it:
+
+| section | bytes | what was in it |
+|---|---|---|
+| `disk_io` | 1649 | 9 devices, 8 of them `loop*` carrying zeros with `counted: false` |
+| `network` | 1267 | 12 interfaces, 9 of them ephemeral `veth*`/`cni0`/`flannel.1` |
+| `disk` | 603 | 11 mounts, 10 of them tmpfs under `/run` |
+| `ram` | 118 | |
+| `cpu` | 35 | |
+
+Nothing queried those arrays. The only field-selective query reached nine scalar
+paths, and the `metrics_gin_idx` over the blob — `jsonb_path_ops`, which answers
+only `@>`, `@?` and `@@` — was never used by any query in either this repo or the
+frontend, while costing 0.8x the heap.
+
+Their members are also unstable by nature: one veth per pod, renamed on every
+restart. That is what rules out a column per entity, and what makes storing them
+at all a poor trade against keeping them live.
+
+Measured over 246,722 rows (7 machines, two days at 5s, values drifting
+continuously rather than replayed, so nothing is flattered by repetition):
+
+| | uncompressed | compressed | ratio |
+|---|---|---|---|
+| jsonb + GIN | 1930 B/row | ~284 B/row | 6.8x |
+| wide row | **317 B/row** | **84 B/row** | 3.75x |
+| `metrics_1m` row | 466 B/row | 146 B/row | 2.8x |
+
+Columnar compression earns less on the wide row than on the blob — 3.75x against
+6.8x — because generic LZ over repetitive text has more to remove than
+delta-delta over already-narrow scalars. That is the wrong number to optimise:
+the row is 6x narrower before either of them runs.
+
+The 4-hour chunk interval costs 3.4% against day-long chunks on the same rows
+(87.4 vs 84.5 B/row compressed), which is what buys most of the retention window
+being compressed at all.
+
+Confirmed at scale rather than extrapolated: 37 machines and 90 days of history,
+6.75M rows resident after the raw window had aged down to three days.
+
+| | rows | resident | per machine |
+|---|---|---|---|
+| raw, 3 days | 1,951,749 | 278 MB | **7.7 MB** |
+| `metrics_1m`, 90 days | 4,794,103 | 745 MB | **20 MB** |
+| `metrics_1h`, 90 days | 78,810 | 23 MB | 630 kB |
+
+At the full 730-day hourly retention that is roughly **31 MB per machine** — about
+4.6x less than the previous 30-day jsonb window's ~147 MB, while gaining 90 days
+of minute data and two years of hourly data where there was none. Compressed cost
+per row held at 83 B across the fivefold larger fleet, against 84.5 B measured on
+seven machines, so this scales flat.
+
+One operational caveat the load surfaced: inserting into an already-compressed
+chunk parks the new rows in that chunk's uncompressed area, and calling
+`compress_chunk` on it again does not always fold them in — one backfilled chunk
+sat at 334 B/row until it was fully decompressed and recompressed, 4x its clean
+size. Backfill against `metrics` should decompress the affected chunks first,
+which is what revision 0004 does.
+
+The 90-day minute rollup is the largest single consumer; halve
+`METRICS_ROLLUP_1M_RETENTION_DAYS` to take roughly 11 MB per machine off the
+total. At 500 machines the figures are ~16 GB against ~74 GB.
+
+Two numbers changed meaning in the move, both because they were wrong:
+
+* **Network totals count physical interfaces only.** They used to sum every
+  interface that was up and not loopback, so a packet crossing a veth, a bridge
+  and the uplink counted three times. On the Kubernetes node the reported figure
+  was 46,202 B/s against 23,635 B/s actually crossing `eth0`.
+* **`disk_used_percent` skips pseudo filesystems.** It used to be the maximum
+  over every mount, so a full `/run/credentials/...` read as a full disk. It is
+  now the fullest real filesystem, which is still not necessarily root — a full
+  `/var` stays visible.
+
 ### Retention
 
-At a five second interval a machine writes 17,280 samples a day, so a fleet in
-the hundreds writes millions of rows and gigabytes of jsonb a day. `app.db.policies`
-therefore schedules two TimescaleDB jobs on the hypertable — compression after
-`METRICS_COMPRESS_AFTER_HOURS`, dropping chunks after `METRICS_RETENTION_DAYS` —
-and chunks are one day rather than the seven-day default, since both policies and
-`DELETE /metrics?before=` are chunk-granular.
+Raw samples are kept `METRICS_RETENTION_DAYS` — three by default, which is a
+troubleshooting window rather than a history. History comes from two continuous
+aggregates, `metrics_1m` and `metrics_1h`, kept 90 days and two years.
+`GET /metrics/stats` picks whichever source still covers the range asked for and
+returns the same columns either way; the bucket is floored at what that source
+can resolve.
 
-The policies live in `policies.py` rather than in a migration because both
-windows are settings, not schema: they are removed and re-added on every startup,
+The rollups keep `sum` and `count` per metric rather than an average, because
+re-bucketing an average is only correct when every bucket held the same number of
+samples — and a failed poll writes no row, while any single column can be NULL on
+its own. `sum(x_sum) / sum(x_n)` stays exact at any width. They were impossible
+over the jsonb shape at all: the disk figure needed `jsonb_array_elements`, and a
+continuous aggregate rejects set-returning functions.
+
+`METRICS_ROLLUP_REFRESH_LAG_DAYS` must stay shorter than the raw retention, or a
+refresh is asked to re-read chunks retention has already dropped and the rollup
+develops holes exactly where the raw data used to be. `policies.py` clamps it to
+75% of retention and logs when it does.
+
+Chunks are four hours rather than the seven-day default, and compression runs at
+`METRICS_COMPRESS_AFTER_HOURS`. The two are tied: a chunk is only eligible once
+its *end* is that far in the past, so day-long chunks with a 24 hour window would
+not compress until two days old — against a three day retention, most of the
+window would stay uncompressed. Four hour chunks compressed after eight hours put
+roughly sixty of the seventy-two retained hours in columnar form. Both policies
+and `DELETE /metrics?before=` are chunk-granular.
+
+The policies live in `policies.py` rather than in a migration because every
+window is a setting, not schema: they are removed and re-added on every startup,
 so changing the setting changes the policy. A migration would pin whichever value
 was configured the day it was written, and `add_*_policy(if_not_exists => TRUE)`
-would then keep it and ignore the change.
+would then keep it and ignore the change. The aggregates themselves *are* schema,
+and belong to revision `0004`.
 
 ### SQLAlchemy over psycopg2, under async endpoints
 
@@ -601,8 +745,8 @@ identity code's ORM. It did not make the database layer async: the driver is
 still psycopg2 and still synchronous, so every query runs through Starlette's
 worker threadpool around a pooled connection, and the event loop never blocks.
 The fleet and metric repositories kept their hand-written SQL, because
-`time_bucket`, `drop_chunks` and the jsonb lateral aggregate have no ORM spelling
-worth having. `DB_POOL_MAX` is sized for request handlers, and AnyIO's default 40 worker
+`time_bucket`, `drop_chunks` and reading a query through one of three sources
+have no ORM spelling worth having. `DB_POOL_MAX` is sized for request handlers, and AnyIO's default 40 worker
 threads cap how many queries can be in flight regardless of pool size. It does
 **not** need to exceed `COLLECTOR_CONCURRENCY`: that semaphore bounds SNMP calls,
 and a tick issues two or three queries in total — list the machines, one batched
@@ -887,7 +1031,11 @@ make check
 
 Read the generated revision immediately. With `DB_AUTO_MIGRATE=true`, the
 reloading API applies it to the development database as soon as it starts again.
-Adding a metric still needs no migration because samples are stored as `jsonb`.
+
+Adding a metric means a column, and touching four places: the table in
+`db/tables.py`, the mapping in `services/snmp/flatten.py` (both directions), the
+rollup spec in `db/rollups.py` if it belongs in long-range history, and the
+revision. `tests/test_flatten.py` fails if the first two disagree.
 
 ## Teardown
 

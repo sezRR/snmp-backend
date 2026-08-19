@@ -60,6 +60,15 @@ def parse_key_ring(raw: str) -> dict[str, bytes]:
     return ring
 
 
+def _prefix_tuple(raw: str) -> tuple[str, ...]:
+    """Split a comma separated prefix list, dropping blanks.
+
+    A tuple rather than a list because `str.startswith` takes one directly, and
+    because these are read on every sample and must not be mutable by accident.
+    """
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
 class DatabaseSettings(BaseSettings):
     """How to reach Postgres, and how to migrate it. No application config."""
 
@@ -193,12 +202,67 @@ class Settings(DatabaseSettings):
     snmp_credential_active_key: str = ""
 
     # ---- Metric retention ----------------------------------------------------
-    # Applied as TimescaleDB background jobs by `app.db.policies`. Either at 0
-    # disables that policy and leaves the data alone. Compression works on
+    # Applied as TimescaleDB background jobs by `app.db.policies`. Any of these
+    # at 0 disables that policy and leaves the data alone. Compression works on
     # batches of up to a thousand rows, so the ratio it achieves depends on how
     # full a chunk is — a busy day compresses far better than a quiet one.
-    metrics_compress_after_hours: float = 24.0
-    metrics_retention_days: float = 30.0
+    #
+    # The raw window is deliberately short: it exists for live troubleshooting,
+    # and everything older is served from the two continuous aggregates. Both
+    # figures below are tied to each other and to the chunk interval. A chunk is
+    # only eligible for compression once its *end* is `compress_after` in the
+    # past, so with day-long chunks and a 24 hour window a chunk is not
+    # compressed until it is two days old — which, against a three day
+    # retention, would leave two thirds of the data uncompressed. Four hour
+    # chunks compressed after eight hours put roughly sixty of the seventy-two
+    # retained hours in columnar form.
+    metrics_compress_after_hours: float = 8.0
+    metrics_retention_days: float = 3.0
+    # Applied to new chunks only; existing chunks keep the interval they were
+    # created with and age out.
+    metrics_chunk_interval_hours: float = 4.0
+
+    # ---- Metric rollups -------------------------------------------------------
+    # Retention for the `metrics_1m` and `metrics_1h` continuous aggregates.
+    # These are what make a long range chart answerable at all once the raw
+    # window is three days, so they are the numbers to raise if history goes
+    # missing rather than `metrics_retention_days`.
+    metrics_rollup_1m_retention_days: float = 90.0
+    metrics_rollup_1h_retention_days: float = 730.0
+    # How far back a refresh reaches. Must stay *shorter* than
+    # `metrics_retention_days`, or a refresh is asked to re-read chunks the
+    # retention policy has already dropped and the rollup develops holes.
+    metrics_rollup_refresh_lag_days: float = 2.0
+
+    # ---- Metric entity classification -----------------------------------------
+    # Comma separated, matched as prefixes, case sensitive.
+    #
+    # Mounts whose usage is not a real filesystem's usage. hrStorageTable reports
+    # tmpfs under the same hrStorageFixedDisk type as a real disk, so type alone
+    # cannot tell them apart and the path is the only signal available. These are
+    # excluded from `disk_max_used_pct` only — every mount still reaches the UI
+    # live. `/tmp` is absent on purpose: it is a real filesystem on plenty of
+    # hosts, so excluding it by default would hide a genuinely full disk.
+    metrics_pseudo_mount_prefixes: str = (
+        "/run,/dev/shm,/sys,/proc,/snap,/var/lib/docker/overlay2,/var/lib/kubelet/pods"
+    )
+    # Interfaces excluded from the host network totals. A virtual interface
+    # cannot move a packet off the box on its own — the traffic it carries
+    # crosses a physical NIC as well — so summing both counts it twice. On a
+    # Kubernetes node with one veth per pod that inflates the total severalfold.
+    # They still appear per-interface in the live payload.
+    metrics_virtual_iface_prefixes: str = (
+        "veth,cni,flannel,docker,br-,virbr,kube-ipvs,tunl,gre,sit,ip6tnl,"
+        "tailscale,wg,weave,cali,nomad"
+    )
+
+    @property
+    def pseudo_mount_prefixes(self) -> tuple[str, ...]:
+        return _prefix_tuple(self.metrics_pseudo_mount_prefixes)
+
+    @property
+    def virtual_iface_prefixes(self) -> tuple[str, ...]:
+        return _prefix_tuple(self.metrics_virtual_iface_prefixes)
 
     # ---- OpenStack ----------------------------------------------------------
     # The real lookup is read-only: it lists Nova servers across projects and

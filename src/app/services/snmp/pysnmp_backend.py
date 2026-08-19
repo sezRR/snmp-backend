@@ -90,6 +90,7 @@ from app.models.credential import (
     SnmpVersion,
 )
 from app.services.snmp import SnmpError
+from app.services.snmp.flatten import is_physical_interface
 
 log = logging.getLogger(__name__)
 
@@ -343,12 +344,14 @@ class PySnmpSampler:
         retries: int,
         max_repetitions: int = 25,
         diskio_enabled: bool = True,
+        virtual_iface_prefixes: tuple[str, ...] = (),
     ) -> None:
         self._port = port
         self._timeout = timeout_seconds
         self._retries = retries
         self._max_repetitions = max_repetitions
         self._diskio_enabled = diskio_enabled
+        self._virtual_iface_prefixes = virtual_iface_prefixes
         # (credential id, secret version) -> its own engine and auth object.
         # Keyed on the version too, so an edited passphrase builds a fresh
         # engine rather than fighting pysnmp's USM cache over the old one.
@@ -630,16 +633,29 @@ class PySnmpSampler:
                 }
             )
 
-        # Host totals sum only the interfaces that had a usable rate, so one
-        # wrapped counter does not drag the total down to a partial figure.
-        rated = [i for i in interfaces if i["rx_bps"] is not None]
+        # Host totals count physical interfaces only. A virtual interface never
+        # moves a packet off the machine by itself — whatever it carries also
+        # crosses a NIC — so summing both counts the same traffic twice. On a
+        # Kubernetes node, with a veth per pod plus a bridge and an overlay, the
+        # total came out several times the real uplink throughput.
+        #
+        # Rates still sum only the interfaces that produced one, so a single
+        # wrapped counter does not drag the total down to a partial figure. The
+        # byte counters now sum the same physical set rather than every
+        # interface, which is what stops the two from disagreeing.
+        physical = [
+            i
+            for i in interfaces
+            if is_physical_interface(i["name"], self._virtual_iface_prefixes)
+        ]
+        rated = [i for i in physical if i["rx_bps"] is not None]
         payload = {
             "rx_bps": round(sum(i["rx_bps"] for i in rated), 2) if rated else None,
             "tx_bps": round(sum(i["tx_bps"] or 0.0 for i in rated), 2)
             if rated
             else None,
-            "rx_bytes": sum(i["rx_bytes"] for i in interfaces),
-            "tx_bytes": sum(i["tx_bytes"] for i in interfaces),
+            "rx_bytes": sum(i["rx_bytes"] for i in physical),
+            "tx_bytes": sum(i["tx_bytes"] for i in physical),
             "interval_seconds": round(elapsed, 3) if elapsed > 0 else None,
             "interfaces": interfaces,
         }

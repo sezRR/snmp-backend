@@ -114,6 +114,7 @@ def build_sampler(
         retries=settings.snmp_retries,
         max_repetitions=settings.snmp_max_repetitions,
         diskio_enabled=settings.snmp_diskio_enabled,
+        virtual_iface_prefixes=settings.virtual_iface_prefixes,
     )
 
 

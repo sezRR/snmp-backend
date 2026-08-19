@@ -6,8 +6,16 @@ Every `COLLECTOR_INTERVAL_SECONDS`:
 2. refresh each IPv4 from the OpenStack lookup — OpenStack owns the address, so a
    re-IP'd server keeps being polled without the client doing anything;
 3. sample all of them concurrently, bounded by `COLLECTOR_CONCURRENCY`;
-4. write the batch in one insert;
-5. publish each sample to the bus for SSE subscribers.
+4. flatten each reading to scalars and write the batch in one insert;
+5. publish each *unflattened* sample to the bus for SSE subscribers.
+
+Steps 4 and 5 deliberately carry different things. Storage keeps one scalar per
+metric, because per-mount, per-device and per-interface rows are ephemeral and
+enormous — see `app.services.snmp.flatten`. Live subscribers keep the whole
+reading, mounts and interfaces included, because a dashboard showing the machine
+right now can afford detail that three days of five second history cannot.
+`last_samples` is what lets `/metrics/latest` answer with the same detail as the
+stream rather than with a row read back from the database.
 
 A machine that fails to answer is recorded and skipped; it never stops the tick
 or the other machines' samples. A machine with no credential bound is recorded
@@ -33,6 +41,7 @@ from app.services.bus import MetricBus
 from app.services.credentials import CredentialCache
 from app.services.openstack import CachedOpenStack, normalise_mac
 from app.services.snmp import SnmpSampler
+from app.services.snmp.flatten import flatten
 
 log = logging.getLogger(__name__)
 
@@ -108,6 +117,10 @@ class Collector:
         self.effective_interval: float | None = None
         self._last_tick_started: float | None = None
         self.statuses: dict[str, MachineStatus] = {}
+        # MAC -> the last full reading, arrays and all. Bounded by the fleet
+        # size and pruned wherever `statuses` is, so a deleted machine stops
+        # showing a live sample instead of lingering here.
+        self.last_samples: dict[str, MetricSample] = {}
 
     @property
     def _sample_budget(self) -> float:
@@ -216,6 +229,7 @@ class Collector:
         async with self._tick_lock:
             deleted = await self._db.run_query(machines_repo.delete, mac)
             self.statuses.pop(mac, None)
+            self.last_samples.pop(mac, None)
             return deleted
 
     async def _tick(self) -> int:
@@ -226,6 +240,7 @@ class Collector:
         polled_macs = {row["mac"] for row in rows}
         for mac in self.statuses.keys() - polled_macs:
             del self.statuses[mac]
+            self.last_samples.pop(mac, None)
         if not rows:
             self.last_inserted = 0
             self.last_failed = 0
@@ -245,11 +260,23 @@ class Collector:
         if samples:
             await self._db.run_query(
                 metrics_repo.insert_many,
-                [(s.ts, s.mac, s.metrics) for s in samples],
+                [
+                    {
+                        "ts": s.ts,
+                        "mac": s.mac,
+                        **flatten(
+                            s.metrics,
+                            pseudo_mount_prefixes=self._settings.pseudo_mount_prefixes,
+                            virtual_iface_prefixes=self._settings.virtual_iface_prefixes,
+                        ),
+                    }
+                    for s in samples
+                ],
             )
-            # Published only after the write, so a subscriber never sees a
-            # sample that failed to persist.
+            # Published and cached only after the write, so neither a subscriber
+            # nor `/metrics/latest` ever shows a sample that failed to persist.
             for sample in samples:
+                self.last_samples[sample.mac] = sample
                 self._bus.publish(sample)
 
         return len(samples)

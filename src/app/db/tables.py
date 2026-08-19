@@ -23,6 +23,7 @@ import uuid
 from datetime import UTC, datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
@@ -33,13 +34,20 @@ from sqlalchemy import (
     Integer,
     LargeBinary,
     PrimaryKeyConstraint,
+    SmallInteger,
     Table,
     Text,
     UniqueConstraint,
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import INET, JSONB, MACADDR, UUID
+from sqlalchemy.dialects.postgresql import (
+    DOUBLE_PRECISION,
+    INET,
+    MACADDR,
+    REAL,
+    UUID,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -196,15 +204,61 @@ class Machine(Base):
     )
 
 
-# The hypertable. Its chunk interval, compression settings and the two indexes
-# below are TimescaleDB features that autogenerate cannot see; revision 0001
-# installs them with op.execute and nothing here reflects them.
+# The hypertable. Its chunk interval, compression settings, the continuous
+# aggregates built on top of it and the index below are TimescaleDB features
+# that autogenerate cannot see; revisions 0001 and 0004 install them with
+# op.execute and nothing here reflects them.
+#
+# Every metric column is nullable, and that is load-bearing rather than lax. A
+# machine whose IF-MIB walk failed has no network reading at all, a machine
+# whose agent serves no DISKIO-MIB has no disk I/O, and every rate is unknown on
+# the first sample after a restart because a rate needs two counter readings.
+# NULL is the honest answer in each case, and aggregates skip it for free.
 metrics = Table(
     "metrics",
     Base.metadata,
     Column("ts", DateTime(timezone=True), nullable=False),
     Column("mac", MACADDR, nullable=False),
-    Column("metrics", JSONB, nullable=False),
+    # --- cpu ---
+    Column("cpu_usage_pct", REAL),
+    Column("cpu_cores", SmallInteger),
+    # --- ram ---
+    Column("ram_total_bytes", BigInteger),
+    Column("ram_used_bytes", BigInteger),
+    Column("ram_used_pct", REAL),
+    Column("ram_available_bytes", BigInteger),
+    # --- disk ---
+    # The root filesystem, plus the fullest real filesystem. Submounts are not
+    # stored: they are mostly tmpfs, they do not roll up into root, and their
+    # names churn. They still reach the UI live over SSE.
+    Column("disk_root_total_bytes", BigInteger),
+    Column("disk_root_used_bytes", BigInteger),
+    Column("disk_root_used_pct", REAL),
+    Column("disk_max_used_pct", REAL),
+    # --- disk i/o, summed over the devices that count toward the host total ---
+    Column("dio_read_bps", DOUBLE_PRECISION),
+    Column("dio_write_bps", DOUBLE_PRECISION),
+    Column("dio_read_iops", REAL),
+    Column("dio_write_iops", REAL),
+    Column("dio_read_bytes", BigInteger),
+    Column("dio_write_bytes", BigInteger),
+    Column("dio_reads", BigInteger),
+    Column("dio_writes", BigInteger),
+    Column("dio_busy_pct", REAL),
+    # --- network, summed over physical interfaces only ---
+    Column("net_rx_bps", DOUBLE_PRECISION),
+    Column("net_tx_bps", DOUBLE_PRECISION),
+    Column("net_rx_bytes", BigInteger),
+    Column("net_tx_bytes", BigInteger),
+    Column("net_rx_util_pct", REAL),
+    Column("net_tx_util_pct", REAL),
+    # Bits per second, unlike every other *_bps column here, which are bytes per
+    # second. That is IF-MIB's unit for ifHighSpeed and renaming it would hide
+    # where the number comes from.
+    Column("net_speed_bps", BigInteger),
+    # Seconds between this sample and the previous one for this machine, which
+    # is what every rate above was derived over.
+    Column("interval_ms", Integer),
     ForeignKeyConstraint(
         ["mac"], ["machines.mac"], ondelete="CASCADE", name="metrics_mac_fkey"
     ),
@@ -214,12 +268,6 @@ metrics = Table(
     # cannot means every autogenerate run proposes dropping it.
     Index("metrics_ts_idx", text("ts DESC")),
     Index("metrics_mac_ts_idx", "mac", text("ts DESC")),
-    Index(
-        "metrics_gin_idx",
-        "metrics",
-        postgresql_using="gin",
-        postgresql_ops={"metrics": "jsonb_path_ops"},
-    ),
 )
 
 
