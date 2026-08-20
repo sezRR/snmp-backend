@@ -48,6 +48,7 @@ def fake_user(user_id: uuid.UUID, username: str, scopes: frozenset[str]) -> Simp
         username=username,
         scopes=scopes,
         is_active=True,
+        session_epoch=0,
         roles=[],
         created_at=NOW,
         updated_at=NOW,
@@ -76,6 +77,25 @@ class FakeDb:
         return fn(self._session, *args)
 
 
+class FakeEpochs:
+    """The session-epoch cache, with nothing behind it.
+
+    These tests are about who may edit whom, not about session invalidation —
+    they need the routers' `epochs` argument to exist and record what it was
+    told, so that a bump nobody asked for shows up as a failure.
+    """
+
+    def __init__(self) -> None:
+        self.remembered: list[tuple[object, int]] = []
+        self.forgotten: list[object] = []
+
+    def remember(self, user_id, epoch) -> None:
+        self.remembered.append((user_id, epoch))
+
+    def forget(self, user_id) -> None:
+        self.forgotten.append(user_id)
+
+
 def user_db(user: SimpleNamespace) -> FakeDb:
     """A session whose `get` returns one user, which is all `_load` needs."""
     return FakeDb(SimpleNamespace(get=lambda _model, _id: user))
@@ -94,6 +114,7 @@ class EditingUsersUpwardsTests(IsolatedAsyncioTestCase):
         self.admin_account = fake_user(ADMIN_ID, "root", frozenset(ALL_SCOPES))
         self.db = user_db(self.admin_account)
         self.settings = SimpleNamespace(password_min_length=12)
+        self.epochs = FakeEpochs()
 
     async def assert_forbidden(self, awaitable) -> HTTPException:
         with self.assertRaises(HTTPException) as caught:
@@ -109,6 +130,7 @@ class EditingUsersUpwardsTests(IsolatedAsyncioTestCase):
                 PasswordReset(new_password="a-long-enough-password"),
                 self.db,
                 self.settings,
+                self.epochs,
                 OPERATOR,
             )
         )
@@ -117,7 +139,7 @@ class EditingUsersUpwardsTests(IsolatedAsyncioTestCase):
     async def test_operator_cannot_deactivate_an_admin(self) -> None:
         await self.assert_forbidden(
             users_router.update_user(
-                ADMIN_ID, UserUpdate(is_active=False), self.db, OPERATOR
+                ADMIN_ID, UserUpdate(is_active=False), self.db, self.epochs, OPERATOR
             )
         )
 
@@ -129,14 +151,16 @@ class EditingUsersUpwardsTests(IsolatedAsyncioTestCase):
         )
 
     async def test_operator_cannot_delete_an_admin(self) -> None:
-        await self.assert_forbidden(users_router.delete_user(ADMIN_ID, self.db, OPERATOR))
+        await self.assert_forbidden(
+            users_router.delete_user(ADMIN_ID, self.db, self.epochs, OPERATOR)
+        )
 
     async def test_an_admin_can_still_edit_another_admin(self) -> None:
         with patch.object(
             users_router.users_repo, "set_active", return_value=None
         ) as set_active:
             await users_router.update_user(
-                ADMIN_ID, UserUpdate(is_active=False), self.db, ADMIN
+                ADMIN_ID, UserUpdate(is_active=False), self.db, self.epochs, ADMIN
             )
 
         set_active.assert_called_once()
@@ -147,7 +171,7 @@ class EditingUsersUpwardsTests(IsolatedAsyncioTestCase):
             users_router.users_repo, "set_active", return_value=None
         ) as set_active:
             await users_router.update_user(
-                PEER_ID, UserUpdate(is_active=False), user_db(peer), OPERATOR
+                PEER_ID, UserUpdate(is_active=False), user_db(peer), self.epochs, OPERATOR
             )
 
         set_active.assert_called_once()
@@ -219,7 +243,9 @@ class SelfEditTests(IsolatedAsyncioTestCase):
     async def test_you_still_cannot_delete_yourself(self) -> None:
         db = AsyncMock()
         with self.assertRaises(HTTPException) as caught:
-            await users_router.delete_user(OPERATOR.user_id, db, OPERATOR)
+            await users_router.delete_user(
+                OPERATOR.user_id, db, FakeEpochs(), OPERATOR
+            )
 
         self.assertEqual(caught.exception.status_code, 409)
         db.run_session.assert_not_awaited()

@@ -11,11 +11,16 @@ or, where the handler needs to know who is calling::
 `requires` is FastAPI's `Security(...)`, so the scopes it names appear on each
 operation in the OpenAPI document and Swagger's Authorize dialog lists them.
 
-**No database access.** Scopes are carried in the access token, so an
-authenticated request costs zero queries — which is what makes this affordable
-on the SSE routes, where the alternative is a join per reconnect. The staleness
-that buys is bounded by the token's TTL, and anything that must take effect
-sooner revokes refresh tokens; see `app.services.auth`.
+**Almost no database access.** Scopes are carried in the access token, so
+authorisation costs zero queries — which is what makes this affordable on the
+SSE routes, where the alternative is a join per reconnect. The staleness that
+buys is bounded by the token's TTL.
+
+The one thing that cannot wait out a TTL is a session the user has *ended*: a
+password changed after a phone was lost is worth nothing if the phone keeps
+reading for another fifteen minutes. So every request also asks whether the
+token's session epoch is still current, which is a cached read of one integer
+and, on the rare disagreement, one indexed row. See `app.services.sessions`.
 
 **Streams are the exception to Bearer.** A browser's `EventSource` cannot set an
 `Authorization` header, and the usual workaround — the access token in the query
@@ -37,10 +42,11 @@ from typing import Annotated
 from fastapi import Depends, HTTPException, Query, Request, Security, status
 from fastapi.security import OAuth2PasswordBearer, SecurityScopes
 
-from app.api.deps import SettingsDep
+from app.api.deps import SessionEpochsDep, SettingsDep
 from app.config import Settings
 from app.security.scopes import SCOPE_DESCRIPTIONS, Scope
 from app.services.auth import ACCESS, TokenError, decode_token
+from app.services.sessions import SessionEpochs
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +62,9 @@ class Principal:
     user_id: uuid.UUID
     username: str
     scopes: frozenset[str]
+    # The session epoch the token was minted under. Kept on the principal so a
+    # long-lived stream can re-ask the question its connect request answered.
+    epoch: int = 0
 
     def has(self, *scopes: str) -> bool:
         return self.scopes.issuperset(scopes)
@@ -78,18 +87,41 @@ def _principal_from_token(settings: Settings, token: str) -> Principal:
     except TokenError as exc:
         raise _unauthorized(f"invalid access token: {exc}") from exc
     return Principal(
-        user_id=decoded.user_id, username=decoded.username, scopes=decoded.scopes
+        user_id=decoded.user_id,
+        username=decoded.username,
+        scopes=decoded.scopes,
+        epoch=decoded.epoch,
     )
+
+
+SESSION_ENDED_DETAIL = (
+    "this session has ended; sign in again "
+    "(the password changed, or the account was disabled)"
+)
+
+
+async def _require_live_session(epochs: SessionEpochs, principal: Principal) -> None:
+    """401 if the token belongs to a session that has since been ended.
+
+    401 rather than 403 on purpose: re-authenticating is exactly what fixes
+    this, and the client's refresh will be refused too — the same change that
+    bumped the epoch revoked the refresh tokens — so the browser reaches the
+    login page instead of retrying forever.
+    """
+    if not await epochs.matches(principal.user_id, principal.epoch):
+        raise _unauthorized(SESSION_ENDED_DETAIL)
 
 
 async def get_current_principal(
     security_scopes: SecurityScopes,
     settings: SettingsDep,
+    epochs: SessionEpochsDep,
     token: Annotated[str | None, Depends(oauth2_scheme)] = None,
 ) -> Principal:
     if token is None:
         raise _unauthorized("not authenticated", security_scopes.scopes)
     principal = _principal_from_token(settings, token)
+    await _require_live_session(epochs, principal)
     _require_scopes(principal, security_scopes.scopes)
     return principal
 
@@ -162,6 +194,7 @@ StreamTicketsDep = Annotated[StreamTickets, Depends(get_stream_tickets)]
 async def get_stream_principal(
     settings: SettingsDep,
     tickets: StreamTicketsDep,
+    epochs: SessionEpochsDep,
     # Security rather than Depends purely so metrics:read shows up on these two
     # operations in the OpenAPI document; auto_error is off either way, and the
     # actual check below covers the ticket path too.
@@ -191,6 +224,10 @@ async def get_stream_principal(
             "POST /auth/stream-ticket",
             [str(Scope.METRICS_READ)],
         )
+    # Checked on the ticket path too: a ticket outlives the request that minted
+    # it by up to thirty seconds, which is long enough for a password change to
+    # land in between.
+    await _require_live_session(epochs, principal)
     _require_scopes(principal, [str(Scope.METRICS_READ)])
     return principal
 

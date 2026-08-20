@@ -28,6 +28,7 @@ from app.db.pool import Database
 from app.security.crypto import CredentialCipher
 from app.services.bootstrap import bootstrap_admin, bootstrap_credentials
 from app.services.bus import MetricBus
+from app.services.sessions import SessionEpochs
 from app.services.collector import Collector
 from app.services.credentials import CredentialCache
 from app.services.openstack import build_lookup
@@ -80,6 +81,11 @@ async def lifespan(app: FastAPI):
         app.state.bus = MetricBus(queue_maxsize=settings.sse_queue_maxsize)
         # In-process, like the bus a stream reads from.
         app.state.stream_tickets = StreamTickets(settings.stream_ticket_ttl_seconds)
+        # A cache, not a source of truth: users.session_epoch is, and a token
+        # that disagrees with what is cached is checked against the row itself.
+        app.state.session_epochs = SessionEpochs(
+            db, settings.session_epoch_cache_ttl_seconds
+        )
         # Also per-process: with more than one each carries its own counters, so
         # the effective limit is multiplied by the process count.
         app.state.login_limiter = LoginRateLimiter(
@@ -132,11 +138,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
 
-    origins = [
-        "http://localhost:5173",  # Vite / Vue local development port
-        "http://localhost:4173",  # Vite / Vue local development port
-        "http://192.168.1.115",
-    ]
+    # CORS_ALLOW_ORIGINS, comma separated. Exact matches only — scheme, host and
+    # port all count.
+    origins = settings.allowed_origins
+    if "*" in origins:
+        # Starlette answers a credentialed request by echoing the caller's own
+        # origin rather than a literal `*`, so this is not "no CORS" — it is
+        # "every site is trusted with the user's cookies". Log it loudly.
+        log.warning(
+            "CORS_ALLOW_ORIGINS contains '*' while credentials are allowed; "
+            "any origin can make authenticated requests. List real origins instead."
+        )
 
     app.add_middleware(
         CORSMiddleware,
@@ -144,6 +156,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_credentials=True,  # Support cookies & authentication headers
         allow_methods=["*"],  # Allow all standard HTTP methods (GET, POST, etc.)
         allow_headers=["*"],  # Allow all custom request headers
+        # A browser cannot read a response header it was not handed. These two
+        # carry what `/metrics/stats` resolved a request to — the bucket width
+        # after fitting and flooring, and the table it was answered from — which
+        # a chart needs to label itself.
+        expose_headers=["X-Metrics-Bucket", "X-Metrics-Source"],
     )
 
     app.state.settings = settings

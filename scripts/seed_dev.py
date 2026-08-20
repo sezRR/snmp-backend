@@ -3,9 +3,10 @@
 
 A fresh stack has an empty `machines` table, so the collector has nothing to
 poll and every endpoint answers with an empty list — which looks like a bug the
-first time you see it. This registers the fleet that
+first time you see it. This registers part of the fleet that
 `app.services.openstack.simulated` serves, by address only: the MAC, tenant,
 user and flavor all come from the lookup, exactly as they would for a real one.
+The rest of that fleet stays unregistered — see FLEET below.
 
 `/machines` requires the `machines:write` scope, so this logs in first with
 ADMIN_USERNAME / ADMIN_PASSWORD — the same values the backend was started with.
@@ -43,9 +44,10 @@ API_BASE = os.environ.get("API_BASE", "http://127.0.0.1:8000").rstrip("/")
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 
-# (address, label). Matches _FLEET in app/services/openstack/simulated.py; the
-# labels are the client's own annotation, which is the one thing OpenStack does
-# not supply.
+# (address, label). A subset of _FLEET in app/services/openstack/simulated.py:
+# the rest of that fleet is left unregistered on purpose, so there is always
+# something the lookup knows about and `machines` does not. The labels are the
+# client's own annotation, which is the one thing OpenStack does not supply.
 FLEET = [
     ("10.0.0.11", "web-01"),
     ("10.0.0.12", "web-02"),

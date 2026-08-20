@@ -60,11 +60,12 @@ def parse_key_ring(raw: str) -> dict[str, bytes]:
     return ring
 
 
-def _prefix_tuple(raw: str) -> tuple[str, ...]:
-    """Split a comma separated prefix list, dropping blanks.
+def _csv_tuple(raw: str) -> tuple[str, ...]:
+    """Split a comma separated list, dropping blanks and surrounding space.
 
-    A tuple rather than a list because `str.startswith` takes one directly, and
-    because these are read on every sample and must not be mutable by accident.
+    A tuple rather than a list because `str.startswith` takes one directly for
+    the prefix lists below, and because those are read on every sample and must
+    not be mutable by accident.
     """
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
@@ -258,11 +259,11 @@ class Settings(DatabaseSettings):
 
     @property
     def pseudo_mount_prefixes(self) -> tuple[str, ...]:
-        return _prefix_tuple(self.metrics_pseudo_mount_prefixes)
+        return _csv_tuple(self.metrics_pseudo_mount_prefixes)
 
     @property
     def virtual_iface_prefixes(self) -> tuple[str, ...]:
-        return _prefix_tuple(self.metrics_virtual_iface_prefixes)
+        return _csv_tuple(self.metrics_virtual_iface_prefixes)
 
     # ---- OpenStack ----------------------------------------------------------
     # The real lookup is read-only: it lists Nova servers across projects and
@@ -306,6 +307,13 @@ class Settings(DatabaseSettings):
     # seconds is enough to redeem one and short enough that a ticket leaked into
     # an access log is inert by the time anyone reads it.
     stream_ticket_ttl_seconds: float = 30.0
+    # How long a process trusts its cached copy of users.session_epoch before
+    # reading it again. This is *not* how long a revoked session survives — a
+    # token whose epoch disagrees with the cache is always re-read against the
+    # database — it only bounds how long a *second* process goes without
+    # noticing an epoch it has never been shown. Trading it up costs
+    # correctness nothing and saves a small indexed read per user per window.
+    session_epoch_cache_ttl_seconds: float = 10.0
 
     # ---- Login rate limiting -------------------------------------------------
     # Failed /auth/login attempts are counted per username and per client
@@ -335,9 +343,26 @@ class Settings(DatabaseSettings):
     # ---- API ----------------------------------------------------------------
     # Restores a prefix stripped by a reverse proxy in URLs FastAPI generates.
     root_path: str = ""
+    # Comma separated browser origins allowed to call this API. Matched exactly
+    # — scheme, host and port all count, so http://localhost:5173 does not cover
+    # https://ui.example.com or a bare hostname. The default is the local Vite
+    # dev/preview server and the compose UI port; a deployment adds its own.
+    #
+    # `*` is honoured but is a poor idea here: responses carry credentials, so
+    # Starlette echoes the caller's origin back instead of a literal `*`, which
+    # makes every site on the internet an allowed origin for cookie-bearing
+    # requests. Startup logs a warning if it is set.
+    cors_allow_origins: str = (
+        "http://localhost:5173,http://localhost:4173,http://localhost:8080"
+    )
     sse_heartbeat_seconds: float = 15.0
     sse_queue_maxsize: int = 100
     log_level: str = Field(default="INFO", pattern="(?i)^(debug|info|warning|error|critical)$")
+
+    @property
+    def allowed_origins(self) -> list[str]:
+        """`CORS_ALLOW_ORIGINS` as the list CORSMiddleware wants."""
+        return list(_csv_tuple(self.cors_allow_origins))
 
     @model_validator(mode="after")
     def _required_secrets_are_not_blank(self) -> "Settings":

@@ -372,7 +372,7 @@ scope in the third column. See [Authentication](#authentication).
 | POST | `/machines/{mac}/snmp-credential/test` | `credentials:write` | poll this machine once. Takes no address — `{credential?}` to dry-run an unsaved one |
 | GET | `/metrics` | `metrics:read` | `?mac=&since=&limit=` — repeat `mac` to filter on several |
 | GET | `/metrics/latest` | `metrics:read` | most recent sample per machine |
-| GET | `/metrics/stats` | `metrics:read` | `?bucket=1 minute&hours=1&mac=` — `time_bucket`, read from the raw table or a rollup depending on the range |
+| GET | `/metrics/stats` | `metrics:read` | `?from=&to=&mac=&bucket=` — `time_bucket` over a required ISO 8601 window for one or more named machines (`mac` required, up to 10). Read from the raw table or a rollup depending on how far back `from` reaches. `bucket` is optional and a preset — `30s`, `1m`, `5m`, `15m`, `1h`, `6h`, `1d`, `7d` — fitted to the window when omitted. Answers carry `X-Metrics-Bucket` and `X-Metrics-Source` |
 | GET | `/metrics/counts` | `metrics:read` | rows and latest sample per machine |
 | GET | `/metrics/stream` | `metrics:read` | SSE firehose, `?mac=` to filter |
 | GET | `/machines/{mac}/metrics/stream` | `metrics:read` | SSE for one machine |
@@ -582,12 +582,14 @@ The settings worth knowing:
 | `JWT_SECRET` | **required** | No default. Blank or under 32 chars and the app refuses to start |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD` | **required** | The bootstrap account; likewise no default |
 | `ADMIN_PASSWORD_RESET` | false | One-shot: rewrites the admin password from the environment |
-| `ACCESS_TOKEN_TTL_SECONDS` | 900 | Access tokens cannot be revoked, so they are short |
+| `ACCESS_TOKEN_TTL_SECONDS` | 900 | Access tokens are stateless, so they are short |
+| `SESSION_EPOCH_CACHE_TTL_SECONDS` | 10 | How long a process trusts its cached copy of `users.session_epoch` |
 | `REFRESH_TOKEN_TTL_SECONDS` | 1209600 | These are tracked per session and *can* be revoked |
 | `LOGIN_RATE_LIMIT_MAX_PER_USER` | 5 | Failed logins per username per window before 429 |
 | `LOGIN_RATE_LIMIT_MAX_PER_IP` | 20 | Same per client address; both are per process |
 | `LOGIN_RATE_LIMIT_WINDOW_SECONDS` | 300 | The window both counters slide over |
 | `ROOT_PATH` | empty | Optional prefix when a reverse proxy strips a path prefix |
+| `CORS_ALLOW_ORIGINS` | localhost 5173/4173/8080 | Comma separated browser origins, matched exactly on scheme, host and port |
 
 ### Holding the cadence
 
@@ -821,9 +823,13 @@ password grant, and each operation lists the scopes it needs.
 
 ### Tokens
 
-An **access token** (15 minutes) carries the user's scopes in its claims, so an
-authenticated request costs no database queries — which is what makes it
-affordable on the SSE routes. It cannot be revoked, only outlived.
+An **access token** (15 minutes) carries the user's scopes in its claims, so
+authorisation costs no database queries — which is what makes it affordable on
+the SSE routes. It also carries the **session epoch** it was minted under, which
+is the one thing checked against the database: `users.session_epoch`, read
+through a short-lived per-process cache. A token cannot be revoked one by one,
+but ending a session bumps the epoch and every token from before it stops being
+accepted on the next request.
 
 A **refresh token** (14 days) carries no authority except the right to mint a new
 pair, and every one is recorded in `refresh_tokens` by its `jti`. Refreshing
@@ -833,8 +839,15 @@ would hold the successor — so the response is to revoke that user's entire cha
 not to fail one request.
 
 Anything that must take effect immediately (disabling a user, changing a
-password) revokes refresh tokens. Role changes are visible within one access
-token's lifetime, or at once on the next refresh, which re-reads the roles.
+password, deleting an account) ends that user's sessions: refresh tokens are
+revoked, the session epoch is bumped, and any SSE stream those tokens opened is
+closed with a `session-revoked` event rather than left streaming. The session
+that made the change is the exception — it mints a fresh pair afterwards, under
+the new epoch, so changing your password does not sign you out of the tab you
+changed it in.
+
+Role changes are not in that list: they are visible within one access token's
+lifetime, or at once on the next refresh, which re-reads the roles.
 
 ### Failed logins
 

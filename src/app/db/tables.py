@@ -295,6 +295,13 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("true")
     )
+    # Bumped by anything that ends this account's sessions. Every access token
+    # carries the value it was minted under, and one that no longer matches is
+    # refused — which is how a password change reaches the sessions it cannot
+    # revoke, access tokens being stateless. See app.services.sessions.
+    session_epoch: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

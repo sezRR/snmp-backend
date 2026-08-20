@@ -18,6 +18,7 @@ from app.services.collector import Collector
 from app.services.credentials import CredentialCache
 from app.services.openstack import CachedOpenStack
 from app.services.ratelimit import LoginRateLimiter
+from app.services.sessions import SessionEpochs
 from app.services.snmp import SnmpSampler
 
 
@@ -53,6 +54,10 @@ def get_credentials(request: Request) -> CredentialCache:
 
 def get_login_limiter(request: Request) -> LoginRateLimiter:
     return request.app.state.login_limiter
+
+
+def get_session_epochs(request: Request) -> SessionEpochs:
+    return request.app.state.session_epochs
 
 
 def get_client_ip(request: Request) -> str | None:
@@ -99,4 +104,5 @@ SamplerDep = Annotated[SnmpSampler, Depends(get_sampler)]
 CredentialCacheDep = Annotated[CredentialCache, Depends(get_credentials)]
 CipherDep = Annotated[CredentialCipher, Depends(get_cipher)]
 LoginLimiterDep = Annotated[LoginRateLimiter, Depends(get_login_limiter)]
+SessionEpochsDep = Annotated[SessionEpochs, Depends(get_session_epochs)]
 ClientIpDep = Annotated[str | None, Depends(get_client_ip)]

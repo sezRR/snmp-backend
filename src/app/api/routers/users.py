@@ -41,7 +41,7 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy.exc import IntegrityError
 
-from app.api.deps import DbDep, SettingsDep
+from app.api.deps import DbDep, SessionEpochsDep, SettingsDep
 from app.api.routers.auth import check_password_policy, refuse_password_reuse
 from app.api.security import Principal, requires
 from app.db import roles as roles_repo
@@ -173,12 +173,17 @@ async def create_user(
 
 @router.patch("/{user_id}")
 async def update_user(
-    user_id: uuid.UUID, payload: UserUpdate, db: DbDep, principal: WriteDep
+    user_id: uuid.UUID,
+    payload: UserUpdate,
+    db: DbDep,
+    epochs: SessionEpochsDep,
+    principal: WriteDep,
 ) -> UserOut:
     """Activate or deactivate an account.
 
-    Deactivating revokes the account's refresh tokens; its last access token
-    stays valid for its remaining few minutes, which nothing can prevent.
+    Deactivating ends every session it has: the refresh tokens are revoked and
+    the session epoch moves, which refuses the access tokens already out there
+    and closes any stream they opened.
     """
     if payload.is_active is False:
         _refuse_self(principal, user_id, "deactivate")
@@ -194,6 +199,9 @@ async def update_user(
         user = await db.run_session(_update)
     except users_repo.LastAdminError as exc:
         raise _last_admin(exc) from exc
+
+    if payload.is_active is False:
+        epochs.remember(user.id, user.session_epoch)
 
     log.info("%r updated user %r", principal.username, user.username)
     return UserOut.from_row(user)
@@ -235,6 +243,7 @@ async def reset_user_password(
     payload: PasswordReset,
     db: DbDep,
     settings: SettingsDep,
+    epochs: SessionEpochsDep,
     principal: WriteDep,
 ) -> None:
     """Administrative reset. Ends every session that user has.
@@ -246,7 +255,7 @@ async def reset_user_password(
     check_password_policy(settings, payload.new_password)
     password_hash = await hash_password(payload.new_password)
 
-    def _reset(session) -> str:
+    def _reset(session) -> tuple[str, int]:
         user = _load(session, user_id)
         # The escalation this closes: knowing a password is being that account,
         # so resetting one is worth exactly the scopes the account holds.
@@ -263,14 +272,20 @@ async def reset_user_password(
             )
             raise
         users_repo.set_password(session, user, password_hash)
-        return user.username
+        return user.username, user.session_epoch
 
-    username = await db.run_session(_reset)
+    username, epoch = await db.run_session(_reset)
+    # This process stops accepting that account's outstanding access tokens
+    # without waiting out the cache TTL; any other process finds out the first
+    # time one is presented to it.
+    epochs.remember(user_id, epoch)
     log.warning("%r reset %r's password", principal.username, username)
 
 
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_user(user_id: uuid.UUID, db: DbDep, principal: WriteDep) -> None:
+async def delete_user(
+    user_id: uuid.UUID, db: DbDep, epochs: SessionEpochsDep, principal: WriteDep
+) -> None:
     """Delete an account. Its refresh tokens go with it, via ON DELETE CASCADE."""
     _refuse_self(principal, user_id, "delete")
 
@@ -286,4 +301,9 @@ async def delete_user(user_id: uuid.UUID, db: DbDep, principal: WriteDep) -> Non
     except users_repo.LastAdminError as exc:
         raise _last_admin(exc) from exc
 
+    # There is no epoch to compare against any more, and a cached one would
+    # keep accepting the deleted account's access tokens for the rest of the
+    # window. Dropping it makes the next request read the row, find none, and
+    # refuse.
+    epochs.forget(user_id)
     log.warning("%r deleted user %r", principal.username, username)

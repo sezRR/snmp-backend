@@ -9,10 +9,11 @@ Two habits run through this module:
 * **Failures do not distinguish "no such user" from "wrong password".** Both
   answer 401 with the same text, and the no-such-user path still pays for a
   password verification, so the response time does not leak which it was.
-* **Anything that invalidates a credential revokes refresh tokens in the same
-  transaction.** Access tokens cannot be revoked, so a few minutes of residual
-  authority is unavoidable; leaving a refresh token alive would make it
-  indefinite.
+* **Anything that invalidates a credential ends the sessions holding it, in the
+  same transaction.** Refresh tokens are rows and are revoked outright. Access
+  tokens are signed strings nobody can recall, so they carry the session epoch
+  they were minted under and are refused once the account's epoch moves past
+  them — see `app.services.sessions`.
 * **Failed logins are counted, and past a limit answered 429 without doing the
   work.** The counters live in `app.services.ratelimit`; the reason they exist
   is that a constant-time 401 is still an invitation to keep guessing.
@@ -28,7 +29,13 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 
-from app.api.deps import ClientIpDep, DbDep, LoginLimiterDep, SettingsDep
+from app.api.deps import (
+    ClientIpDep,
+    DbDep,
+    LoginLimiterDep,
+    SessionEpochsDep,
+    SettingsDep,
+)
 from app.api.security import (
     AuthenticatedDep,
     Principal,
@@ -113,12 +120,17 @@ async def issue_pair(db: Database, settings: Settings, user: User) -> TokenPair:
     Scopes are read from the user's roles here, which is the point at which a
     role change becomes visible: a refresh picks it up even though the previous
     access token carried the old set.
+
+    The session epoch is read from the same row, so a pair minted after an epoch
+    bump belongs to the surviving session and a pair minted before it does not.
     """
     refresh_token, jti, expires_at = create_refresh_token(
         settings, user.id, user.username
     )
     await db.run_session(tokens_repo.record, jti, user.id, expires_at)
-    access_token = create_access_token(settings, user.id, user.username, user.scopes)
+    access_token = create_access_token(
+        settings, user.id, user.username, user.scopes, user.session_epoch
+    )
     return TokenPair(
         access_token=access_token,
         refresh_token=refresh_token,
@@ -181,8 +193,10 @@ async def login(
 
     if new_hash is not None:
         # The stored hash predates a cost increase; upgrade it while we have the
-        # plaintext, which is the only moment it is possible.
-        await db.run_session(users_repo.set_password, user, new_hash)
+        # plaintext, which is the only moment it is possible. Deliberately not
+        # `set_password`: the password did not change, and ending this user's
+        # sessions because they logged in would be a strange way to thank them.
+        await db.run_session(users_repo.store_password_hash, user, new_hash)
 
     log.info("login for %r", user.username)
     return await issue_pair(db, settings, user)
@@ -237,7 +251,9 @@ async def refresh(db: DbDep, settings: SettingsDep, payload: RefreshRequest) -> 
             headers={"WWW-Authenticate": "Bearer"},
         ) from exc
 
-    access_token = create_access_token(settings, user.id, user.username, user.scopes)
+    access_token = create_access_token(
+        settings, user.id, user.username, user.scopes, user.session_epoch
+    )
     return TokenPair(
         access_token=access_token,
         refresh_token=new_token,
@@ -287,12 +303,17 @@ async def me(db: DbDep, principal: AuthenticatedDep) -> Me:
 
 @router.patch("/me/password")
 async def change_own_password(
-    db: DbDep, settings: SettingsDep, principal: AuthenticatedDep, payload: PasswordChange
+    db: DbDep,
+    settings: SettingsDep,
+    epochs: SessionEpochsDep,
+    principal: AuthenticatedDep,
+    payload: PasswordChange,
 ) -> TokenPair:
     """Change your own password. Requires the current one, and a different one.
 
-    Every other session is ended, and a fresh pair is returned so the caller is
-    not logged out of the session they made the change from.
+    Every other session is ended — refresh tokens revoked, access tokens refused
+    from the next request, open streams closed — and a fresh pair is returned so
+    the caller is not logged out of the session they made the change from.
     """
     check_password_policy(settings, payload.new_password)
     # Plaintext comparison rather than a second Argon2 verify: the current
@@ -315,9 +336,13 @@ async def change_own_password(
         )
 
     new_hash = await hash_password(payload.new_password)
-    # set_password revokes every refresh token for this user, including the one
-    # the caller is holding — hence the fresh pair below.
+    # set_password revokes every refresh token for this user and bumps the
+    # session epoch, which between them invalidate every credential the account
+    # is holding — including the caller's own. Hence the fresh pair below.
     await db.run_session(users_repo.set_password, user, new_hash)
+    # Before the pair is minted, so the token this response carries is never
+    # measured against the epoch it replaced.
+    epochs.remember(user.id, user.session_epoch)
     log.info("%r changed their password", user.username)
     return await issue_pair(db, settings, user)
 

@@ -22,6 +22,8 @@ literal SQL, generated from this spec once, by hand.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 # Gauges: a reading whose average over a window is meaningful. Each contributes
 # `<col>_sum`, `<col>_n` and `<col>_max` to both views.
 ROLLUP_GAUGES: tuple[str, ...] = (
@@ -74,12 +76,6 @@ STATS_METRICS: tuple[tuple[str, str], ...] = (
     ("disk_write_iops", "dio_write_iops"),
 )
 
-# Hours of raw data on hand, and of one-minute data on hand. Both are read from
-# settings at call time rather than baked in here; these are only the fallbacks
-# used when a caller does not pass them.
-RAW_HOURS = 72.0
-ROLLUP_1M_HOURS = 90.0 * 24
-
 
 def stats_projection(source: str) -> str:
     """The `avg`/`max` pair for every public metric, for one source table.
@@ -99,6 +95,16 @@ def stats_projection(source: str) -> str:
             )
             lines.append(f"max(m.{column}_max) AS {public}_max")
     return ",\n                ".join(lines)
+
+
+def hours_back(start: datetime) -> float:
+    """How far back a window's start reaches from now, in hours.
+
+    That reach, not the window's length, is what decides the source: a one-hour
+    window six months ago is answered from a rollup even though an hour of raw
+    data would have covered it, because those rows are long gone.
+    """
+    return max((datetime.now(UTC) - start).total_seconds() / 3600.0, 0.0)
 
 
 def pick_source(hours: float, raw_hours: float, rollup_1m_hours: float) -> str:
@@ -122,6 +128,16 @@ SOURCE_MIN_BUCKET: dict[str, str] = {
     "metrics_1m": "1 minute",
     "metrics_1h": "1 hour",
 }
+
+# The same floors as a number, for `StatsBucket.at_least` to round a request up
+# to a preset before the query runs — the router reports that preset back in
+# `X-Metrics-Bucket`, and the `greatest()` in the query stays as the backstop.
+SOURCE_MIN_BUCKET_SECONDS: dict[str, float] = {
+    "metrics": 1.0,
+    "metrics_1m": 60.0,
+    "metrics_1h": 3_600.0,
+}
+
 
 # The column a source buckets on. Raw rows bucket on their timestamp; a rollup
 # is already bucketed and re-buckets on the bucket it carries.

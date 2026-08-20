@@ -340,14 +340,74 @@ history has no other copy and rebuilding would destroy it.
 
 ## 7. Read path
 
-`GET /metrics/stats` answers from whichever source still holds the range.
-`rollups.pick_source` (`rollups.py:104`):
+`GET /metrics/stats` takes an explicit window — `?from=` and `?to=`, both
+required, ISO 8601, naive read as UTC — and answers it from whichever source
+still holds it. What decides the source is how far back `from` reaches, not how
+long the window is: an hour-long window six months ago comes from a rollup,
+because the raw rows for it are long gone (`rollups.hours_back`,
+`rollups.pick_source`):
 
-| requested `hours` | source | min bucket |
+| `from` reaches back | source | min bucket |
 |---|---|---|
 | <= `METRICS_RETENTION_DAYS * 24` (72) | `metrics` | 1 second |
 | <= `METRICS_ROLLUP_1M_RETENTION_DAYS * 24` (2160) | `metrics_1m` | 1 minute |
 | otherwise | `metrics_1h` | 1 hour |
+
+`?mac=` is required and repeatable, up to `MAX_MACS` (10). Rows are buckets
+times machines and the cap below counts buckets alone, so the endpoint makes the
+caller name its machines rather than defaulting to the whole fleet.
+
+`?bucket=` is a preset, not a free-form interval: `30s`, `1m`, `5m`, `15m`,
+`1h`, `6h`, `1d`, `7d` (`models.metric.StatsBucket`). It used to be any string,
+cast to `interval` in SQL — so `?bucket=asgg` reached Postgres and came back a
+500 out of the driver rather than a 422 out of validation.
+
+### The bucket a request actually gets
+
+`?bucket=` is optional, and there is no fixed default: a single width cannot
+serve a range that runs from an hour to two years — five minutes is twelve
+points over an hour and eight thousand over a month. Omitted, it is **fitted**
+to the window, aiming for `TARGET_POINTS` (360) points — a chart's worth of
+detail at a payload a browser can hold several of
+(`StatsBucket.at_least(span / TARGET_POINTS)`):
+
+| window | fitted bucket | points |
+|---|---|---|
+| 1h | `30s` | 120 |
+| 6h | `1m` | 360 |
+| 24h | `5m` | 288 |
+| 7d | `1h` | 168 |
+| 30d | `6h` | 120 |
+| 90d | `6h` | 360 |
+| 2y | `7d` | 104 |
+
+The ladder is lumpy — 30 days and 90 days both land on `6h` — because the
+presets are the ones a human would pick off a dropdown, not a continuous scale.
+A window between two presets rounds *up*, so the count lands under the target
+rather than over it.
+
+Fitted or asked for, the width is then **floored** at what the source can
+resolve — the same `at_least` call, against `SOURCE_MIN_BUCKET_SECONDS`. The
+floor resolves to a preset rather than to the source's own interval string,
+which is what makes the result nameable: `1h` is a bucket a caller can ask for
+again, `1 hour` was only ever a substitution inside the query.
+
+Both steps change the width away from what was requested, so the answer says
+what it used:
+
+```
+X-Metrics-Bucket: 15m
+X-Metrics-Source: metrics_1m
+```
+
+Both are listed in `expose_headers` on the CORS middleware (`main.py`) — a
+browser cannot read a response header it was not handed.
+
+Two rejections happen before the query runs, both 422: `to` at or before
+`from`, and a window covering more than `MAX_BUCKETS` (5000) buckets. The bucket
+count is measured on the effective width, so an explicit `?bucket=30s` over two
+years is judged as the 17538 hourly buckets it would actually return. A fitted
+bucket cannot trip that cap, since `TARGET_POINTS` is well under it.
 
 `stats_projection` emits `avg(col)` / `max(col)` for raw and
 `sum(col_sum)/nullif(sum(col_n),0)` / `max(col_max)` for a rollup, under the same

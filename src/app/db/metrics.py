@@ -80,26 +80,28 @@ def list_samples(
 
 def stats(
     conn: Connection,
+    source: str,
     bucket: str,
-    hours: float,
+    start: datetime,
+    end: datetime,
     macs: list[str] | None,
-    raw_hours: float = rollups.RAW_HOURS,
-    rollup_1m_hours: float = rollups.ROLLUP_1M_HOURS,
 ) -> list[dict[str, Any]]:
-    """`time_bucket` aggregates, read from whichever source still has the range.
+    """`time_bucket` aggregates over one `[start, end)` window.
 
-    The shape of the result does not depend on the source: the caller asks for a
-    window and a bucket width and gets the same columns back either way.
+    Which source still holds that window is the caller's call — it is a question
+    about the configured retentions, which live in settings, not here. The shape
+    of the result does not depend on the answer: the caller asks for a window
+    and a bucket width and gets the same columns back either way.
     """
-    source = rollups.pick_source(hours, raw_hours, rollup_1m_hours)
     time_column = rollups.SOURCE_TIME_COLUMN[source]
     rows = conn.execute(
         text(
             f"""
             SELECT
-                -- CAST to text first, not straight to interval: the driver would
-                -- otherwise want a timedelta, and '15 minutes' is friendlier in
-                -- a query string.
+                -- CAST to text first, not straight to interval: the driver
+                -- would otherwise want a timedelta. The string comes from
+                -- `StatsBucket`, a closed set of presets, so it is never
+                -- caller-controlled text.
                 --
                 -- greatest() floors the bucket at what the source can actually
                 -- resolve. Asking a one-hour rollup for five-minute buckets does
@@ -116,7 +118,8 @@ def stats(
                 {rollups.SOURCE_SAMPLES[source]} AS samples,
                 {rollups.stats_projection(source)}
             FROM {source} AS m
-            WHERE m.{time_column} > now() - (CAST(:hours AS double precision) * INTERVAL '1 hour')
+            WHERE m.{time_column} >= CAST(:start AS timestamptz)
+              AND m.{time_column} < CAST(:end AS timestamptz)
               AND (CAST(:macs AS text[]) IS NULL
                    OR CAST(m.mac AS text) = ANY (CAST(:macs AS text[])))
             -- Grouped and ordered by position, not by the `bucket` alias. A
@@ -133,7 +136,8 @@ def stats(
         {
             "bucket": bucket,
             "min_bucket": rollups.SOURCE_MIN_BUCKET[source],
-            "hours": hours,
+            "start": start,
+            "end": end,
             "macs": macs,
         },
     ).mappings()

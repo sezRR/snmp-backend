@@ -52,6 +52,10 @@ class DecodedToken:
     jti: uuid.UUID
     token_type: str
     expires_at: datetime
+    # The value of users.session_epoch when this was minted. Absent from tokens
+    # older than the column, which read as 0 — the default — and so keep working
+    # until they expire rather than being refused on deploy.
+    epoch: int = 0
 
 
 # --- Passwords ---------------------------------------------------------------
@@ -92,6 +96,7 @@ def _encode(
     token_type: str,
     ttl_seconds: int,
     scopes: frozenset[str] | None = None,
+    epoch: int | None = None,
 ) -> tuple[str, uuid.UUID, datetime]:
     now = datetime.now(UTC)
     expires_at = now + timedelta(seconds=ttl_seconds)
@@ -107,6 +112,8 @@ def _encode(
     }
     if scopes is not None:
         claims["scopes"] = sorted(scopes)
+    if epoch is not None:
+        claims["ep"] = epoch
     token = jwt.encode(
         claims,
         settings.jwt_secret.get_secret_value(),
@@ -116,7 +123,11 @@ def _encode(
 
 
 def create_access_token(
-    settings: Settings, user_id: uuid.UUID, username: str, scopes: frozenset[str]
+    settings: Settings,
+    user_id: uuid.UUID,
+    username: str,
+    scopes: frozenset[str],
+    epoch: int = 0,
 ) -> str:
     """Scopes are baked in at mint time.
 
@@ -125,6 +136,10 @@ def create_access_token(
     per SSE reconnect. Baking them in bounds the staleness at the access token's
     TTL instead, and `/auth/refresh` re-reads from the database, so a revoked
     role is gone within minutes without a permanent query cost.
+
+    `epoch` is the exception to that bargain, for the one change that cannot
+    wait out a TTL: ending a session. It is checked on every request against a
+    cached copy of the column — see `app.services.sessions`.
     """
     token, _, _ = _encode(
         settings,
@@ -133,6 +148,7 @@ def create_access_token(
         token_type=ACCESS,
         ttl_seconds=settings.access_token_ttl_seconds,
         scopes=scopes,
+        epoch=epoch,
     )
     return token
 
@@ -186,4 +202,7 @@ def decode_token(settings: Settings, token: str, expected_type: str) -> DecodedT
         jti=jti,
         token_type=expected_type,
         expires_at=datetime.fromtimestamp(claims["exp"], UTC),
+        # A token minted before the epoch existed carries no "ep" and reads as
+        # 0, which is the column's default: it keeps working until it expires.
+        epoch=int(claims.get("ep", 0)),
     )

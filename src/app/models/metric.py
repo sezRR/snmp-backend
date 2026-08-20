@@ -1,9 +1,76 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+
+class StatsBucket(StrEnum):
+    """The `time_bucket` widths `GET /metrics/stats` accepts.
+
+    A closed set rather than a free-form Postgres interval. The interval used to
+    be taken straight from the query string and cast in SQL, so anything
+    Postgres could not parse came back as a 500 from the driver instead of a 422
+    from validation, and any width at all was accepted — including ones no
+    source can resolve and ones that would return a million rows.
+
+    The member value is what goes on the wire, `interval` is what SQL gets, and
+    `seconds` is the same width as a number, for working out how many buckets a
+    requested window covers before running the query.
+    """
+
+    S30 = "30s"
+    M1 = "1m"
+    M5 = "5m"
+    M15 = "15m"
+    H1 = "1h"
+    H6 = "6h"
+    D1 = "1d"
+    D7 = "7d"
+
+    @property
+    def interval(self) -> str:
+        return _BUCKET_INTERVALS[self]
+
+    @property
+    def seconds(self) -> float:
+        return _BUCKET_SECONDS[self]
+
+    @classmethod
+    def at_least(cls, seconds: float) -> StatsBucket:
+        """The narrowest preset no finer than `seconds`; the widest if none is.
+
+        Two different questions reduce to this one. Fitting a window to a point
+        count asks for a bucket at least `span / points` wide; flooring at what
+        a rollup can resolve asks for one at least its bucket wide. Members are
+        declared narrowest-first, so the first match is the answer.
+        """
+        return next((bucket for bucket in cls if bucket.seconds >= seconds), cls.D7)
+
+
+_BUCKET_INTERVALS: dict[StatsBucket, str] = {
+    StatsBucket.S30: "30 seconds",
+    StatsBucket.M1: "1 minute",
+    StatsBucket.M5: "5 minutes",
+    StatsBucket.M15: "15 minutes",
+    StatsBucket.H1: "1 hour",
+    StatsBucket.H6: "6 hours",
+    StatsBucket.D1: "1 day",
+    StatsBucket.D7: "7 days",
+}
+
+_BUCKET_SECONDS: dict[StatsBucket, float] = {
+    StatsBucket.S30: 30.0,
+    StatsBucket.M1: 60.0,
+    StatsBucket.M5: 300.0,
+    StatsBucket.M15: 900.0,
+    StatsBucket.H1: 3_600.0,
+    StatsBucket.H6: 21_600.0,
+    StatsBucket.D1: 86_400.0,
+    StatsBucket.D7: 604_800.0,
+}
 
 
 class MetricSample(BaseModel):
