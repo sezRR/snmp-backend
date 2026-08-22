@@ -1,32 +1,3 @@
-"""Encryption for stored SNMP credentials.
-
-Unlike a password, an SNMP passphrase has to come back out: pysnmp needs the
-plaintext at poll time to localize a USM key. So this is encryption with a key
-ring, not hashing — `users.password_hash` is the wrong model to copy here, and
-copying it would produce credentials the collector cannot use.
-
-What that buys and what it does not: the ciphertext is useless to anyone who
-walks off with a `pg_dump`, a replica, or a backup. It is *not* protection
-against a compromised app container, which by construction holds the key in its
-environment. Treat this as raising the cost of a database-only breach, and
-protect access to `.env` and the container runtime.
-
-Three details are load-bearing:
-
-* **Key ring, not key.** Every row records the `key_id` it was encrypted under,
-  so a rotation adds a key, flips the active id, and lets
-  `python -m app.db.reencrypt` walk the rows at its leisure. Rows still on the
-  old key keep decrypting throughout.
-* **AAD binds the row to its own ciphertext.** The additional authenticated
-  data is `credential_id|key_id|secret_version`, so a blob lifted from one row
-  into another fails to decrypt rather than silently authenticating the
-  collector to a host as the wrong principal — which, with reusable profiles, is
-  exactly the confusion worth making impossible.
-* **The fingerprint is stored, not derived on read.** It exists so a UI can tell
-  two profiles apart without seeing either secret, and computing it on demand
-  would mean decrypting every row of every list response.
-"""
-
 from __future__ import annotations
 
 import hmac
@@ -41,12 +12,10 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from app.config import Settings
 
-# 96 bits, the size AES-GCM is specified around: anything else forces an extra
-# GHASH pass and buys nothing.
+# 96 bits: the size AES-GCM is specified around.
 NONCE_BYTES = 12
 
-# Domain separation, so the fingerprint HMAC can never collide with any other
-# use of the same key material.
+# Domain separation for the fingerprint HMAC.
 _FINGERPRINT_LABEL = b"snmp-credential-fingerprint-v1"
 
 
@@ -129,9 +98,7 @@ class CredentialCipher:
                 self._aad(credential_id, key_id, secret_version),
             )
         except InvalidTag as exc:
-            # Either the wrong key, or the row's identity no longer matches what
-            # was sealed into it. Both mean "do not use this", and neither is
-            # worth distinguishing to the caller.
+            # Wrong key, or an identity that no longer matches the sealed AAD.
             raise CredentialCryptoError(
                 f"credential {credential_id} failed authentication: wrong key, or "
                 "the stored ciphertext does not belong to this row"

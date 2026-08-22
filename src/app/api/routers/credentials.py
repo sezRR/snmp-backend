@@ -1,25 +1,3 @@
-"""SNMP credential profiles, and binding them to machines.
-
-Two routers live here. The `/snmp-credentials` one is ordinary CRUD; the
-`/machines/{mac}/snmp-credential` one is the part with teeth.
-
-**Binding is its own scope.** The bind routes are here rather than folded into
-`PATCH /machines/{mac}` because that endpoint is gated on `machines:write`
-alone, and a `credential_id` field on it would make one handler enforce two
-scopes conditionally on which fields the caller happened to send — a check that
-survives exactly until someone adds a field and forgets. A separate route
-carries `requires(Scope.CREDENTIALS_WRITE)` flatly, where it cannot be
-sidestepped.
-
-Why that boundary exists at all: credentials are shared, so binding one decides
-which host the collector will authenticate to using a secret the whole fleet
-depends on. Registering a machine at an arbitrary address is cheap and
-low-privilege; pointing a shared credential at it must not be.
-
-**Nothing here returns a secret.** Not redacted, not optional — `SnmpCredential`
-has no field that could hold one.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -54,9 +32,8 @@ from app.services.credentials import resolve_row
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/snmp-credentials", tags=["snmp credentials"])
-# Same prefix as the machines router; FastAPI merges them in the OpenAPI
-# document and the bind routes read as what they are — a sub-resource of a
-# machine, gated on the credential scopes rather than the machine ones.
+# Same prefix as the machines router: a machine sub-resource, gated on the
+# credential scopes rather than the machine ones.
 machine_router = APIRouter(prefix="/machines", tags=["snmp credentials"])
 
 
@@ -179,8 +156,8 @@ async def update_credential(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
             ) from exc
 
-        # Sealed against the version the update will land on, which is one past
-        # the current one — the AAD has to match what the row will say.
+        # Sealed against the version the update lands on: the AAD must match
+        # what the row will say.
         next_version = current["secret_version"] + 1
         secret, key_id, fingerprint = _seal(cipher, credential_id, next_version, spec)
         row = await db.run_query(
@@ -258,8 +235,7 @@ async def delete_credential(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="unknown credential"
         )
-    # Drop the plaintext and the engine holding its USM keys now, rather than
-    # leaving them in memory until the process restarts.
+    # Drop the plaintext and the engine holding its USM keys now.
     credentials.forget(credential_id)
     sampler.forget_credential(credential_id)
     log.warning("credential %s deleted by %s", credential_id, principal.username)
@@ -349,8 +325,7 @@ async def test_credential(
 
     ad_hoc = payload.credential is not None
     if ad_hoc:
-        # A throwaway id so the sampler's per-credential cache key is unique;
-        # dropped in the `finally` below, along with the engine holding its keys.
+        # A throwaway id for the sampler's cache key; dropped in the `finally`.
         credential = _ad_hoc_credential(payload.credential)
     else:
         if machine["credential_id"] is None:
@@ -371,10 +346,8 @@ async def test_credential(
         try:
             credential = resolve_row(cipher, row)
         except CredentialCryptoError as exc:
-            # Almost always a key dropped from the ring before every row had
-            # been moved off it. The collector already reports this per machine
-            # in /admin/collector; without this the same condition reaches an
-            # operator here as an opaque 500.
+            # Almost always a key dropped from the ring too early. Without this
+            # it reaches the operator as an opaque 500.
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
             ) from exc
@@ -394,9 +367,8 @@ async def test_credential(
             detail="no answer within the sample budget",
         )
     except Exception as exc:
-        # pysnmp reports "wrongDigests" for a bad auth passphrase and
-        # "unknownUserName" for a bad securityName, both of which are what the
-        # operator needs. None of them carry the passphrase itself.
+        # pysnmp names the cause ("wrongDigests", "unknownUserName") without
+        # carrying the passphrase.
         return CredentialTestResult(
             ok=False,
             ipv4=ipv4,

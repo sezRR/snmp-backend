@@ -1,22 +1,3 @@
-"""Every table in the database, as SQLAlchemy sees it.
-
-This module is the schema's single source of truth: Alembic autogenerate diffs
-the live database against `Base.metadata`, so a table that is not declared here
-does not exist as far as migrations are concerned.
-
-Two conventions worth knowing before editing:
-
-* **`metrics` is a Core `Table`, not a declarative class.** It is a TimescaleDB
-  hypertable and deliberately has no primary key, which the ORM requires. It is
-  also queried entirely through hand-written SQL in `app.db.metrics`, so a
-  mapped class would buy nothing.
-* **The pre-existing constraints and indexes are named explicitly**, matching
-  what Postgres generated for the databases built by the old `schema.sql`
-  (`machines_pkey`, `metrics_mac_fkey`, ...). Letting the naming convention
-  rename them would make autogenerate emit a drop/recreate against every
-  already-deployed database. New tables use the convention.
-"""
-
 from __future__ import annotations
 
 import uuid
@@ -112,17 +93,15 @@ class SnmpCredential(Base):
             "('DES', '3DES', 'AES128', 'AES192', 'AES256')",
             name="ck_snmp_credentials_priv_protocol",
         ),
-        # A v2c row carries no USM fields; a v3 row must name its user and level.
-        # The API validates this too, but the constraint is what makes a
-        # hand-edited row unable to reach the sampler as something half-formed.
+        # v2c carries no USM fields; v3 must name its user and level. Enforced
+        # here so a hand-edited row cannot reach the sampler half-formed.
         CheckConstraint(
             "(snmp_version = '2c' AND username IS NULL AND security_level IS NULL) "
             "OR (snmp_version = '3' AND username IS NOT NULL "
             "AND security_level IS NOT NULL)",
             name="ck_snmp_credentials_version_shape",
         ),
-        # The protocol columns are present exactly when the security level says
-        # they must be — the pairing USM itself requires.
+        # Protocol columns present exactly when the security level requires them.
         CheckConstraint(
             "(security_level IS NULL AND auth_protocol IS NULL "
             "AND priv_protocol IS NULL) "
@@ -142,8 +121,7 @@ class SnmpCredential(Base):
     name: Mapped[str] = mapped_column(Text, nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
     snmp_version: Mapped[str] = mapped_column(Text, nullable=False)
-    # The v3 securityName. Null for v2c, whose identity is the community string
-    # and therefore lives inside the ciphertext.
+    # v3 securityName; null for v2c, whose identity is inside the ciphertext.
     username: Mapped[str | None] = mapped_column(Text)
     security_level: Mapped[str | None] = mapped_column(Text)
     auth_protocol: Mapped[str | None] = mapped_column(Text)
@@ -168,8 +146,7 @@ class Machine(Base):
     __tablename__ = "machines"
     __table_args__ = (
         PrimaryKeyConstraint("mac", name="machines_pkey"),
-        # An index rather than a UNIQUE constraint, because that is what
-        # schema.sql created and what deployed databases already have.
+        # An index, not a constraint: that is what deployed databases have.
         Index("machines_ipv4_key", "ipv4", unique=True),
         Index("ix_machines_credential_id", "credential_id"),
     )
@@ -183,11 +160,9 @@ class Machine(Base):
     external: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
-    # Nullable, and an unbound machine is simply not polled — the collector says
-    # so per machine in /admin/collector rather than failing quietly. RESTRICT
-    # for the same reason `user_roles.role_id` uses it: deleting a credential
-    # that is still in use should be a 409 someone has to think about, not a
-    # silent mass-unbind that stops the fleet being sampled.
+    # Nullable: an unbound machine is not polled, and says so in
+    # /admin/collector. RESTRICT so deleting a credential in use is a 409, not a
+    # silent mass-unbind.
     credential_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey(
@@ -204,16 +179,10 @@ class Machine(Base):
     )
 
 
-# The hypertable. Its chunk interval, compression settings, the continuous
-# aggregates built on top of it and the index below are TimescaleDB features
-# that autogenerate cannot see; revisions 0001 and 0004 install them with
-# op.execute and nothing here reflects them.
-#
-# Every metric column is nullable, and that is load-bearing rather than lax. A
-# machine whose IF-MIB walk failed has no network reading at all, a machine
-# whose agent serves no DISKIO-MIB has no disk I/O, and every rate is unknown on
-# the first sample after a restart because a rate needs two counter readings.
-# NULL is the honest answer in each case, and aggregates skip it for free.
+# The hypertable. Chunk interval, compression, the aggregates and the index
+# below are TimescaleDB features autogenerate cannot see; 0001 and 0004 install
+# them with op.execute. Every metric column is nullable on purpose: a failed
+# walk has no reading, and a rate needs two counter readings.
 metrics = Table(
     "metrics",
     Base.metadata,
@@ -228,9 +197,8 @@ metrics = Table(
     Column("ram_used_pct", REAL),
     Column("ram_available_bytes", BigInteger),
     # --- disk ---
-    # The root filesystem, plus the fullest real filesystem. Submounts are not
-    # stored: they are mostly tmpfs, they do not roll up into root, and their
-    # names churn. They still reach the UI live over SSE.
+    # Root plus the fullest real filesystem. Submounts churn and are mostly
+    # tmpfs, so they are live-only.
     Column("disk_root_total_bytes", BigInteger),
     Column("disk_root_used_bytes", BigInteger),
     Column("disk_root_used_pct", REAL),
@@ -252,20 +220,15 @@ metrics = Table(
     Column("net_tx_bytes", BigInteger),
     Column("net_rx_util_pct", REAL),
     Column("net_tx_util_pct", REAL),
-    # Bits per second, unlike every other *_bps column here, which are bytes per
-    # second. That is IF-MIB's unit for ifHighSpeed and renaming it would hide
-    # where the number comes from.
+    # Bits per second, unlike the other *_bps columns: IF-MIB's own unit.
     Column("net_speed_bps", BigInteger),
-    # Seconds between this sample and the previous one for this machine, which
-    # is what every rate above was derived over.
+    # The span every rate above was derived over.
     Column("interval_ms", Integer),
     ForeignKeyConstraint(
         ["mac"], ["machines.mac"], ondelete="CASCADE", name="metrics_mac_fkey"
     ),
-    # Not declared in schema.sql and not created by any migration: this is the
-    # index create_hypertable() builds for itself on the partitioning column.
-    # It is declared here anyway, because a table Alembic can see but an index it
-    # cannot means every autogenerate run proposes dropping it.
+    # create_hypertable()'s own index. Declared so autogenerate stops proposing
+    # to drop it.
     Index("metrics_ts_idx", text("ts DESC")),
     Index("metrics_mac_ts_idx", "mac", text("ts DESC")),
 )
@@ -295,10 +258,8 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("true")
     )
-    # Bumped by anything that ends this account's sessions. Every access token
-    # carries the value it was minted under, and one that no longer matches is
-    # refused — which is how a password change reaches the sessions it cannot
-    # revoke, access tokens being stateless. See app.services.sessions.
+    # Bumped by anything ending this account's sessions; a token minted under an
+    # older value is refused. See app.services.sessions.
     session_epoch: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("0")
     )
@@ -333,8 +294,7 @@ class Role(Base):
     )
     name: Mapped[str] = mapped_column(Text, nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
-    # Set on the built-in admin role. Guards it against deletion and against
-    # having its scopes edited away, which is the one change nobody can undo.
+    # The built-in admin role: undeletable, and its scopes cannot be edited away.
     is_system: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )

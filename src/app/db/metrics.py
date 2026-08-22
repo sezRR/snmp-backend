@@ -1,24 +1,3 @@
-"""Metric repository.
-
-Same convention as `machines`: connection first, blocking, called through
-`Database.run_query`.
-
-Every metric is its own column. It used to be one jsonb blob, and the aggregates
-reached into it with `->` / `->>` plus a cast; the payload is now flattened
-before it is written (`app.services.snmp.flatten`). The columns are all
-nullable, which preserves the property that made jsonb safe to evolve: a sample
-taken before a metric existed, or one whose SNMP walk failed, contributes
-nothing to that metric's average rather than erroring.
-
-Reads past the raw retention window are answered from the continuous aggregates
-instead — see `app.db.rollups` for the routing and why the rollups store sums
-and counts rather than averages.
-
-Casts are spelled `CAST(x AS type)` throughout rather than `x::type`, because
-SQLAlchemy's `text()` reads a bare `:` as the start of a bind parameter and
-would swallow the type name.
-"""
-
 from __future__ import annotations
 
 from datetime import datetime
@@ -30,9 +9,8 @@ from sqlalchemy.engine import Connection
 from app.db import rollups
 from app.db.tables import metrics as metrics_table
 
-# Derived from the table rather than restated, so the two can never drift. The
-# order is the table's, which is also the order `app.services.snmp.flatten`
-# lists them in; `tests/test_flatten.py` asserts the two agree.
+# Derived from the table so the two cannot drift; `tests/test_flatten.py`
+# asserts the order matches `app.services.snmp.flatten`.
 METRIC_COLUMNS: tuple[str, ...] = tuple(
     column.name for column in metrics_table.columns if column.name not in ("ts", "mac")
 )

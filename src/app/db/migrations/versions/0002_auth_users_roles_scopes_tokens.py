@@ -1,30 +1,4 @@
-"""Auth: users, roles, role scopes, grants and refresh tokens.
-
-Revision ID: 0002
-Revises: 0001
-Create Date: 2026-08-09
-
-Five tables, and the shape of them encodes a few decisions worth restating:
-
-* **No `scopes` table.** The scope set is fixed in code
-  (`app.security.scopes.Scope`) and only ever changes with a deployment, so a
-  catalogue table would be a second source of truth that could disagree with the
-  first. `role_scopes.scope` is validated against the enum on write.
-* **`role_scopes` is a row per grant**, not an array column on `roles`. Roles are
-  user-editable through the API, so the grants want to be individually
-  constrained and queryable ("which roles can purge metrics?").
-* **`user_roles.role_id` is RESTRICT**, unlike every other foreign key here.
-  Deleting a role that is still assigned should be a 409 the caller has to think
-  about, not a silent mass-revocation.
-* **`users` has no unique constraint on `username`** — it has a unique index on
-  `lower(username)` instead, so `Admin` and `admin` cannot both exist while the
-  original casing survives for display. A functional index rather than `citext`,
-  which would need an extension.
-* **`refresh_tokens.replaced_by`** chains each rotation to its successor. That
-  chain is what makes replay detectable: a token presented after it has already
-  been replaced has leaked, and the whole chain can be revoked at once.
-"""
-
+"""Auth: users, roles, role scopes, grants and refresh tokens."""
 from __future__ import annotations
 
 import sqlalchemy as sa
@@ -160,8 +134,7 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("jti", name=op.f("pk_refresh_tokens")),
     )
-    # Partial: revoked and expired rows are dead weight for the only lookup that
-    # matters, which is "this user's live sessions".
+    # Partial: revoked and expired rows are dead weight for the live-session lookup.
     op.create_index(
         "ix_refresh_tokens_active",
         "refresh_tokens",

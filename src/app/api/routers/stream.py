@@ -1,20 +1,3 @@
-"""Server-Sent Events for live metrics.
-
-Streaming is a side channel onto the collector's output: samples are written to
-TimescaleDB first and published second, so subscribing changes nothing about what
-is stored. Events therefore arrive at the collector's cadence
-(`COLLECTOR_INTERVAL_SECONDS`), not on demand.
-
-A stream is the one place where "authenticate the request" is not enough. Every
-other endpoint answers and is gone inside a few milliseconds, so a credential
-checked at the start is a credential checked at the end. A stream authenticates
-once and then holds the connection open for hours, which would let a session
-ended in the meantime — a changed password, a disabled account — keep reading
-live data for as long as the socket stayed up. So the loop re-asks, at the
-heartbeat's cadence, and closes the stream with a `session-revoked` event when
-the answer changes.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -37,10 +20,8 @@ from app.services.sessions import SessionEpochs
 
 log = logging.getLogger(__name__)
 
-# Both routes authenticate through get_stream_principal rather than the usual
-# Bearer dependency: a browser's EventSource cannot set an Authorization header,
-# so it presents a single-use ticket as ?ticket= instead. Either way the caller
-# must hold metrics:read. See app.api.security.
+# EventSource cannot set an Authorization header, so these routes also accept a
+# single-use ?ticket=. Either way the caller needs metrics:read.
 router = APIRouter(tags=["stream"], dependencies=[Depends(get_stream_principal)])
 
 
@@ -68,10 +49,8 @@ async def _events(
     }
 
     samples = bus.subscribe(macs)
-    # The subscription is awaited through a task that outlives each round of the
-    # loop rather than a cancellable `wait_for`: cancelling a pending `__anext__`
-    # would unwind the generator and drop the subscription, so a stream on an
-    # idle fleet would unsubscribe itself every time the recheck timer fired.
+    # A task that outlives each round, not a cancellable `wait_for`: cancelling
+    # a pending `__anext__` would drop the subscription on an idle fleet.
     pending: asyncio.Task[MetricSample] | None = None
     try:
         while True:
@@ -80,8 +59,7 @@ async def _events(
             done, _ = await asyncio.wait({pending}, timeout=recheck_seconds)
 
             if not await still_live():
-                # Named, so the client can tell this apart from a dropped
-                # connection: one means reconnect, the other means sign in.
+                # Named, so a client can tell this from a dropped connection.
                 yield {
                     "event": "session-revoked",
                     "data": json.dumps({"reason": "session ended"}),
@@ -106,9 +84,8 @@ async def _events(
             }
     finally:
         if pending is not None:
-            # Awaited, not just cancelled: cancellation is delivered on the next
-            # trip through the loop, and closing the subscription while its
-            # `__anext__` is still running raises "already running".
+            # Awaited, not just cancelled: closing while `__anext__` still runs
+            # raises "already running".
             pending.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await pending

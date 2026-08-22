@@ -1,16 +1,3 @@
-"""The declarative base and the one `MetaData` Alembic diffs against.
-
-Kept apart from `tables` so that `env.py` and the table definitions can both
-import it without a cycle.
-
-The naming convention is not cosmetic. Postgres invents names for unnamed
-constraints and indexes, and those names differ between a database built by
-`CREATE TABLE` and one built by a migration. Alembic then cannot emit a stable
-`drop_constraint`, and autogenerate produces churn on every run. Fixing the
-names here makes the diff empty when nothing changed, which is the property the
-whole migration workflow rests on.
-"""
-
 from __future__ import annotations
 
 from sqlalchemy import MetaData

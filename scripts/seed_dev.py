@@ -1,34 +1,4 @@
 #!/usr/bin/env python3
-"""Register a starter fleet against a running API.
-
-A fresh stack has an empty `machines` table, so the collector has nothing to
-poll and every endpoint answers with an empty list — which looks like a bug the
-first time you see it. This registers the addresses in FLEET below, by address
-only: the MAC, tenant, user and flavor all come from the OpenStack lookup.
-Edit FLEET to match the fleet this deployment actually polls.
-
-`/machines` requires the `machines:write` scope, so this logs in first with
-ADMIN_USERNAME / ADMIN_PASSWORD — the same values the backend was started with.
-
-Registering is only half of it. A machine with no SNMP credential bound is not
-polled at all — there is no fallback community string — so this then binds every
-unbound machine to the `default-v2c` profile the backend seeds from
-SNMP_COMMUNITY on its first boot. Binding is a separate call because it needs a
-separate scope (`credentials:write`), which is the whole point of the split: see
-`app.security.scopes`.
-
-Run it inside the API container (`docker compose exec api python
-/app/scripts/seed_dev.py`) or from the host against the published port:
-
-    API_BASE=http://127.0.0.1:8000 ADMIN_PASSWORD=... python scripts/seed_dev.py
-
-Re-running is a no-op — an already registered machine answers 409.
-
-Only the standard library, so it works in the app image with no extra
-dependencies. That is also why the login below hand-rolls a form POST rather
-than reaching for httpx.
-"""
-
 from __future__ import annotations
 
 import json

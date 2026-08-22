@@ -1,10 +1,3 @@
-"""Ending a session has to reach the credentials that are already out there.
-
-Revoking the refresh token was never the hard half: it is a row. The access
-token is a signed string in somebody's localStorage, and the stream it opened is
-a socket that was authenticated once, minutes ago. These cover both.
-"""
-
 import asyncio
 import json
 import uuid

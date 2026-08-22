@@ -1,16 +1,3 @@
-"""SNMP credential repository.
-
-Same shape as `app.db.machines`: every function takes a `Connection` first and
-blocks, so it is called through `Database.run_query`.
-
-The one convention worth stating is why `_COLUMNS` stops where it does. It
-lists metadata only — no `secret`, no `key_id`. Ciphertext comes out through
-`get_secret()` and nowhere else, so an ordinary read path cannot select it by
-accident and no new endpoint can start returning it just by reusing the list
-query. There is exactly one caller of `get_secret` outside this module
-(`app.services.credentials`), which is the whole point.
-"""
-
 from __future__ import annotations
 
 from typing import Any

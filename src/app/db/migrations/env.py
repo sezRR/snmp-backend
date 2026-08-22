@@ -1,19 +1,3 @@
-"""Alembic environment.
-
-Two ways in:
-
-* the host CLI (`uv run alembic ...`), which lands here with no connection and
-  builds its own engine from `Settings`; and
-* `app.db.migrate`, which hands over a live `Connection` through
-  `config.attributes["connection"]` so the app reuses its own engine — and, with
-  it, the advisory lock that serialises replicas.
-
-The `include_object` filter is the load-bearing part. TimescaleDB keeps chunks
-and catalogues in schemas of its own, and every chunk of the `metrics`
-hypertable is a real table. Without the filter, autogenerate sees hundreds of
-tables that are not in `Base.metadata` and cheerfully proposes dropping them.
-"""
-
 from __future__ import annotations
 
 from logging.config import fileConfig
@@ -45,10 +29,8 @@ TIMESCALE_SCHEMAS = {
 }
 
 
-# The continuous aggregates. Each is a view backed by its own hypertable, and
-# revision 0004 creates both with op.execute, so `Base.metadata` knows nothing
-# about them. Reflection, however, sees the view — and a table Alembic can see
-# but the metadata cannot means every autogenerate run proposes dropping it.
+# The continuous aggregates, created by 0004 with op.execute and absent from
+# `Base.metadata`. Ignored here so autogenerate stops proposing to drop them.
 CONTINUOUS_AGGREGATES = {"metrics_1m", "metrics_1h"}
 
 
@@ -109,8 +91,7 @@ def _run(connection) -> None:
         connection=connection,
         target_metadata=target_metadata,
         include_object=include_object,
-        # Catches a column whose Python type changed without its name changing,
-        # which is otherwise invisible to autogenerate.
+        # Catches a column whose type changed without its name changing.
         compare_type=True,
         compare_server_default=True,
     )

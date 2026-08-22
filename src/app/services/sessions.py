@@ -1,31 +1,3 @@
-"""Whether the session an access token belongs to is still alive.
-
-Access tokens are stateless on purpose (see `app.services.auth`): they carry
-their scopes and verify against nothing but the signing key, which is what makes
-an authenticated request cost zero queries and an SSE reconnect cost no join.
-The price is that they cannot be revoked, so anything that ends a session —
-a password change, a disabled account — used to reach only the refresh token and
-leave the access token authoritative for the rest of its TTL.
-
-`users.session_epoch` closes that. Every access token carries the epoch it was
-minted under; ending a session bumps the column; a token whose epoch no longer
-matches is refused.
-
-**The cost is bounded by caching, and correctness is not.** The happy path
-answers from a process-local cache with a short TTL, so a busy session costs one
-small indexed read every few seconds rather than one per request. A *mismatch*
-is never answered from the cache: it re-reads the row before deciding. That
-matters in both directions and is what makes this correct with more than one
-process:
-
-* a stale-high cache would keep refusing the fresh token the caller was just
-  handed, logging out the very session that changed the password;
-* a stale-low cache would keep accepting a token the epoch bump already killed.
-
-An unknown user id — the account was deleted — is refused outright, which also
-retires the deleted account's access tokens on the spot.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -61,8 +33,7 @@ class SessionEpochs:
         cached = self._fresh(user_id)
         if cached is not None and cached == epoch:
             return True
-        # Either nothing cached, or what is cached disagrees. Disagreement is
-        # rare enough to pay for a read, and too consequential to guess at.
+        # Nothing cached, or a disagreement — rare, and too consequential to guess.
         live = await self._db.run_query(_read_epoch, user_id)
         if live is None:
             return False

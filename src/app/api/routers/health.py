@@ -1,9 +1,3 @@
-"""Liveness and readiness.
-
-Split on purpose: `/healthz` touches nothing, while `/readyz` queries Postgres so
-health-aware tooling can stop routing requests while data cannot be served.
-"""
-
 from __future__ import annotations
 
 import logging

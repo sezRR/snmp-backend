@@ -1,11 +1,3 @@
-"""OpenStack lookup: protocol, in-memory TTL cache, factory.
-
-OpenStack is the only source of truth for machine facts, so every read that
-needs a tenant, user or flavor goes through here. That would mean an API call per
-request, hence the cache: one fetch per TTL window, shared by every request,
-flushable on demand from `/admin/openstack/cache/flush`.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -36,9 +28,8 @@ class CachedOpenStack:
     ) -> None:
         self._upstream = upstream
         self._ttl = ttl_seconds
-        # Read by the endpoints that have to explain an empty fleet: "OpenStack
-        # is off" and "OpenStack knows nothing about this address" are the same
-        # answer here and completely different problems for the caller.
+        # Lets endpoints tell "OpenStack is off" from "OpenStack has never heard
+        # of this address" — same empty answer, different problems.
         self.enabled = enabled
         self._lock = asyncio.Lock()
         self._servers: list[ServerInfo] = []
@@ -60,9 +51,8 @@ class CachedOpenStack:
             self._hits += 1
             return
         async with self._lock:
-            # Another coroutine may have refreshed it while we waited for the
-            # lock; without this check a cold cache would fan out one upstream
-            # call per waiting request.
+            # Another coroutine may have refreshed while we waited; without this
+            # a cold cache fans out one upstream call per waiter.
             if self._fresh():
                 self._hits += 1
                 return

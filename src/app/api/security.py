@@ -1,35 +1,3 @@
-"""Turning a request into a principal, and a scope requirement into a 403.
-
-The pattern throughout the routers is::
-
-    @router.get("/machines", dependencies=[requires(Scope.MACHINES_READ)])
-
-or, where the handler needs to know who is calling::
-
-    async def handler(principal: Annotated[Principal, requires(Scope.USERS_WRITE)]):
-
-`requires` is FastAPI's `Security(...)`, so the scopes it names appear on each
-operation in the OpenAPI document and Swagger's Authorize dialog lists them.
-
-**Almost no database access.** Scopes are carried in the access token, so
-authorisation costs zero queries — which is what makes this affordable on the
-SSE routes, where the alternative is a join per reconnect. The staleness that
-buys is bounded by the token's TTL.
-
-The one thing that cannot wait out a TTL is a session the user has *ended*: a
-password changed after a phone was lost is worth nothing if the phone keeps
-reading for another fifteen minutes. So every request also asks whether the
-token's session epoch is still current, which is a cached read of one integer
-and, on the rare disagreement, one indexed row. See `app.services.sessions`.
-
-**Streams are the exception to Bearer.** A browser's `EventSource` cannot set an
-`Authorization` header, and the usual workaround — the access token in the query
-string — puts a credential with full API authority into proxy access logs,
-the browser's history, and every proxy in between. Instead a client exchanges
-its token for a single-use ticket that is worth thirty seconds and one
-connection.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -50,8 +18,7 @@ from app.services.sessions import SessionEpochs
 
 log = logging.getLogger(__name__)
 
-# auto_error=False so a missing header produces this module's 401 with a
-# scope-bearing WWW-Authenticate, rather than FastAPI's bare one.
+# auto_error=False so a missing header gets this module's scope-bearing 401.
 oauth2_scheme = OAuth2PasswordBearer(
     tokenUrl="auth/login", scopes=dict(SCOPE_DESCRIPTIONS), auto_error=False
 )
@@ -62,8 +29,7 @@ class Principal:
     user_id: uuid.UUID
     username: str
     scopes: frozenset[str]
-    # The session epoch the token was minted under. Kept on the principal so a
-    # long-lived stream can re-ask the question its connect request answered.
+    # The epoch this token was minted under, so a long-lived stream can recheck.
     epoch: int = 0
 
     def has(self, *scopes: str) -> bool:
@@ -129,8 +95,7 @@ async def get_current_principal(
 def _require_scopes(principal: Principal, required: list[str]) -> None:
     missing = [s for s in required if s not in principal.scopes]
     if missing:
-        # 403, not 401: the caller is who they say they are, they simply may not
-        # do this. Re-authenticating would not help, so do not invite it.
+        # 403, not 401: authenticated, just not permitted.
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"missing required scope(s): {', '.join(missing)}",
@@ -195,9 +160,8 @@ async def get_stream_principal(
     settings: SettingsDep,
     tickets: StreamTicketsDep,
     epochs: SessionEpochsDep,
-    # Security rather than Depends purely so metrics:read shows up on these two
-    # operations in the OpenAPI document; auto_error is off either way, and the
-    # actual check below covers the ticket path too.
+    # Security, not Depends, purely so metrics:read shows up in the OpenAPI
+    # document; the real check below covers the ticket path too.
     token: Annotated[
         str | None, Security(oauth2_scheme, scopes=[str(Scope.METRICS_READ)])
     ] = None,
@@ -224,9 +188,8 @@ async def get_stream_principal(
             "POST /auth/stream-ticket",
             [str(Scope.METRICS_READ)],
         )
-    # Checked on the ticket path too: a ticket outlives the request that minted
-    # it by up to thirty seconds, which is long enough for a password change to
-    # land in between.
+    # Checked on the ticket path too: a ticket outlives its request by up to
+    # thirty seconds.
     await _require_live_session(epochs, principal)
     _require_scopes(principal, [str(Scope.METRICS_READ)])
     return principal

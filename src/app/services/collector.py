@@ -1,29 +1,3 @@
-"""The polling loop.
-
-Every `COLLECTOR_INTERVAL_SECONDS`:
-
-1. read the enabled machines, each with the SNMP credential it is bound to;
-2. refresh each IPv4 from the OpenStack lookup — OpenStack owns the address, so a
-   re-IP'd server keeps being polled without the client doing anything;
-3. sample all of them concurrently, bounded by `COLLECTOR_CONCURRENCY`;
-4. flatten each reading to scalars and write the batch in one insert;
-5. publish each *unflattened* sample to the bus for SSE subscribers.
-
-Steps 4 and 5 deliberately carry different things. Storage keeps one scalar per
-metric, because per-mount, per-device and per-interface rows are ephemeral and
-enormous — see `app.services.snmp.flatten`. Live subscribers keep the whole
-reading, mounts and interfaces included, because a dashboard showing the machine
-right now can afford detail that three days of five second history cannot.
-`last_samples` is what lets `/metrics/latest` answer with the same detail as the
-stream rather than with a row read back from the database.
-
-A machine that fails to answer is recorded and skipped; it never stops the tick
-or the other machines' samples. A machine with no credential bound is recorded
-the same way rather than skipped silently — there is no fallback community
-string any more, so "nobody has given this machine a credential" is a real and
-reportable state.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -52,8 +26,7 @@ class MachineStatus:
     def __init__(self, mac: str) -> None:
         self.mac = mac
         self.ipv4: str | None = None
-        # The credential's name, not its id: this is read by a human wondering
-        # why a machine is failing, and a UUID answers nothing.
+        # The name, not the id: a UUID answers nothing for whoever reads this.
         self.credential: str | None = None
         self.ok_count = 0
         self.fail_count = 0
@@ -97,8 +70,8 @@ class Collector:
         self._credentials = credentials
         self._task: asyncio.Task[None] | None = None
         self._semaphore = asyncio.Semaphore(settings.collector_concurrency)
-        # Ticks must not interleave their counter baselines, and deletion must
-        # not race the foreign-key references in a tick's metric insert.
+        # Ticks must not interleave baselines, and deletion must not race a
+        # tick's metric insert.
         self._tick_lock = asyncio.Lock()
         self._pending_ticks = 0
 
@@ -111,15 +84,12 @@ class Collector:
         self.last_failed = 0
         self.last_tick_error: str | None = None
         self.overrun_count = 0
-        # Smoothed tick-to-tick spacing. The configured interval is what we ask
-        # for; this is what the loop actually achieves, and they diverge as soon
-        # as a tick outruns its period.
+        # Smoothed tick-to-tick spacing: what the loop achieves, not what it
+        # was asked for.
         self.effective_interval: float | None = None
         self._last_tick_started: float | None = None
         self.statuses: dict[str, MachineStatus] = {}
-        # MAC -> the last full reading, arrays and all. Bounded by the fleet
-        # size and pruned wherever `statuses` is, so a deleted machine stops
-        # showing a live sample instead of lingering here.
+        # MAC -> last full reading. Pruned wherever `statuses` is.
         self.last_samples: dict[str, MetricSample] = {}
 
     @property
@@ -168,8 +138,7 @@ class Collector:
 
     async def _run(self) -> None:
         while True:
-            # Read fresh each pass rather than binding it once for the lifetime
-            # of the process, so the value cannot go stale behind a reload.
+            # Read fresh each pass so a reload cannot leave it stale.
             interval = self._settings.collector_interval_seconds
             started = time.monotonic()
             if self._last_tick_started is not None:
@@ -187,17 +156,15 @@ class Collector:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # A whole failed tick (database down, lookup down) must not kill
-                # the loop — the next one may well succeed.
+                # A failed tick must not kill the loop; the next may succeed.
                 self.last_tick_error = f"{type(exc).__name__}: {exc}"
                 log.exception("collector tick failed")
             elapsed = time.monotonic() - started
             self.last_tick_duration = elapsed
 
             if elapsed > interval:
-                # Without this the loop just runs back to back and every status
-                # reading still claims the configured interval. Say so instead:
-                # the cadence is now whatever the tick costs.
+                # Otherwise the loop runs back to back while still claiming the
+                # configured interval.
                 self.overrun_count += 1
                 log.warning(
                     "collector tick took %.2fs, longer than the %.2fs interval "
@@ -273,8 +240,7 @@ class Collector:
                     for s in samples
                 ],
             )
-            # Published and cached only after the write, so neither a subscriber
-            # nor `/metrics/latest` ever shows a sample that failed to persist.
+            # After the write only, so nothing shows a sample that failed to persist.
             for sample in samples:
                 self.last_samples[sample.mac] = sample
                 self._bus.publish(sample)
@@ -292,8 +258,7 @@ class Collector:
         try:
             index = await self._lookup.mac_index()
         except Exception as exc:
-            # Lookup down: keep polling the addresses we already have rather
-            # than skipping the tick entirely.
+            # Lookup down: poll the addresses we already have.
             log.warning("address refresh skipped: %s", exc)
             index = {}
 
@@ -303,16 +268,13 @@ class Collector:
             ipv4 = row["ipv4"]
             server = index.get(normalise_mac(mac))
             if server is not None and row["external"]:
-                # Registered as external — either while the lookup was down, or
-                # before the machine was imported into the fleet. OpenStack has
-                # it now, so it owns the address from here on.
+                # Registered as external, but OpenStack has it now, so it owns
+                # the address from here on.
                 log.info("machine %s is in OpenStack after all; no longer external", mac)
                 await self._db.run_query(machines_repo.mark_managed, mac)
             if server is not None and server.ipv4 != ipv4:
-                # A managed machine's credential follows it: OpenStack is the
-                # address authority here, and anyone able to re-IP a server
-                # there already holds more than this credential is worth. Named
-                # in the log so the move is at least visible to whoever owns it.
+                # The credential follows the machine: OpenStack is the address
+                # authority, and a re-IP there already outranks this secret.
                 log.info(
                     "machine %s moved %s -> %s (credential %s)",
                     mac,
@@ -335,10 +297,8 @@ class Collector:
         status = self.statuses.setdefault(mac, MachineStatus(mac))
 
         if row["credential_id"] is None:
-            # Not an error the machine can fix by answering: nobody has told us
-            # how to authenticate to it. Reported per machine rather than
-            # dropped, so it shows up in /admin/collector as the configuration
-            # gap it is instead of the machine simply never appearing.
+            # A configuration gap, not an unreachable host: reported per machine
+            # so /admin/collector shows it.
             status.record_failure(
                 "no credential bound: PUT /machines/{mac}/snmp-credential"
             )
@@ -349,25 +309,21 @@ class Collector:
                 row["credential_id"], row["credential_secret_version"]
             )
         except Exception as exc:
-            # A deleted credential, or a key ring that can no longer open this
-            # row. Either way there is nothing to poll with, and the whole tick
-            # must not fail over one machine's credential.
+            # Deleted credential or unopenable row: nothing to poll with, and
+            # one machine must not fail the tick.
             status.record_failure(f"{type(exc).__name__}: {exc}")
             log.warning("credential unavailable for %s (%s): %s", mac, ipv4, exc)
             return None
 
         async with self._semaphore:
             try:
-                # The MAC, not the address, is what the sampler remembers
-                # counter baselines under: OpenStack may re-IP a machine between
-                # two ticks and its history should survive that.
+                # Baselines are keyed on the MAC so they survive a re-IP.
                 metrics = await asyncio.wait_for(
                     self._sampler.sample(ipv4, mac, credential),
                     timeout=self._sample_budget,
                 )
             except asyncio.TimeoutError:
-                # Recorded like any other failure. The point is the slot: a host
-                # that never answers must not hold one for a whole period.
+                # The point is the slot: a dead host must not hold one all period.
                 status.record_failure(
                     f"TimeoutError: no sample within {self._sample_budget:.1f}s"
                 )
@@ -393,8 +349,8 @@ class Collector:
             "enabled": self._settings.collector_enabled,
             "running": self.running,
             "interval_seconds": self._settings.collector_interval_seconds,
-            # What the loop is actually achieving, which is the number worth
-            # watching: it only matches the configured interval while ticks fit.
+            # What the loop achieves; matches the configured interval only
+            # while ticks fit.
             "effective_interval_seconds": self.effective_interval,
             "overrun_count": self.overrun_count,
             "sample_budget_seconds": self._sample_budget,

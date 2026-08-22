@@ -1,15 +1,3 @@
-"""In-process fan-out from the collector to SSE subscribers.
-
-The collector publishes every sample here after writing it to TimescaleDB, so
-streaming is a side channel: with no subscribers the writes still happen, and a
-subscriber that cannot keep up loses events rather than growing a queue without
-bound.
-
-With more than one process a client only sees samples collected by the process
-it connected to; a shared bus (Redis, NATS, or Postgres
-LISTEN/NOTIFY) would be the fix.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -48,8 +36,7 @@ class MetricBus:
             try:
                 sub.queue.put_nowait(sample)
             except asyncio.QueueFull:
-                # Drop the oldest so a stalled client sees recent data when it
-                # resumes, instead of a backlog it will never catch up on.
+                # Drop the oldest: a stalled client wants recent data, not a backlog.
                 try:
                     sub.queue.get_nowait()
                     sub.queue.put_nowait(sample)

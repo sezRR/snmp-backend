@@ -1,25 +1,4 @@
-"""Baseline: machines and the metrics hypertable.
-
-Revision ID: 0001
-Revises:
-Create Date: 2026-08-09
-
-Transcribed from the `src/app/db/schema.sql` this replaces, so that a database
-built by either route ends up identical.
-
-The `has_table` guard exists because two very different databases have to
-converge here. An installation created before Alembic already has both tables, filled
-with metrics, and no `alembic_version` row; a fresh one has nothing. Guarding on
-introspection lets `alembic upgrade head` adopt the former without a manual
-`alembic stamp` and build the latter from scratch — the same command either way,
-which is the whole point of not making the operator choose.
-
-Everything TimescaleDB-specific — the hypertable itself, the chunk interval, the
-compression settings — is `op.execute`, because autogenerate cannot see any of
-it. The compression and retention *policies* are deliberately absent: they are
-settings-driven background jobs, re-applied on every boot by `app.db.policies`.
-"""
-
+"""Baseline: machines and the metrics hypertable."""
 from __future__ import annotations
 
 import sqlalchemy as sa
@@ -34,8 +13,8 @@ depends_on = None
 
 def upgrade() -> None:
     if sa.inspect(op.get_bind()).has_table("machines"):
-        # Adopting a database built by schema.sql: the objects below are already
-        # there and identical. Recording the revision is the only work to do.
+        # Adopting a schema.sql database: the objects already exist, so only the
+        # revision needs recording.
         return
 
     op.execute("CREATE EXTENSION IF NOT EXISTS timescaledb")

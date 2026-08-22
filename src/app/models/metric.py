@@ -113,20 +113,16 @@ class MetricStatsRow(BaseModel):
     cpu_usage_percent_max: float | None = None
     ram_used_percent_avg: float | None = None
     ram_used_percent_max: float | None = None
-    # The fullest filesystem on the machine, not the root one. Pseudo
-    # filesystems are excluded — a full `/run/credentials/...` is a tmpfs doing
-    # its job, not a disk about to fill up.
+    # The fullest real filesystem, not root: a full tmpfs is not a full disk.
     disk_used_percent_avg: float | None = None
     disk_used_percent_max: float | None = None
-    # Bytes per second, averaged over the samples in the bucket. Null for a
-    # bucket whose samples predate the metric or carry no rate.
+    # Bytes per second over the bucket; null when no sample carried a rate.
     net_rx_bps_avg: float | None = None
     net_rx_bps_max: float | None = None
     net_tx_bps_avg: float | None = None
     net_tx_bps_max: float | None = None
-    # Disk throughput in bytes per second and IOPS in operations per second,
-    # summed across the machine's real block devices. Null for a bucket whose
-    # samples predate the metric or whose agent serves no DISKIO-MIB.
+    # Throughput and IOPS summed across real block devices; null without
+    # DISKIO-MIB.
     disk_read_bps_avg: float | None = None
     disk_read_bps_max: float | None = None
     disk_write_bps_avg: float | None = None

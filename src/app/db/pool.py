@@ -1,26 +1,3 @@
-"""SQLAlchemy engine over psycopg2, usable from async endpoints.
-
-psycopg2 is synchronous and stays that way — SQLAlchemy is here for the schema
-(Alembic diffs `Base.metadata`) and for the auth code's ORM, not to make the
-database layer async. Every call still runs in Starlette's worker threadpool,
-which keeps the event loop free (see `run_query`). Two sizing rules follow:
-
-* `DB_POOL_MAX` must exceed `COLLECTOR_CONCURRENCY` plus whatever the request
-  path needs, or the collector will starve request handlers of connections;
-* AnyIO's default worker limit (40 threads) caps how many queries can be in
-  flight at once, regardless of pool size.
-
-Two seams are exposed, and which one to use is a property of the caller:
-
-* `run_query(fn, conn_args...)` hands `fn` a `Connection`. The fleet and metric
-  repositories use it — their SQL is hand-tuned around TimescaleDB and there is
-  nothing for an identity map to do.
-* `run_session(fn, ...)` hands `fn` a `Session`. The auth repositories use it,
-  where relationships and cascades earn their keep.
-
-Both commit on a clean return and roll back on an exception.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -53,18 +30,15 @@ class Database:
         settings = self._settings
         self._engine = create_engine(
             settings.sqlalchemy_url,
-            # pool_size is the persistent pool and max_overflow is what may be
-            # opened past it, so the two together cap total connections at
-            # DB_POOL_MAX — the same ceiling the psycopg2 pool enforced.
+            # pool_size plus max_overflow cap total connections at DB_POOL_MAX.
             pool_size=settings.db_pool_min,
             max_overflow=max(0, settings.db_pool_max - settings.db_pool_min),
-            # Cheap round-trip before handing out a connection, so a database
-            # restart or an idle connection reaped by a firewall surfaces as a
-            # reconnect rather than as a failed request.
+            # A cheap round trip, so a reaped connection reconnects instead of
+            # failing the request.
             pool_pre_ping=True,
             pool_recycle=1800,
-            # Compiles executemany into psycopg2's execute_values, which is what
-            # the collector's batch insert relies on to stay one round trip.
+            # executemany -> execute_values, which keeps the batch insert to
+            # one round trip.
             executemany_mode="values_plus_batch",
             connect_args=settings.connect_args,
             future=True,

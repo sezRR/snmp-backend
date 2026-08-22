@@ -1,5 +1,3 @@
-"""Read-only OpenStack SDK adapter."""
-
 from __future__ import annotations
 
 import logging
@@ -21,9 +19,8 @@ log = logging.getLogger(__name__)
 
 
 def build_sdk_lookup(settings: Settings) -> "SDKOpenStack":
-    # Keystone v3 password authentication. The user is given as a UUID when
-    # OS_USER_ID is set and as a name-in-a-domain otherwise; sending both would
-    # be ambiguous, so only one goes on the wire.
+    # Keystone v3 password auth: a UUID when OS_USER_ID is set, a
+    # name-in-a-domain otherwise. Sending both would be ambiguous.
     credentials: dict[str, object] = {
         "auth_url": settings.os_auth_url,
         "password": settings.os_password.get_secret_value(),
@@ -38,9 +35,8 @@ def build_sdk_lookup(settings: Settings) -> "SDKOpenStack":
     connection = openstack.connect(
         app_name="snmp-metrics-api",
         app_version=__version__,
-        # The deployment's environment is the only source of configuration:
-        # a clouds.yaml that happens to exist in the image, or a stray OS_*
-        # variable, must not be able to redirect the lookup at another cloud.
+        # The environment is the only configuration source: no clouds.yaml or
+        # stray OS_* may redirect the lookup at another cloud.
         load_yaml_config=False,
         load_envvars=False,
         region_name=settings.os_region_name or None,
@@ -61,8 +57,7 @@ class SDKOpenStack:
         self._connection = connection
 
     async def servers(self) -> list[ServerInfo]:
-        # SDK iterators perform blocking HTTP requests while they are consumed,
-        # so the complete lookup belongs in the worker thread.
+        # SDK iterators do blocking HTTP as they are consumed.
         return await run_in_threadpool(self._load_servers)
 
     def close(self) -> None:

@@ -1,11 +1,3 @@
-"""The payload/column mapping.
-
-These are the first tests in this repo to assert on a telemetry field. They
-matter more than their size suggests: `flatten` is the only thing standing
-between what an agent reports and what the database keeps, and everything it
-drops is unrecoverable.
-"""
-
 from unittest import TestCase
 
 from app.db.metrics import METRIC_COLUMNS

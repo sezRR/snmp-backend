@@ -1,22 +1,3 @@
-"""User repository.
-
-Unlike the fleet and metric repositories, these take a `Session` and are called
-through `Database.run_session`. Users, roles and grants are ordinary relational
-data with cascades worth having, and nothing here is hot enough to want SQL by
-hand.
-
-Each function is one transaction, which is why the *invariants live here rather
-than in the routers*. "Do not remove the last admin" cannot be checked before
-the mutation without a race — two requests each see two admins and each removes
-one. Mutating first and counting after, inside the same transaction, makes the
-check exact: whichever transaction commits second sees the other's effect and
-rolls itself back.
-
-Objects come back detached but usable: the sessionmaker sets
-`expire_on_commit=False`, and `User.roles` / `Role.scopes` are `selectin`, so a
-caller can read a user's scopes after the session has closed.
-"""
-
 from __future__ import annotations
 
 import uuid
@@ -118,8 +99,7 @@ def store_password_hash(session: Session, user: User, password_hash: str) -> Non
         .where(User.id == user.id)
         .values(password_hash=password_hash)
     )
-    # Not a plain assignment: on an *attached* user that would mark the
-    # instance dirty and flush a second, identical UPDATE.
+    # Not a plain assignment: on an attached user that flushes a second UPDATE.
     set_committed_value(user, "password_hash", password_hash)
 
 
@@ -145,9 +125,8 @@ def end_sessions(session: Session, user: User) -> int:
 def set_active(session: Session, user: User, is_active: bool) -> None:
     user.is_active = is_active
     if not is_active:
-        # Same reasoning as a password change: the refresh token is revoked and
-        # the epoch bump takes the access tokens with it, rather than leaving a
-        # disabled account a working session for the token's last few minutes.
+        # As with a password change: revoke the refresh token and bump the epoch
+        # rather than leave a disabled account a working session.
         end_sessions(session, user)
         guard_admins_remain(session)
 

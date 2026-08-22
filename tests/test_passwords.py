@@ -1,10 +1,3 @@
-"""A password change must actually change the password.
-
-Both endpoints, since they arrive at it differently: the self-service one holds
-the current plaintext and compares, the administrative one has only the stored
-hash and has to verify against it.
-"""
-
 import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace

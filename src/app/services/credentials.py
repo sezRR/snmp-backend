@@ -1,24 +1,3 @@
-"""Decrypted credentials, cached for the collector.
-
-The collector reads its machine list every tick and each machine names a
-credential. Fetching and decrypting per machine per tick would mean a query and
-an AES open for every host every interval, almost always for the same two or
-three profiles — so this caches the decrypted result on
-`(credential_id, secret_version)`.
-
-That key is the whole invalidation story. `secret_version` is bumped by
-`app.db.credentials.update_secret` on any change to a secret, so an edit made
-through the API is picked up on the next tick without a restart, a signal, or a
-cache-busting call from the router. A rotation that only re-encrypts
-(`rewrap`) leaves the counter alone, because the plaintext did not change and
-re-localizing every USM key across the fleet for a bookkeeping update would be
-churn for nothing.
-
-Plaintext lives here for the process lifetime. That is unavoidable — pysnmp
-needs it on every request — but it is bounded: this cache holds one entry per
-profile, not per machine, and entries whose version has moved on are dropped.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -78,9 +57,8 @@ class CredentialCache:
         self._db = db
         self._cipher = cipher
         self._entries: dict[tuple[UUID, int], ResolvedCredential] = {}
-        # A tick samples up to `collector_concurrency` machines at once and they
-        # commonly share a profile. Without this, the first tick after an edit
-        # fires one identical query and decrypt per machine.
+        # Machines sampled together commonly share a profile; without this the
+        # first tick after an edit decrypts once per machine.
         self._locks: dict[tuple[UUID, int], asyncio.Lock] = {}
 
     async def resolve(
@@ -105,9 +83,8 @@ class CredentialCache:
                 )
             resolved = resolve_row(self._cipher, row)
             if resolved.secret_version != secret_version:
-                # The row was edited between the machine list and this fetch.
-                # Cache under what we actually read; the next tick's list will
-                # carry the new version and find it here.
+                # Edited between the machine list and this fetch: cache what was
+                # actually read.
                 log.info(
                     "credential %s changed while resolving (v%s -> v%s)",
                     resolved.name,

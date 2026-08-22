@@ -1,31 +1,3 @@
-"""Failed-login throttling.
-
-No database and no HTTP here, like `app.services.auth`: this counts events
-against keys and says how long the caller must wait. `app.api.routers.auth`
-turns that into a 429.
-
-**Two keys per attempt, because one is not enough.** A per-username counter is
-what stops a password being guessed, but on its own it lets anyone lock any
-account out by failing five logins against it. A per-IP counter is what stops a
-spray across many usernames from one host, but on its own it does nothing about
-a botnet grinding a single account. Both are checked, and the longer wait wins.
-
-**Only failures count.** A successful login clears the username's counter and
-leaves the address's alone — otherwise anyone holding one valid account could
-reset their own budget between guesses at another.
-
-**In-process, on `app.state`**, like `StreamTickets`. With one process that is
-the whole picture; with several, each carries its own counters and the effective
-limit multiplies by the process count. That is a weaker bound, not a broken one,
-and the alternative is a shared store this installation does not have.
-Moving to one means replacing the dict below and nothing else.
-
-The counters are what protect the Argon2 verification, which is deliberately
-expensive: `retry_after` is consulted before a password is hashed, so a rejected
-attempt costs a dictionary lookup rather than 19 MiB and a few milliseconds of
-CPU. That is as much a denial-of-service bound as a credential-stuffing one.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -58,9 +30,8 @@ class LoginRateLimiter:
         self._window = window_seconds
         self._enabled = enabled
         self._clock = clock
-        # key -> timestamps of recent failures. Each deque is capped at its own
-        # limit, so a key costs a bounded number of floats no matter how long it
-        # is hammered; `_sweep` is what drops the keys themselves.
+        # key -> recent failure timestamps, each deque capped at its own limit;
+        # `_sweep` drops the keys.
         self._failures: dict[str, deque[float]] = {}
         self._last_sweep = clock()
 
@@ -105,9 +76,8 @@ class LoginRateLimiter:
         """
         if self._max_per_user > 0:
             yield self._user_key(username), self._max_per_user
-        # `ip` is None when the ASGI scope carries no client, which is the case
-        # for in-process test transports. Nothing to key on, so nothing to
-        # count; the username half still applies.
+        # None for an in-process transport: nothing to key on, so nothing to
+        # count. The username half still applies.
         if ip is not None and self._max_per_ip > 0:
             yield f"ip:{ip}", self._max_per_ip
 

@@ -1,37 +1,4 @@
-"""Wide-row metrics: scalar columns, no jsonb, plus the 1m and 1h rollups
-
-Revision ID: 0004
-Revises: 0003
-Create Date: 2026-08-19
-
-The jsonb payload averaged 4.8 KB on a Kubernetes node and 73% of it was three
-arrays nothing queried: every loop device, every tmpfs mount, and one veth per
-pod. At a five second interval that is 83 MB per machine per day before indexes,
-and the GIN index over the blob cost another 0.8x the heap while serving no
-query in the codebase - `jsonb_path_ops` only answers `@>`, `@?` and `@@`, which
-nothing ever issued.
-
-This revision replaces the blob with one column per metric, backfills the
-history it can, and adds the two continuous aggregates that make the shortened
-raw retention survivable. Aggregates were not possible over the old shape at
-all: the disk figure needed `jsonb_array_elements`, and a continuous aggregate
-rejects set-returning functions.
-
-Two backfilled columns deliberately disagree with the jsonb they are computed
-from, because the old scalars were wrong:
-
-* `net_*` is re-summed over physical interfaces only. `network.rx_bps` counted
-  every up, non-loopback interface, so one packet crossing a veth, a bridge and
-  the uplink counted three times.
-* `disk_max_used_pct` skips pseudo filesystems, where the old query took the max
-  over every mount and read a full tmpfs as a full disk.
-
-The aggregate definitions below are literal rather than generated from
-`app.db.rollups`. A migration is a snapshot: if it read that module, editing the
-spec would change what this revision replays as, and a database rebuilt from
-scratch would diverge from one migrated forward.
-"""
-
+"""Wide-row metrics: scalar columns, no jsonb, plus the 1m and 1h rollups"""
 from __future__ import annotations
 
 from alembic import op
@@ -41,10 +8,8 @@ down_revision = "0003"
 branch_labels = None
 depends_on = None
 
-# Matching `Settings.metrics_virtual_iface_prefixes` and
-# `metrics_pseudo_mount_prefixes` as they stood when this revision was written.
-# Frozen here on purpose: the backfill has to stay reproducible after the
-# settings defaults move on.
+# Frozen copies of the settings defaults as they stood here, so the backfill
+# stays reproducible after those defaults move on.
 VIRTUAL_IFACE_PREFIXES = (
     "veth|cni|flannel|docker|br-|virbr|kube-ipvs|tunl|gre|sit|ip6tnl|"
     "tailscale|wg|weave|cali|nomad"
@@ -55,9 +20,8 @@ PSEUDO_MOUNT_PREFIXES = (
 
 
 def upgrade() -> None:
-    # 1. The columns. All nullable, and that is load-bearing: a failed IF-MIB
-    #    walk means no network reading at all, and every rate is unknown until
-    #    there are two counter readings behind it.
+    # 1. The columns, all nullable: a failed walk has no reading, and a rate
+    #    needs two counter readings.
     op.execute(
         """
         ALTER TABLE metrics
@@ -91,8 +55,8 @@ def upgrade() -> None:
         """
     )
 
-    # 2. Compressed chunks have to come apart before a full-table UPDATE. The
-    #    compression policy puts them back on its next run.
+    # 2. Compressed chunks must come apart before a full-table UPDATE; the
+    #    policy recompresses them on its next run.
     op.execute(
         """
         SELECT decompress_chunk(chunk, true)
@@ -100,14 +64,9 @@ def upgrade() -> None:
         """
     )
 
-    # 3. Backfill. Three of these columns are reductions over the arrays
-    #    rather than copies of a scalar, so they arrive as subqueries.
-    #
-    #    They cannot be laterals in a FROM clause: Postgres does not let the
-    #    FROM list of an UPDATE reference the row being updated, which is
-    #    exactly what unnesting that row's own jsonb needs. Multi-column SET
-    #    assignment does allow the correlation, and keeps one unnest per group
-    #    rather than one per column.
+    # 3. Backfill. Three columns are reductions over the arrays, so they are
+    #    subqueries — an UPDATE's FROM list cannot reference the row being
+    #    updated, but multi-column SET can.
     op.execute(
         f"""
         UPDATE metrics AS m SET
@@ -200,32 +159,19 @@ def upgrade() -> None:
         """
     )
 
-    # 4. The GIN index answered `@>`, `@?` and `@@`. Nothing ever asked one.
-    #
-    #    DROP COLUMN does not rewrite the existing tuples - it marks the column
-    #    dropped and leaves its bytes in the heap - so the space this frees does
-    #    not appear until each chunk is either compressed (which rewrites it) or
-    #    dropped by the retention policy. Both happen within days. Run
-    #    `VACUUM FULL metrics` to see it immediately, at the cost of an
-    #    exclusive lock; that is a decision for whoever is deploying, so it is
-    #    not done here.
+    # 4. The GIN index answered queries nothing ever asked. DROP COLUMN leaves
+    #    the bytes in the heap until a chunk is compressed or dropped, so the
+    #    space returns within days; `VACUUM FULL` is the deployer's call.
     op.execute("DROP INDEX IF EXISTS metrics_gin_idx")
     op.execute("ALTER TABLE metrics DROP COLUMN metrics")
 
-    # 5. Four hour chunks, down from a day. A chunk is only eligible for
-    #    compression once its *end* is `compress_after` in the past, so day-long
-    #    chunks against a three day retention would leave most of the window
-    #    uncompressed. Existing chunks keep their interval and age out.
+    # 5. Four hour chunks: a chunk compresses only once its end is
+    #    `compress_after` old. Existing chunks age out at their own interval.
     op.execute("SELECT set_chunk_time_interval('metrics', INTERVAL '4 hours')")
 
-    # 6. The rollups, WITH NO DATA: creating them populated would hold one
-    #    transaction open across the whole history.
-    #
-    #    `materialized_only` is stated rather than left to the default, which
-    #    has changed between TimescaleDB versions. It is what we want here: a
-    #    rollup is only ever read for ranges past the raw window, so unioning it
-    #    with the raw table on every query would be work spent on rows the query
-    #    cannot reach anyway.
+    # 6. The rollups, WITH NO DATA — populating them here would hold one
+    #    transaction open across all history. `materialized_only` is stated
+    #    because its default changed between TimescaleDB versions.
     op.execute(
         """
         CREATE MATERIALIZED VIEW metrics_1m
@@ -344,10 +290,8 @@ def upgrade() -> None:
     for view in ("metrics_1m", "metrics_1h"):
         op.execute(f"ALTER MATERIALIZED VIEW {view} SET (timescaledb.compress = true)")
 
-    # Populated before the shortened retention can drop the raw rows out from
-    # under them. Without this, a chart asking for more than three days comes
-    # back empty rather than coarse. `refresh_continuous_aggregate` cannot run
-    # inside a transaction block, hence the COMMIT.
+    # Populated before the shortened retention drops the raw rows.
+    # `refresh_continuous_aggregate` cannot run in a transaction, hence COMMIT.
     op.execute("COMMIT")
     for view in ("metrics_1m", "metrics_1h"):
         op.execute(f"CALL refresh_continuous_aggregate('{view}', NULL, NULL)")

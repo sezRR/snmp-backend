@@ -1,15 +1,3 @@
-"""Refresh token repository.
-
-The access token is stateless and this table does not know about it. What lives
-here is the one credential long-lived enough to be worth revoking.
-
-Rotation is the reason for `replaced_by`. Every refresh mints a new token and
-marks the old one replaced, so a token presented twice is proof that a copy
-escaped — the legitimate client would already have moved on to its successor.
-The response to that is not to reject one request but to revoke the user's whole
-chain, since there is no way to tell the thief from the victim.
-"""
-
 from __future__ import annotations
 
 import uuid
@@ -57,10 +45,8 @@ def redeem(session: Session, jti: uuid.UUID) -> RefreshToken:
     if token is None:
         raise TokenReplayed("unknown refresh token")
     if token.revoked_at is not None:
-        # Already spent. The holder is either replaying or is the victim of one;
-        # both are answered by ending every session this user has — but not from
-        # here, because raising rolls this transaction back. The caller burns the
-        # chain separately; see TokenReplayed.
+        # Already spent: a replay, or its victim. Ending every session is the
+        # answer, but not from here — raising rolls this transaction back.
         raise TokenReplayed(
             "refresh token has already been used", burn_user_id=token.user_id
         )
@@ -77,8 +63,7 @@ def rotate(
 ) -> RefreshToken:
     """Revoke `old`, issue its successor, and link the two."""
     successor = record(session, new_jti, old.user_id, expires_at)
-    # Python-side rather than func.now(), for the same reason `updated_at` is —
-    # see app.db.tables._now.
+    # Python-side rather than func.now(); see app.db.tables._now.
     old.revoked_at = datetime.now(UTC)
     old.replaced_by = successor.jti
     return successor

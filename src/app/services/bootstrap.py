@@ -1,28 +1,3 @@
-"""Ensure the admin role, the admin account and the default credential exist.
-
-Runs on every boot, after migrations and before the app serves anything.
-
-This runs after migrations and before the app serves anything, and it raises on
-failure so the process exits. That is the intent: an API whose permission
-model is enforced everywhere is unusable if nobody holds the scopes, so a
-backend that cannot guarantee an administrator must not pretend to be up.
-
-The role is *reconciled*: its scope set is rewritten to exactly `ALL_SCOPES`
-every time. That is what lets a scope added to `app.security.scopes` reach the
-admin role through an ordinary deployment, with no migration and no data edit,
-and it heals a hand-edited database on the next restart.
-
-The user is *not* reconciled. Its password is written once, at creation. Anyone
-can change it afterwards through `/auth/me/password`, and rewriting it from the
-environment on every boot would silently revert that — while also requiring the
-plaintext to stay in `.env`. `ADMIN_PASSWORD_RESET=true` forces one
-rotation, for the case where the password is genuinely lost.
-
-The account is always re-activated and always re-granted the role, because an
-admin who deactivated themselves or dropped their own role would otherwise have
-locked everyone out permanently.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -59,8 +34,7 @@ def ensure_admin_role(session: Session) -> Role:
     role.is_system = True
     current = role.scope_set
     if current != ALL_SCOPES:
-        # Assigned wholesale rather than diffed: the target is a constant, so
-        # there is nothing a merge would preserve.
+        # Assigned wholesale: the target is a constant, nothing to merge.
         role.scopes = [RoleScope(scope=s) for s in sorted(ALL_SCOPES)]
         if current:
             log.info(
@@ -97,9 +71,8 @@ def bootstrap_blocking(session: Session, settings: Settings) -> None:
                 "ended its sessions — unset it before the next restart",
                 username,
             )
-        # Re-granted and re-activated unconditionally. These are the two ways an
-        # administrator can lock the whole deployment out of itself, and the
-        # environment is the only authority left to undo them.
+        # Re-granted unconditionally: this is the only way back from an admin
+        # locking the deployment out of itself.
         if role not in user.roles:
             user.roles = [*user.roles, role]
             log.warning("admin bootstrap: restored the %s role on %r", ADMIN_ROLE_NAME, username)

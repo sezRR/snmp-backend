@@ -1,37 +1,3 @@
-"""User accounts and their role grants.
-
-Four guardrails run through this module, and they are the reason the handlers
-are longer than CRUD:
-
-**No amplification.** A caller may only grant a role whose scopes they already
-hold. Without this, `users:write` is not one permission but all of them: its
-holder creates a user, grants it the admin role, and logs in as it. The subset
-check makes `users:write` mean what it says — the ability to delegate authority
-you already have.
-
-**No editing upwards.** The same subset test applied to the *target*: a caller
-may only edit an account whose scopes they already hold. Granting is not the
-only way to reach authority you lack — resetting an admin's password, or
-stripping their roles, gets there just as well. In practice this means the admin
-account can only be touched by somebody who is also an admin.
-
-**No editing yourself.** Not your own roles, not your own existence. This is
-partly a lockout guard and partly a review one: an account's privileges should
-be changed by somebody else.
-
-**Somebody keeps the lights on.** Every mutation that could remove the last
-holder of `users:write` is checked *after* the change, inside the transaction —
-see `app.db.users.guard_admins_remain` for why a pre-check would be racy.
-
-One thing the password reset gives away, deliberately: refusing a new password
-that equals the current one tells the caller they guessed it. That is worth
-knowing about, because the passwords people reuse elsewhere are the ones worth
-guessing — but it is not worth much, since the caller could simply reset the
-password and own the account outright. Answering "that is already the password"
-is the only way to refuse a reset that ends every session and changes nothing,
-so the refusal is logged instead of hidden.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -160,8 +126,7 @@ async def create_user(
     try:
         user = await db.run_session(_create)
     except IntegrityError as exc:
-        # The unique index is on lower(username), so this fires for a difference
-        # of case too — which is the point of it.
+        # The unique index is on lower(username), so case differences fire too.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"username {payload.username!r} is taken",
@@ -216,8 +181,8 @@ async def set_user_roles(
 
     def _set(session) -> User:
         user = _load(session, user_id)
-        # Both directions: this refuses stripping the admin's roles, and
-        # _resolve_roles below refuses granting a role you could not hold.
+        # Both directions: no stripping the admin's roles here, no granting a
+        # role you could not hold in _resolve_roles.
         _refuse_privileged_target(principal, user, "change the roles on")
         roles = _resolve_roles(session, payload.roles, principal)
         users_repo.set_roles(session, user, roles)
@@ -257,14 +222,12 @@ async def reset_user_password(
 
     def _reset(session) -> tuple[str, int]:
         user = _load(session, user_id)
-        # The escalation this closes: knowing a password is being that account,
-        # so resetting one is worth exactly the scopes the account holds.
+        # Resetting a password is worth exactly the scopes that account holds.
         _refuse_privileged_target(principal, user, "reset the password of")
         try:
             refuse_password_reuse(payload.new_password, user.password_hash)
         except HTTPException:
-            # Logged because this answer tells the caller something about the
-            # password they proposed — see the module docstring.
+            # Logged: this answer tells the caller something about the password.
             log.warning(
                 "%r proposed %r's current password as its new one",
                 principal.username,
@@ -275,9 +238,7 @@ async def reset_user_password(
         return user.username, user.session_epoch
 
     username, epoch = await db.run_session(_reset)
-    # This process stops accepting that account's outstanding access tokens
-    # without waiting out the cache TTL; any other process finds out the first
-    # time one is presented to it.
+    # Drops this process's cached epoch; others find out on the next token.
     epochs.remember(user_id, epoch)
     log.warning("%r reset %r's password", principal.username, username)
 
@@ -301,9 +262,7 @@ async def delete_user(
     except users_repo.LastAdminError as exc:
         raise _last_admin(exc) from exc
 
-    # There is no epoch to compare against any more, and a cached one would
-    # keep accepting the deleted account's access tokens for the rest of the
-    # window. Dropping it makes the next request read the row, find none, and
-    # refuse.
+    # A cached epoch would keep accepting a deleted account's tokens for the
+    # rest of the window.
     epochs.forget(user_id)
     log.warning("%r deleted user %r", principal.username, username)

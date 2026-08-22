@@ -1,10 +1,3 @@
-"""Machine registration and reads.
-
-The database row is half the answer; the rest — tenant, user, flavor and its
-specs — comes from the OpenStack lookup on every read, so nothing here can go
-stale against the real fleet.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -41,8 +34,7 @@ async def enrich(row: dict[str, Any], lookup: CachedOpenStack) -> Machine:
     try:
         server = await lookup.by_mac(row["mac"])
     except Exception as exc:
-        # The lookup being down degrades the response rather than failing it:
-        # the machine is still registered and still being polled.
+        # A lookup outage degrades the response; the machine is still polled.
         log.warning("openstack lookup unavailable: %s", exc)
         server = None
     return Machine(**row, openstack=server)
@@ -72,9 +64,8 @@ async def register_machine(
     try:
         server = await lookup.by_ipv4(ipv4)
     except Exception as exc:
-        # Without a MAC there is nothing to register: identity comes from the
-        # lookup. With one, the client has supplied everything we need, so the
-        # outage only costs us the classification — see below.
+        # Without a MAC there is no identity to register; with one, the outage
+        # only costs the classification.
         if supplied_mac is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -108,9 +99,8 @@ async def register_machine(
                 ),
             )
 
-    # External when OpenStack produced no record. If that was only because the
-    # lookup was down, the collector clears the flag on the first tick that
-    # resolves the MAC.
+    # External when OpenStack produced no record; the collector clears the flag
+    # on the first tick that resolves the MAC.
     external = server is None
     mac = normalise_mac(server.mac) if server is not None else supplied_mac
     try:
@@ -118,9 +108,8 @@ async def register_machine(
             machines_repo.insert, mac, ipv4, payload.label, external
         )
     except IntegrityError as exc:
-        # The MAC is free but the address is taken — same host registered under
-        # a MAC that has since changed in OpenStack. SQLAlchemy wraps psycopg2's
-        # UniqueViolation, so this is the exception to catch.
+        # Free MAC, taken address: the same host under a MAC that has since
+        # changed. SQLAlchemy wraps psycopg2's UniqueViolation.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"address {ipv4} is already registered",

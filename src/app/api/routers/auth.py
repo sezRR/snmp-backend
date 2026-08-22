@@ -1,24 +1,3 @@
-"""Login, token rotation, and self-service account management.
-
-`/auth/login` takes a form body rather than JSON because that is what OAuth2's
-password grant specifies, and following it is what makes Swagger's Authorize
-button work and any OAuth2 client library work unmodified.
-
-Two habits run through this module:
-
-* **Failures do not distinguish "no such user" from "wrong password".** Both
-  answer 401 with the same text, and the no-such-user path still pays for a
-  password verification, so the response time does not leak which it was.
-* **Anything that invalidates a credential ends the sessions holding it, in the
-  same transaction.** Refresh tokens are rows and are revoked outright. Access
-  tokens are signed strings nobody can recall, so they carry the session epoch
-  they were minted under and are refused once the account's epoch moves past
-  them — see `app.services.sessions`.
-* **Failed logins are counted, and past a limit answered 429 without doing the
-  work.** The counters live in `app.services.ratelimit`; the reason they exist
-  is that a constant-time 401 is still an invitation to keep guessing.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -71,9 +50,8 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-# Verified against when the username does not exist, so a login attempt costs
-# the same either way. Computed once at import; the value is never a real
-# password's hash.
+# Verified against when the username does not exist, so a login costs the same
+# either way. Never a real password's hash.
 _DUMMY_HASH = hash_password_blocking(uuid.uuid4().hex)
 
 _BAD_CREDENTIALS = HTTPException(
@@ -155,9 +133,8 @@ async def login(
     """
     wait = limiter.retry_after(form.username, client_ip)
     if wait is not None:
-        # Same answer whether or not the username exists, like _BAD_CREDENTIALS:
-        # a counter that only ever appeared for real accounts would enumerate
-        # them.
+        # Same answer either way: a counter that only appeared for real
+        # accounts would enumerate them.
         log.warning(
             "throttled login for %r from %s (%.0fs remaining)",
             form.username,
@@ -179,23 +156,19 @@ async def login(
         limiter.record_failure(form.username, client_ip)
         raise _BAD_CREDENTIALS
     if not user.is_active:
-        # Same response as a wrong password: whether an account is disabled is
-        # not something an unauthenticated caller needs to learn. Counted too —
-        # a disabled account is exactly what a stolen password looks like.
+        # Same response as a wrong password, and counted: a disabled account is
+        # what a stolen password looks like.
         log.info("login refused for inactive user %r", user.username)
         limiter.record_failure(form.username, client_ip)
         raise _BAD_CREDENTIALS
 
-    # The password was right, so the failures before it were this user's own
-    # typing. The address keeps its count: clearing it would give anyone holding
-    # one valid account an unlimited budget against every other.
+    # The address keeps its count: clearing it would give one valid account an
+    # unlimited budget against every other.
     limiter.record_success(form.username)
 
     if new_hash is not None:
-        # The stored hash predates a cost increase; upgrade it while we have the
-        # plaintext, which is the only moment it is possible. Deliberately not
-        # `set_password`: the password did not change, and ending this user's
-        # sessions because they logged in would be a strange way to thank them.
+        # Upgrade the hash while the plaintext is here, which is the only
+        # moment possible. Not `set_password`: the password did not change.
         await db.run_session(users_repo.store_password_hash, user, new_hash)
 
     log.info("login for %r", user.username)
@@ -236,8 +209,7 @@ async def refresh(db: DbDep, settings: SettingsDep, payload: RefreshRequest) -> 
         user = await db.run_session(_rotate)
     except tokens_repo.TokenReplayed as exc:
         if exc.burn_user_id is not None:
-            # A second transaction on purpose: the one above rolled back, and
-            # this revocation must survive.
+            # A second transaction: the one above rolled back, this must survive.
             burned = await db.run_session(users_repo.revoke_all_tokens, exc.burn_user_id)
             log.warning(
                 "refresh token replayed for %r; revoked %s live session(s)",
@@ -273,8 +245,7 @@ async def logout(
     try:
         decoded = decode_token(settings, payload.refresh_token, REFRESH)
     except TokenError:
-        # Already unusable. Logging out is idempotent by nature; a client
-        # clearing its state should not have to handle an error here.
+        # Already unusable, and logging out is idempotent.
         return
 
     def _revoke(session) -> None:
@@ -316,10 +287,8 @@ async def change_own_password(
     the caller is not logged out of the session they made the change from.
     """
     check_password_policy(settings, payload.new_password)
-    # Plaintext comparison rather than a second Argon2 verify: the current
-    # password is checked against the stored hash below, so two equal plaintexts
-    # is exactly the case where the change is a no-op. Both strings came from
-    # this caller, so there is nothing to leak by comparing them directly.
+    # Plaintext comparison, not a second Argon2 verify: both strings came from
+    # this caller, and equal plaintexts mean the change is a no-op.
     if payload.new_password == payload.current_password:
         raise _SAME_PASSWORD
 
@@ -336,12 +305,11 @@ async def change_own_password(
         )
 
     new_hash = await hash_password(payload.new_password)
-    # set_password revokes every refresh token for this user and bumps the
-    # session epoch, which between them invalidate every credential the account
-    # is holding — including the caller's own. Hence the fresh pair below.
+    # set_password revokes every token and bumps the epoch, the caller's own
+    # included — hence the fresh pair below.
     await db.run_session(users_repo.set_password, user, new_hash)
-    # Before the pair is minted, so the token this response carries is never
-    # measured against the epoch it replaced.
+    # Before the pair is minted, so this response's token is never measured
+    # against the epoch it replaced.
     epochs.remember(user.id, user.session_epoch)
     log.info("%r changed their password", user.username)
     return await issue_pair(db, settings, user)

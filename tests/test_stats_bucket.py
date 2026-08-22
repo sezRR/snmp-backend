@@ -1,12 +1,3 @@
-"""Bucket presets and the width an omitted `?bucket=` resolves to.
-
-`/metrics/stats` answers windows from an hour to two years out of three sources.
-A fixed default width cannot serve that: five minutes is twelve points over an
-hour and eight thousand over a month, one of which is unreadable and the other
-of which the row cap rejects. `StatsBucket.at_least` is what fits the width to
-the window instead — and the same call floors it at what a rollup can resolve.
-"""
-
 from unittest import TestCase
 
 from app.api.routers.metrics import MAX_BUCKETS, TARGET_POINTS

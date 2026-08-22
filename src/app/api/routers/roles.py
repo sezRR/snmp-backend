@@ -1,22 +1,3 @@
-"""Roles, and the fixed scope catalogue they are composed from.
-
-Roles are addressed by name rather than id. A role name is already unique, it is
-what appears in `/auth/me`, and `PUT /roles/viewer/scopes` is a URL somebody can
-type — the id buys nothing here that it does not cost in ergonomics.
-
-The same no-amplification rule as `users` applies: a caller cannot create or
-edit a role holding scopes they do not themselves hold. Without it, `roles:write`
-would silently be every permission, since its holder could mint an admin-shaped
-role and have someone with `users:write` grant it.
-
-It is checked in both directions, as in `users`. The scopes *going in* to a role
-must be ones the caller holds, and so must the ones already *on* the role being
-edited or deleted — otherwise `roles:write` would still let its holder rewrite
-the authority of people above them, which is a different attack with the same
-ending. The built-in admin role is doubly covered: it holds every scope, so only
-an admin passes the subset test, and its scopes are fixed regardless.
-"""
-
 from __future__ import annotations
 
 import logging

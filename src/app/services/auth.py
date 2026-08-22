@@ -1,23 +1,3 @@
-"""Password hashing and JWT minting.
-
-No database and no HTTP here — this module turns secrets into strings and back,
-and nothing else. The repositories in `app.db.users` and `app.db.tokens` own
-persistence; `app.api.security` owns turning a request into a principal.
-
-**Two token types, deliberately asymmetric.** The access token is stateless: it
-carries the caller's scopes and is verified with nothing but the signing key, so
-an authenticated request costs zero queries — which is what makes it affordable
-on the SSE routes. The price is that revocation cannot be immediate, so it is
-short-lived. The refresh token is the opposite: long-lived, carries no
-authority of its own, and every one is recorded by `jti` so a session can be
-killed. Anything that must take effect at once — disabling a user, changing a
-password — revokes refresh tokens and waits out the access token's few minutes.
-
-Argon2 is tuned to OWASP's floor (19 MiB, t=2, p=1) rather than the library
-default (64 MiB, t=3, p=4). Two concurrent logins at the default would ask for
-128 MiB inside a container limited to 512 MiB while the collector is also running.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -52,9 +32,8 @@ class DecodedToken:
     jti: uuid.UUID
     token_type: str
     expires_at: datetime
-    # The value of users.session_epoch when this was minted. Absent from tokens
-    # older than the column, which read as 0 — the default — and so keep working
-    # until they expire rather than being refused on deploy.
+    # users.session_epoch at minting. Absent on older tokens, which read as 0
+    # and keep working until they expire.
     epoch: int = 0
 
 
@@ -75,8 +54,7 @@ def verify_password_blocking(password: str, password_hash: str) -> tuple[bool, s
     try:
         return _hasher.verify_and_update(password, password_hash)
     except Exception:
-        # A hash this build cannot parse — a downgraded deployment, a truncated
-        # column — is a failed login, not a 500.
+        # An unparseable hash is a failed login, not a 500.
         log.warning("could not verify a stored password hash")
         return False, None
 
@@ -184,9 +162,8 @@ def decode_token(settings: Settings, token: str, expected_type: str) -> DecodedT
         raise TokenError(str(exc)) from exc
 
     if claims.get("type") != expected_type:
-        # Without this an access token would be accepted at /auth/refresh and a
-        # refresh token — which carries no scopes, and so would be read as
-        # holding none — would 403 confusingly instead of 401.
+        # Otherwise an access token would pass /auth/refresh, and a scopeless
+        # refresh token would 403 instead of 401.
         raise TokenError(f"expected a {expected_type} token")
 
     try:
@@ -202,7 +179,6 @@ def decode_token(settings: Settings, token: str, expected_type: str) -> DecodedT
         jti=jti,
         token_type=expected_type,
         expires_at=datetime.fromtimestamp(claims["exp"], UTC),
-        # A token minted before the epoch existed carries no "ep" and reads as
-        # 0, which is the column's default: it keeps working until it expires.
+        # A token minted before the epoch existed reads as 0, the column default.
         epoch=int(claims.get("ep", 0)),
     )

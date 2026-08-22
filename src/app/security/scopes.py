@@ -1,21 +1,3 @@
-"""The permission vocabulary.
-
-Scopes are fixed in code and have no table. They name capabilities the API
-actually implements, so the set can only change when a deployment adds or
-removes an endpoint — a catalogue table would be a second source of truth with
-nothing to say that this file does not, and one more thing that could disagree.
-
-Roles, by contrast, *are* data: an admin composes them out of these scopes
-through `/roles`, and `role_scopes` records the result. Scope strings coming in
-over HTTP are validated against `Scope` on write, so a typo is a 422 rather than
-a grant that silently never matches.
-
-`admin` is not special-cased anywhere in the checker. It is an ordinary role
-that happens to hold every scope, reconciled on each boot by
-`app.services.bootstrap` — which means a scope added to this enum lands on the
-admin role at the next restart, with no migration and no data edit.
-"""
-
 from __future__ import annotations
 
 from enum import StrEnum
@@ -38,8 +20,7 @@ class Scope(StrEnum):
 
 ALL_SCOPES: frozenset[str] = frozenset(str(s) for s in Scope)
 
-# Shown in Swagger's Authorize dialog and returned by GET /scopes, which is what
-# a role-editing UI would build its checkboxes from.
+# Shown in Swagger's Authorize dialog and returned by GET /scopes.
 SCOPE_DESCRIPTIONS: dict[str, str] = {
     Scope.MACHINES_READ: "List and read registered machines",
     Scope.MACHINES_WRITE: "Register, patch and deregister machines",
@@ -59,19 +40,13 @@ SCOPE_DESCRIPTIONS: dict[str, str] = {
 
 ADMIN_ROLE_NAME = "admin"
 
-# The scope that can mint more admins. Losing every holder of it is the one
-# unrecoverable state, so the user and role endpoints guard it specifically.
+# The scope that mints more admins: losing every holder is unrecoverable.
 ADMIN_GATE_SCOPE = str(Scope.USERS_WRITE)
 
-# `credentials:write` is separate from `machines:write` on purpose, and the
-# split is a security boundary rather than tidiness. Credentials are shared
-# across machines, so binding one to a machine decides which host the collector
-# will authenticate to with a fleet-wide secret. A holder of `machines:write`
-# alone can register a machine at any address they like; if that were also
-# enough to point a credential at it, they could stand up an agent, collect an
-# authenticated SNMPv3 exchange, and attack the passphrase offline. Registering
-# is therefore the low-privilege operation and binding is the high-privilege
-# one.
+# `credentials:write` is a security boundary, not tidiness: binding a shared
+# credential decides which host the collector authenticates to with a
+# fleet-wide secret, and a hostile agent can attack that exchange offline.
+# Registering is the low-privilege half, binding the high-privilege one.
 
 
 def unknown_scopes(candidates: list[str]) -> list[str]:

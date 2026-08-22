@@ -50,10 +50,9 @@ class MachineRow(BaseModel):
     label: str | None
     enabled: bool
     external: bool
-    # Which SNMP credential the collector polls this machine with. None means it
-    # is not polled at all: there is no fallback community string any more, so an
-    # unbound machine waits for someone with `credentials:write` to bind one.
-    # Bound through PUT /machines/{mac}/snmp-credential, never through PATCH.
+    # What the collector polls this machine with. None means not polled: there
+    # is no fallback community string. Bound through
+    # PUT /machines/{mac}/snmp-credential, never PATCH.
     credential_id: UUID | None = None
     created_at: datetime
     updated_at: datetime

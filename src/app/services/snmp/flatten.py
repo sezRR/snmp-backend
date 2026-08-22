@@ -1,36 +1,9 @@
-"""The payload/column mapping, in both directions.
-
-The sampler produces a nested reading with one entry per mount, per block
-device and per network interface. The database stores one flat row of scalars.
-This module is the only place that knows how one becomes the other, which is
-what keeps the translation testable without a database and keeps the column
-list from being spelled out in four files.
-
-Why the per-entity arrays are not stored: their members are ephemeral. A
-Kubernetes node has one `veth` per pod and the names change on every restart,
-so they can never become stable columns; `loop0`-`loop7` carry zeros; and ten
-of eleven mounts on a typical host are tmpfs under `/run`. They are still
-collected and still streamed live over SSE — `nest()` is only used for rows
-read back out of the database, where they no longer exist.
-
-Two of the aggregates here are recomputations rather than copies, and
-deliberately disagree with the scalars the sampler wrote:
-
-* Network totals sum physical interfaces only. `network.rx_bps` in the payload
-  sums every interface that is up and not loopback, which on a container host
-  counts the same packet once for the veth, once for the bridge and once for
-  the uplink.
-* `disk_max_used_pct` skips pseudo filesystems. A 100% full
-  `/run/credentials/getty@tty1.service` is not a full disk.
-"""
-
 from __future__ import annotations
 
 from typing import Any
 
-# Every metric column, in table order. `insert_many` binds exactly these, the
-# repository selects exactly these, and the migration backfills exactly these,
-# so adding a metric means editing this tuple and the two mappings below.
+# Every metric column, in table order: inserts, selects and the backfill all
+# bind exactly these, so a new metric edits this tuple and the two mappings.
 COLUMNS: tuple[str, ...] = (
     "cpu_usage_pct",
     "cpu_cores",
@@ -145,9 +118,8 @@ def flatten(
         for d in disks
         if d and not is_pseudo_mount(str(d.get("mount", "")), pseudo_mount_prefixes)
     ]
-    # Falling back to every mount rather than to nothing: a host whose only
-    # filesystems all look pseudo is more likely to be one this list does not
-    # describe than one with no disks.
+    # Fall back to every mount: a host whose filesystems all look pseudo is
+    # more likely undescribed by this list than diskless.
     if not real_mounts:
         real_mounts = [d for d in disks if d]
 
@@ -161,10 +133,8 @@ def flatten(
         for i in interfaces
         if is_physical_interface(str(i.get("name", "")), virtual_iface_prefixes)
     ]
-    # Rates sum only the interfaces that produced one, so a single wrapped
-    # counter does not drag the total down to a partial figure; byte counters
-    # sum the same physical set. Before this the two used different sets, which
-    # made the totals disagree with each other.
+    # Rates sum only interfaces that produced one, so a wrapped counter cannot
+    # drag the total down; byte counters sum the same physical set.
     rx_rated = [i for i in physical if _num(i.get("rx_bps")) is not None]
     tx_rated = [i for i in physical if _num(i.get("tx_bps")) is not None]
 
@@ -172,15 +142,9 @@ def flatten(
     if interval_seconds is None:
         interval_seconds = _num(network.get("interval_seconds"))
 
-    # Falling back to the section's own scalars when there is no array to reduce
-    # over. Two things arrive that way: a row read back out of the database and
-    # re-nested, which carries the totals and nothing else, and an agent that
-    # answers the totals but serves no interface or device table. Reducing an
-    # empty list would report None for a machine that did tell us the answer.
-    #
-    # The fallback cannot reintroduce the over-counting it replaces: it only
-    # fires when `interfaces` is empty, and the inflated scalar is only produced
-    # alongside a populated one.
+    # Fall back to the section's scalars when there is no array to reduce: a
+    # re-nested database row, or an agent with totals but no table. Safe from
+    # the over-counting it replaces, since it fires only on an empty array.
     if interfaces:
         net_rx_bps = _sum([i.get("rx_bps") for i in rx_rated])
         net_tx_bps = _sum([i.get("tx_bps") for i in tx_rated])
@@ -205,9 +169,8 @@ def flatten(
         else _num(disk_io.get("busy_percent_1min"))
     )
 
-    # A payload that already states the machine-level figure is believed over a
-    # reduction of the mounts it ships, which is what makes `nest` an exact
-    # inverse: a stored row knows its own maximum but carries only root.
+    # A stated machine-level figure beats a reduction of the mounts shipped,
+    # which is what makes `nest` an exact inverse.
     disk_max = _num(payload.get("disk_max_used_percent"))
     if disk_max is None:
         disk_max = _max([d.get("used_percent") for d in real_mounts])
@@ -321,12 +284,10 @@ def nest(row: dict[str, Any]) -> dict[str, Any]:
         "disk": [{"mount": ROOT_MOUNT, **root}] if root else [],
         "network": network,
     }
-    # Matching the sampler, which omits the key entirely rather than emitting an
-    # empty object when DISKIO is off.
+    # Matching the sampler, which omits the key rather than emitting an empty one.
     if disk_io:
         payload["disk_io"] = disk_io
-    # The fullest real filesystem, which is not necessarily root and has no
-    # place in the per-mount array — it is a machine-level reading.
+    # A machine-level reading, so not part of the per-mount array.
     if row.get("disk_max_used_pct") is not None:
         payload["disk_max_used_percent"] = row["disk_max_used_pct"]
     return payload

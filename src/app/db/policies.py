@@ -1,21 +1,3 @@
-"""Background jobs on the metrics hypertable and its rollups.
-
-These stay out of Alembic on purpose. Every window here is a setting, and a
-policy is a scheduled background job rather than a schema object: a migration
-would pin whichever window happened to be configured the day it was written, and
-`add_*_policy(..., if_not_exists => TRUE)` would then keep that first window and
-quietly ignore the changed setting. Dropping and re-adding on every boot makes
-the configuration authoritative, and is what keeps this safe to re-run.
-
-What is *not* here: the aggregates themselves, and the `timescaledb.compress`
-setting on each of them. Those are schema — they change what the database
-contains rather than when it is tidied — so revision 0004 owns them.
-
-A failure here is logged rather than raised. The schema is already applied and
-the app is functional without the policies — but say so loudly, because an
-unnoticed missing retention policy is how a disk fills up.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -30,22 +12,14 @@ from app.config import Settings
 
 log = logging.getLogger(__name__)
 
-# When each rollup's own chunks are compressed. Not settings: unlike the raw
-# window these are not a storage/detail tradeoff anyone tunes, they are just far
-# enough back that nothing is still writing to the chunk.
+# When each rollup's chunks compress. Not settings: just far enough back that
+# nothing is still writing to them.
 ROLLUP_1M_COMPRESS_AFTER = "7 days"
 ROLLUP_1H_COMPRESS_AFTER = "30 days"
 
-# How wide each rollup's own chunks are. TimescaleDB defaults a continuous
-# aggregate to ten times its source's chunk interval, which here means both
-# rollups inherit 40 hours from the raw table's 4. That is roughly right for the
-# minute rollup and badly wrong for the hourly one: 40 hours of hourly buckets
-# is 40 rows per machine per chunk, so a two year retention would accumulate
-# ~440 chunks whose per-chunk overhead dwarfs what they hold, and a query
-# spanning the full window has to plan across every one of them.
-#
-# Sized instead by how much each holds: a day of minute buckets is 1440 rows per
-# machine, a month of hourly buckets is 720.
+# Chunk width per rollup. TimescaleDB's default (10x the source interval) gives
+# both 40 hours, which for hourly buckets is 40 rows a chunk and ~440 chunks at
+# two years. Sized by content instead: 1440 minute rows a day, 720 hourly a month.
 ROLLUP_1M_CHUNK_INTERVAL = "1 day"
 ROLLUP_1H_CHUNK_INTERVAL = "30 days"
 

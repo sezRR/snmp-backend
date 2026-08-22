@@ -1,5 +1,3 @@
-"""Application entrypoint: `uvicorn app.main:app`."""
-
 from __future__ import annotations
 
 import logging
@@ -57,37 +55,30 @@ async def lifespan(app: FastAPI):
     collector = None
     try:
         if settings.db_auto_migrate:
-            # Retries internally because Postgres may still be finishing initdb.
-            # Also takes an advisory lock, so processes starting together do not
-            # race each other through the same revision.
+            # Retries past initdb and takes an advisory lock, so processes
+            # starting together do not race the same revision.
             await run_migrations(db.engine, settings)
 
-        # Not schema, and so not Alembic's: both windows are settings, re-applied on
-        # every boot so the configuration stays authoritative.
+        # Settings, not schema: re-applied every boot so config stays authoritative.
         await apply_policies(db.engine, settings)
 
-        # Raises if it cannot guarantee an administrator, which aborts startup. An
-        # API with permissions enforced everywhere and nobody holding them is worse
-        # than one that refuses to come up.
+        # Raises if it cannot guarantee an administrator, aborting startup.
         await bootstrap_admin(db, settings)
 
         app.state.cipher = CredentialCipher.from_settings(settings)
-        # Seeds the default v2c profile from SNMP_COMMUNITY on the first boot that
-        # finds none, and binds the machines that predate credentials. Not a
-        # migration: Alembic runs without the key ring, and this needs to encrypt.
+        # Seeds the default v2c profile on the first boot that finds none. Not a
+        # migration: Alembic runs without the key ring, and this encrypts.
         await bootstrap_credentials(db, settings, app.state.cipher)
         app.state.credentials = CredentialCache(db, app.state.cipher)
 
         app.state.bus = MetricBus(queue_maxsize=settings.sse_queue_maxsize)
         # In-process, like the bus a stream reads from.
         app.state.stream_tickets = StreamTickets(settings.stream_ticket_ttl_seconds)
-        # A cache, not a source of truth: users.session_epoch is, and a token
-        # that disagrees with what is cached is checked against the row itself.
+        # A cache only: a token disagreeing with it is checked against the row.
         app.state.session_epochs = SessionEpochs(
             db, settings.session_epoch_cache_ttl_seconds
         )
-        # Also per-process: with more than one each carries its own counters, so
-        # the effective limit is multiplied by the process count.
+        # Per-process, so the effective limit multiplies by the process count.
         app.state.login_limiter = LoginRateLimiter(
             max_per_user=settings.login_rate_limit_max_per_user,
             max_per_ip=settings.login_rate_limit_max_per_ip,
@@ -136,13 +127,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
 
-    # CORS_ALLOW_ORIGINS, comma separated. Exact matches only — scheme, host and
-    # port all count.
+    # Comma separated, exact matches only: scheme, host and port all count.
     origins = settings.allowed_origins
     if "*" in origins:
-        # Starlette answers a credentialed request by echoing the caller's own
-        # origin rather than a literal `*`, so this is not "no CORS" — it is
-        # "every site is trusted with the user's cookies". Log it loudly.
+        # With credentials, Starlette echoes the caller's origin instead of `*`:
+        # every site becomes trusted. Log it loudly.
         log.warning(
             "CORS_ALLOW_ORIGINS contains '*' while credentials are allowed; "
             "any origin can make authenticated requests. List real origins instead."
@@ -154,10 +143,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_credentials=True,  # Support cookies & authentication headers
         allow_methods=["*"],  # Allow all standard HTTP methods (GET, POST, etc.)
         allow_headers=["*"],  # Allow all custom request headers
-        # A browser cannot read a response header it was not handed. These two
-        # carry what `/metrics/stats` resolved a request to — the bucket width
-        # after fitting and flooring, and the table it was answered from — which
-        # a chart needs to label itself.
+        # A browser cannot read a header it was not handed. These two carry the
+        # resolved bucket width and source, which a chart needs to label itself.
         expose_headers=["X-Metrics-Bucket", "X-Metrics-Source"],
     )
 
@@ -169,8 +156,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(roles.router)
     app.include_router(machines.router)
     app.include_router(credentials.router)
-    # Same /machines prefix as the machines router, carrying the credential
-    # sub-resource. Separate because its routes are gated on credentials:write.
+    # The credential sub-resource of /machines, gated on credentials:write.
     app.include_router(credentials.machine_router)
     app.include_router(metrics.router)
     app.include_router(stream.router)

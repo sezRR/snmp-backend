@@ -1,9 +1,3 @@
-"""Request-scoped accessors for the objects built in the lifespan.
-
-They live on `app.state`, so these exist to keep `request.app.state.…` and its
-`RuntimeError` handling out of every endpoint.
-"""
-
 from __future__ import annotations
 
 from typing import Annotated

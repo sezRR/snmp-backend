@@ -1,14 +1,3 @@
-"""Role repository.
-
-Same convention as `users`: takes a `Session`, called through
-`Database.run_session`, one transaction per function.
-
-Roles are the only part of the permission model that is data. The scopes they
-hold are validated against `app.security.scopes.Scope` by the router before
-anything gets here, so a `RoleScope` row can be trusted to name a real
-capability.
-"""
-
 from __future__ import annotations
 
 import uuid
@@ -75,8 +64,7 @@ def set_scopes(session: Session, role: Role, scopes: list[str]) -> None:
     if role.is_system:
         raise SystemRoleError(f"the {role.name} role's scopes are fixed")
     role.scopes = [RoleScope(scope=s) for s in sorted(set(scopes))]
-    # Editing a role can strip the admin scope from everyone who holds it, which
-    # is the same lockout as deleting the last admin user.
+    # Editing a role can strip the admin scope from everyone holding it.
     guard_admins_remain(session)
 
 

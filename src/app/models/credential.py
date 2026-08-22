@@ -1,15 +1,3 @@
-"""SNMP credential payloads and the credential the sampler actually uses.
-
-The read model is the point of this module: `SnmpCredential` has no field that
-could hold a secret. Not a redacted one, not an optional one — the API cannot
-return a passphrase because there is nowhere in the response type to put it.
-That is deliberately structural rather than a `.pop()` somewhere in a handler,
-because a `.pop()` is one refactor away from being forgotten.
-
-`ResolvedCredential` is the other end: plaintext, in memory, never serialised.
-It exists only between `app.services.credentials` and the sampler.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -49,11 +37,9 @@ class PrivProtocol(StrEnum):
     AES256 = "AES256"
 
 
-# Broken, not merely dated. MD5 and DES are both trivially attackable today, and
-# noAuthNoPriv is SNMPv3 with the security switched off — which is v2c with
-# extra steps and no community string to at least fumble. They stay reachable
-# because plenty of deployed snmpd builds support nothing else, but only with
-# `allow_weak` set, so nobody arrives at them by leaving a field at its default.
+# Broken, not merely dated: MD5 and DES are trivially attackable and
+# noAuthNoPriv is v3 with the security off. Reachable only with `allow_weak`,
+# because deployed snmpd builds still exist that support nothing else.
 WEAK_AUTH_PROTOCOLS = frozenset({AuthProtocol.MD5})
 WEAK_PRIV_PROTOCOLS = frozenset({PrivProtocol.DES})
 
@@ -183,8 +169,7 @@ class SnmpCredentialUpdate(BaseModel):
 
     name: str | None = Field(default=None, min_length=1, max_length=200)
     description: str | None = Field(default=None, max_length=1000)
-    # Omitted means "whatever it already is". Present means the profile is
-    # changing protocol, which is a full replacement of the USM shape anyway.
+    # Omitted keeps the current value; present replaces the whole USM shape.
     snmp_version: SnmpVersion | None = None
     community: str | None = None
     username: str | None = Field(default=None, max_length=200)
@@ -226,9 +211,8 @@ class SnmpCredential(BaseModel):
     auth_protocol: AuthProtocol | None
     priv_protocol: PrivProtocol | None
     secret_version: int
-    # Keyed HMAC of the secret, truncated. Lets a client tell two profiles apart,
-    # and tell whether a rotation actually changed anything, without the API ever
-    # returning what is inside.
+    # Truncated keyed HMAC: tells two profiles apart, and whether a rotation
+    # changed anything, without returning the secret.
     fingerprint: str
     created_at: datetime
     updated_at: datetime
@@ -287,8 +271,7 @@ class ResolvedCredential:
         return (self.id, self.secret_version)
 
     def __repr__(self) -> str:
-        # The default dataclass repr would put both passphrases into any
-        # traceback that happens to hold one of these.
+        # The default repr would put both passphrases into any traceback.
         return (
             f"ResolvedCredential(id={self.id}, name={self.name!r}, "
             f"snmp_version={self.snmp_version}, secret_version={self.secret_version})"

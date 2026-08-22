@@ -1,26 +1,3 @@
-"""Bring the database up to the latest revision.
-
-Runnable two ways, exactly as `schema.sql` was before it:
-
-* from the app's lifespan when `DB_AUTO_MIGRATE=true` (the default), reusing the
-  application's own engine, and
-* standalone, `python -m app.db.migrate`, for an installation that would rather
-  not have its application processes touch DDL at all.
-
-Two things wrap the upgrade.
-
-**Retries.** On a cold start the app may run before Postgres finishes `initdb`,
-so a refused connection is expected rather than fatal for the first few seconds.
-
-**An advisory lock.** `alembic upgrade` is not safe to run concurrently: two
-processes starting together both read the same current revision, both run the
-same migration, and the loser gets a duplicate key on `alembic_version` — or,
-worse, half-applies DDL that the first replica already applied. A session-level
-advisory lock serialises them, and the process that waits finds the work already
-done and does nothing. There is one process today; the lock costs a round trip
-and removes the trap before someone scales up.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -40,8 +17,7 @@ log = logging.getLogger(__name__)
 
 MIGRATIONS_PATH = Path(__file__).with_name("migrations")
 
-# Arbitrary but fixed: any other process taking this same key is, by definition,
-# also migrating this database.
+# Arbitrary but fixed: anyone else holding it is also migrating this database.
 ADVISORY_LOCK_KEY = 8891274401
 
 
@@ -61,8 +37,7 @@ def upgrade_to_head_blocking(engine: Engine, settings: DatabaseSettings) -> None
     """Take the lock, upgrade, release. Blocking."""
     cfg = alembic_config(settings)
     with engine.connect() as lock_conn:
-        # Session-level, so it outlives the upgrade's own transaction and is
-        # released explicitly below rather than at the first commit.
+        # Session-level, so it outlives the upgrade's own transaction.
         lock_conn.execute(
             text("SELECT pg_advisory_lock(:key)"), {"key": ADVISORY_LOCK_KEY}
         )
@@ -107,8 +82,7 @@ def main() -> None:
     from app.db.pool import Database
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
-    # DatabaseSettings, not Settings: a migration process should not need the API's
-    # signing key or an admin password to do its one job.
+    # DatabaseSettings, not Settings: a migration needs no signing key.
     settings = get_database_settings()
     db = Database(settings)
     db.connect()

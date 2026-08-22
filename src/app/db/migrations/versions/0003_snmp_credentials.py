@@ -1,28 +1,4 @@
-"""SNMP credential profiles, and the machine binding that uses them.
-
-Revision ID: 0003
-Revises: 0002
-Create Date: 2026-08-16
-
-Two decisions are visible in what this revision does *not* do.
-
-**No data step.** The obvious migration would copy `SNMP_COMMUNITY` into a
-`default-v2c` profile here and bind every existing machine to it. It does not,
-because that value would have to be encrypted, and Alembic loads
-`DatabaseSettings` (see `app.config`) — which deliberately carries no key ring.
-Reaching for the app's crypto from inside a revision would drag the encryption
-key into every migration process that was designed not to need one. The seeding
-happens in `app.services.bootstrap` instead, which already runs once per boot
-with the full `Settings` in hand and already reconciles data of exactly this
-kind.
-
-**`machines.credential_id` is nullable.** It has to be: this revision runs
-before anything has been seeded, so for one moment every machine is unbound. It
-stays nullable afterwards because unbound is a real state — a freshly registered
-machine has no credential until someone with `credentials:write` gives it one,
-and the collector reports that per machine rather than guessing.
-"""
-
+"""SNMP credential profiles, and the machine binding that uses them."""
 from __future__ import annotations
 
 import sqlalchemy as sa

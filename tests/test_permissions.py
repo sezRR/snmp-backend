@@ -1,11 +1,3 @@
-"""The no-editing-upwards guardrail, on both users and roles.
-
-The handlers are called directly, with a fake session standing in for the two
-repository reads they make before the guard fires. That is enough: every one of
-these paths must refuse before it reaches a write, so a test that gets as far as
-needing a real transaction has already failed.
-"""
-
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase

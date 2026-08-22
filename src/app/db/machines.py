@@ -1,16 +1,3 @@
-"""Machine repository.
-
-Every function takes a `Connection` as its first argument and blocks, so it is
-called through `Database.run_query`, which supplies the connection from the pool
-and runs the call in the threadpool.
-
-The SQL is hand-written rather than built from the ORM mapping in `db.tables`:
-`macaddr` and `inet` need casts on the way out (`mac::text`, `host(ipv4)`) for
-the Pydantic models to validate them, and `UPDATE ... RETURNING` with a
-CASE-guarded patch has no natural ORM spelling. Note that `text()` reads `:` as
-a bind marker, so every cast is written `CAST(x AS type)`.
-"""
-
 from __future__ import annotations
 
 from typing import Any
@@ -24,14 +11,10 @@ _COLUMNS = (
     "credential_id, created_at, updated_at"
 )
 
-# What the collector needs, and only the collector: the machine plus its
-# credential's identity and secret counter, which together are the sampler's
-# cache key. Joined rather than denormalised onto the machine so an edit to the
-# credential is picked up on the next tick without touching every bound row. The
-# ciphertext is deliberately absent — see `app.db.credentials`.
-#
-# Spelled out rather than built from `_COLUMNS` because `created_at` and
-# `updated_at` exist on both tables and would be ambiguous unqualified.
+# The collector's view: machine plus its credential's identity and secret
+# counter, which are the sampler's cache key. Joined, not denormalised, so an
+# edit lands on the next tick. Spelled out because `created_at`/`updated_at`
+# exist on both tables.
 _POLL_COLUMNS = (
     "CAST(m.mac AS text) AS mac, host(m.ipv4) AS ipv4, m.label, m.enabled, "
     "m.external, m.credential_id, m.created_at, m.updated_at, "

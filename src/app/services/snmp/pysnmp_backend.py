@@ -1,51 +1,3 @@
-"""Real SNMP sampling with pysnmp (v2c and v3).
-
-Walks HOST-RESOURCES-MIB, IF-MIB and UCD's DISKIO-MIB by numeric OID rather than
-by name, so the image needs no compiled MIB files:
-
-* `hrProcessorLoad` — one row per CPU, percent busy over the last minute;
-* `hrStorageTable` — one row per storage area, classified by `hrStorageType`
-  into physical memory and fixed disks. Sizes are in allocation units, so bytes
-  are `units * hrStorageAllocationUnits`.
-* `ifXTable` / `ifTable` — per-interface octet counters;
-* `diskIOTable` — per-block-device byte and operation counters.
-
-SNMP reports totals, not rates, so every throughput and IOPS figure is the delta
-against this process's previous sample of the same machine divided by the elapsed
-time. The first sample of a machine has nothing to subtract from and reports null
-rates.
-
-The three tables are walked concurrently, and the columns within each table are
-walked concurrently too. Done serially this is twenty-odd round trips per machine
-per tick, which is what decides whether a short interval is reachable at all.
-
-Every one of those subtrees has to be inside the agent's view, and the stock
-Debian/Ubuntu view (`system` plus `hrSystem` only) contains none of them. An agent
-left that way answers each walk with nothing at all, which arrives here as "no
-HOST-RESOURCES-MIB rows" rather than as a permission error:
-
-    view   fleet  included  .1.3.6.1.2.1.1            # system
-    view   fleet  included  .1.3.6.1.2.1.2            # ifTable
-    view   fleet  included  .1.3.6.1.2.1.25           # host resources
-    view   fleet  included  .1.3.6.1.2.1.31           # ifXTable
-    view   fleet  included  .1.3.6.1.4.1.2021.13.15   # diskIO
-
-DISKIO-MIB additionally needs an snmpd that ships the `ucd-snmp/diskio` module.
-Without it that walk comes back empty and the `disk_io` key is simply dropped.
-
-**One `SnmpEngine` per credential**, not one per process. pysnmp's LCD caches
-USM users on the engine under `(userName, securityEngineId)`
-(`hlapi/v3arch/asyncio/lcd.py`), and since we never set a security engine id,
-two credentials that share a `userName` — the same `monitor` account with
-different passphrases on two sets of hosts, which is an ordinary thing to
-configure — land on the same cache key. pysnmp copes by deleting and re-adding
-the user, mutating engine state that up to `COLLECTOR_CONCURRENCY` samples are
-using at that moment. The failures that produces are intermittent and
-load-dependent, which is the worst kind to debug. Separate engines have no
-shared cache to race on, and the cost is one engine per distinct credential, not
-per machine.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -92,9 +44,7 @@ from app.services.snmp.flatten import is_physical_interface
 
 log = logging.getLogger(__name__)
 
-# Our column values -> pysnmp's protocol objects. A dict rather than putting
-# pysnmp's names in the database, so the stored value stays a stable, readable
-# string that survives a pysnmp rename.
+# Column values -> pysnmp objects, so a pysnmp rename cannot change stored rows.
 AUTH_PROTOCOLS = {
     AuthProtocol.MD5: USM_AUTH_HMAC96_MD5,
     AuthProtocol.SHA: USM_AUTH_HMAC96_SHA,
@@ -123,15 +73,14 @@ HR_STORAGE_OTHER = "1.3.6.1.2.1.25.2.1.1"
 HR_STORAGE_RAM = "1.3.6.1.2.1.25.2.1.2"
 HR_STORAGE_FIXED_DISK = "1.3.6.1.2.1.25.2.1.4"
 
-# net-snmp files its extra memory readings under hrStorageOther and identifies
-# them only by description, so these strings are the whole contract. An agent
-# that names them differently falls back to the raw hrStorageUsed figure.
+# net-snmp files extra memory rows under hrStorageOther, named only by
+# description, so these strings are the whole contract.
 MEM_AVAILABLE_DESCR = "Available memory"
 MEM_BUFFERS_DESCR = "Memory buffers"
 MEM_CACHED_DESCR = "Cached memory"
 
-# IF-MIB. The 64-bit ifXTable counters are preferred: a 32-bit octet counter
-# wraps in under a minute on a 10G link, which no polling interval can follow.
+# IF-MIB. 64-bit ifXTable preferred: a 32-bit octet counter wraps in under a
+# minute on 10G.
 IF_DESCR = "1.3.6.1.2.1.2.2.1.2"
 IF_TYPE = "1.3.6.1.2.1.2.2.1.3"
 IF_SPEED = "1.3.6.1.2.1.2.2.1.5"
@@ -143,11 +92,8 @@ IF_HC_IN_OCTETS = "1.3.6.1.2.1.31.1.1.1.6"
 IF_HC_OUT_OCTETS = "1.3.6.1.2.1.31.1.1.1.10"
 IF_HIGH_SPEED = "1.3.6.1.2.1.31.1.1.1.15"
 
-# UCD DISKIO-MIB. Same 32-vs-64-bit story as IF-MIB, and worse: a 32-bit *byte*
-# counter wraps every 8.6 seconds on a device sustaining 500 MB/s, so the X
-# columns are strongly preferred. There is no 64-bit variant of the operation
-# counters, but those wrap after 4.29 billion operations, which no realistic
-# interval can miss.
+# UCD DISKIO-MIB. Worse than IF-MIB: a 32-bit byte counter wraps every 8.6s at
+# 500 MB/s. Operation counters have no 64-bit variant but wrap far slower.
 DISK_IO_DEVICE = "1.3.6.1.4.1.2021.13.15.1.1.2"
 DISK_IO_NREAD = "1.3.6.1.4.1.2021.13.15.1.1.3"
 DISK_IO_NWRITTEN = "1.3.6.1.4.1.2021.13.15.1.1.4"
@@ -163,16 +109,12 @@ IF_OPER_STATUS_UP = 1
 _COUNTER32_MODULUS = 2**32
 _COUNTER64_MODULUS = 2**64
 
-# Devices excluded from the host totals. The kernel reports a device-mapper or
-# md device *and* the disks underneath it, and a partition *and* its whole disk,
-# so summing every row would count the same I/O two or three times. They still
-# appear in `devices` with their own rates — they are just not added up.
+# Excluded from host totals: the kernel reports both a dm/md device and the
+# disks under it, so summing every row counts the same I/O twice.
 _VIRTUAL_DEVICE_PREFIXES = ("loop", "ram", "sr", "fd", "dm-", "md")
 _PARTITION_RE = re.compile(r"^(?:[hsvx]v?d[a-z]+\d+|nvme\d+n\d+p\d+|mmcblk\d+p\d+)$")
 
-# Counter baselines for a machine that has not been sampled in this long are
-# dropped. Long enough that a machine merely disabled for a while keeps its
-# baseline; short enough that a fleet with churn does not leak.
+# Baselines older than this are dropped, so a churning fleet does not leak.
 _COUNTER_TTL_SECONDS = 3600.0
 _PRUNE_EVERY_SECONDS = 300.0
 
@@ -312,9 +254,8 @@ def build_auth(credential: ResolvedCredential) -> Any:
     if credential.snmp_version is SnmpVersion.V2C:
         return CommunityData(credential.community, mpModel=1)  # mpModel=1 → v2c
 
-    # Passphrases, not localized keys: pysnmp localizes them against whatever
-    # engine id discovery returns. Storing localized keys instead would pin each
-    # credential to one agent's engine id and defeat the point of sharing.
+    # Passphrases, not localized keys: a localized key would pin the credential
+    # to one agent's engine id.
     return UsmUserData(
         credential.username,
         authKey=credential.auth_passphrase,
@@ -350,19 +291,16 @@ class PySnmpSampler:
         self._max_repetitions = max_repetitions
         self._diskio_enabled = diskio_enabled
         self._virtual_iface_prefixes = virtual_iface_prefixes
-        # (credential id, secret version) -> its own engine and auth object.
-        # Keyed on the version too, so an edited passphrase builds a fresh
-        # engine rather than fighting pysnmp's USM cache over the old one.
+        # (credential id, secret version) -> engine, so an edited passphrase
+        # builds a fresh one instead of fighting pysnmp's USM cache.
         self._sessions: dict[tuple[UUID, int], _Session] = {}
         # Machine key (its MAC, not its address) -> previous counter read.
         self._counters: dict[str, _CounterState] = {}
-        # Address -> bulk size that host's path was found to tolerate. Keyed on
-        # the address rather than the MAC because it describes the network
-        # between here and there, which is what a re-IP actually changes.
+        # Address -> tolerated bulk size. Keyed on the address because it
+        # describes the path, which is what a re-IP changes.
         self._repetitions: dict[str, int] = {}
         self._last_prune = time.monotonic()
-        # Hosts already warned about, so a permanent condition logs once rather
-        # than every interval.
+        # Warned-about hosts, so a permanent condition logs once.
         self._warned_diskio32: set[str] = set()
 
     # ---- sessions -----------------------------------------------------------
@@ -378,9 +316,8 @@ class PySnmpSampler:
                 context=ContextData(),
             )
             self._sessions[key] = session
-            # Superseded versions of the same credential are dead the moment a
-            # new one is used: nothing is polling with the old passphrase any
-            # more, and holding the engine would hold its decrypted USM keys too.
+            # A superseded version is dead on first use of the new one, and its
+            # engine holds decrypted USM keys.
             for stale in [
                 k for k in self._sessions if k[0] == key[0] and k[1] != key[1]
             ]:
@@ -453,8 +390,7 @@ class PySnmpSampler:
                 return await self._walk_once(session, target, root_oid, repetitions)
             except _WalkTimeout:
                 if repetitions <= 1:
-                    # One row per response and it still does not arrive: this is
-                    # not a size problem, so report it as the timeout it is.
+                    # One row per response and still nothing: a timeout, not size.
                     raise
                 repetitions = max(1, repetitions // 2)
                 self._repetitions[host] = repetitions
@@ -505,8 +441,7 @@ class PySnmpSampler:
             "cores": len(cpu_values),
         }
 
-        # The memory rows net-snmp reports outside hrStorageRam, keyed by their
-        # description, so the physical-memory row can be corrected below.
+        # Memory rows outside hrStorageRam, keyed by description.
         memory_rows: dict[str, tuple[int, int]] = {}
 
         ram: dict[str, Any] = {}
@@ -566,9 +501,7 @@ class PySnmpSampler:
             IF_SPEED,
         )
 
-        # Second round, only for what the first round did not answer. Modern
-        # agents skip it entirely, and asking for the 32-bit counters
-        # unconditionally would put load on every agent to serve the minority.
+        # Second round for what the first did not answer; modern agents skip it.
         fallbacks: list[str] = []
         if not names:  # agents without ifXTable still have ifDescr
             fallbacks.append(IF_DESCR)
@@ -608,8 +541,8 @@ class PySnmpSampler:
                 rx_bps = _rate(was[0], rx_bytes, elapsed, modulus)
                 tx_bps = _rate(was[1], tx_bytes, elapsed, modulus)
 
-            # ifHighSpeed is Mbit/s and is 0 on agents that do not implement it;
-            # ifSpeed is bit/s and saturates at ~4.29 Gbit/s.
+            # ifHighSpeed is Mbit/s (0 when unimplemented); ifSpeed saturates
+            # at ~4.29 Gbit/s.
             link_bps = int(high_speed.get(index, 0) or 0) * 1_000_000
             if not link_bps:
                 link_bps = int(speed.get(index, 0) or 0)
@@ -631,16 +564,9 @@ class PySnmpSampler:
                 }
             )
 
-        # Host totals count physical interfaces only. A virtual interface never
-        # moves a packet off the machine by itself — whatever it carries also
-        # crosses a NIC — so summing both counts the same traffic twice. On a
-        # Kubernetes node, with a veth per pod plus a bridge and an overlay, the
-        # total came out several times the real uplink throughput.
-        #
-        # Rates still sum only the interfaces that produced one, so a single
-        # wrapped counter does not drag the total down to a partial figure. The
-        # byte counters now sum the same physical set rather than every
-        # interface, which is what stops the two from disagreeing.
+        # Physical interfaces only: a veth's traffic also crosses a NIC, so
+        # summing both counts it twice. Rates sum only interfaces that produced
+        # one, and byte counters sum the same physical set.
         physical = [
             i
             for i in interfaces
@@ -684,8 +610,7 @@ class PySnmpSampler:
         if not devices:
             raise SnmpError("no DISKIO-MIB rows")
 
-        # The 32-bit byte columns are a last resort: they wrap every 4.29 GB,
-        # which a device doing 500 MB/s manages in under nine seconds.
+        # 32-bit byte columns are a last resort: they wrap every 4.29 GB.
         narrow_bytes = not read_x
         if narrow_bytes:
             read_x, written_x = await self._walk_all(
@@ -724,8 +649,7 @@ class PySnmpSampler:
                 write_bps = _rate(
                     was[1], write_bytes, elapsed, byte_modulus, narrow_bytes
                 )
-                # Operation counters are 32-bit with no wide variant, but they
-                # wrap only after 4.29 billion operations — hours even on NVMe.
+                # 32-bit with no wide variant, but 4.29 billion ops is hours.
                 read_iops = _rate(was[2], reads, elapsed, _COUNTER32_MODULUS)
                 write_iops = _rate(was[3], writes, elapsed, _COUNTER32_MODULUS)
 
@@ -741,9 +665,7 @@ class PySnmpSampler:
                     "write_bps": write_bps,
                     "read_iops": read_iops,
                     "write_iops": write_iops,
-                    # diskIOLA1 is a one-minute average, so at a short interval
-                    # it lags the rates beside it by design. Named for what it
-                    # is rather than as a plain "busy_percent".
+                    # A one-minute average, so it lags the rates beside it.
                     "busy_percent_1min": float(busy) if busy is not None else None,
                     "counted": _counts_toward_total(name),
                 }
@@ -795,8 +717,7 @@ class PySnmpSampler:
             (ipv4, self._port), timeout=self._timeout, retries=self._retries
         )
 
-        # One clock read for the whole sample, taken before any walk, so the two
-        # rate groups agree on when this observation happened.
+        # One clock read before any walk, so both rate groups agree on when.
         now = time.monotonic()
         state = self._counters.get(key) or _CounterState()
 
@@ -811,8 +732,7 @@ class PySnmpSampler:
         host_result, net_result = results[0], results[1]
         dio_result = results[2] if self._diskio_enabled else None
 
-        # Host resources are the sample. Without them there is nothing to store,
-        # which is the one failure that propagates.
+        # The one failure that propagates: without these there is no sample.
         if isinstance(host_result, BaseException):
             raise host_result
         payload: dict[str, Any] = dict(host_result)
@@ -824,10 +744,8 @@ class PySnmpSampler:
             disks=state.disks,
         )
 
-        # An agent that serves HOST-RESOURCES-MIB but not IF-MIB or DISKIO-MIB
-        # still has a usable sample; drop the key rather than the sample. The
-        # failing table's baseline is left untouched so the next success
-        # measures across the real span instead of starting over.
+        # Drop the key, not the sample. The failing table keeps its baseline so
+        # the next success measures across the real span.
         if isinstance(net_result, BaseException):
             log.warning("no interface counters from %s: %s", ipv4, net_result)
             payload["network"] = {}

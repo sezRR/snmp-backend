@@ -1,11 +1,3 @@
-"""Request and response shapes for authentication, users and roles.
-
-The rule this file exists to enforce: `password_hash` never leaves the process.
-The ORM classes in `app.db.tables` carry it, so nothing maps them to responses
-automatically — every outbound model is built by an explicit `from_row`, and
-adding a column to `users` cannot leak it by accident.
-"""
-
 from __future__ import annotations
 
 import uuid

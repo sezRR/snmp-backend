@@ -1,5 +1,3 @@
-"""Metric history, aggregates and purges."""
-
 from __future__ import annotations
 
 import logging
@@ -32,22 +30,15 @@ MacQuery = Annotated[
     Query(description="Repeat to filter on several machines; omit for all"),
 ]
 
-# A chart is a few hundred pixels wide, not a few hundred thousand. Counted on
-# the *effective* bucket — the requested width after the source's floor — so a
-# two-year range at 30s buckets is judged on the hourly buckets it would really
-# return, not on the width that was typed.
+# Counted on the effective bucket, after the source's floor, so a long range at
+# 30s buckets is judged on the buckets it would really return.
 MAX_BUCKETS = 5_000
 
-# What an omitted `bucket` aims for. A fixed default cannot serve both ends of
-# the range — five minutes is twelve points over an hour and eight thousand over
-# a month — so the width is fitted to the window instead. 360 is a chart's worth
-# of detail at a payload a browser can hold several of; finer than that is
-# points stacked on the same pixel.
+# What an omitted `bucket` aims for: a fixed width cannot serve both an hour
+# and a month, so it is fitted to the window. 360 is a chart's worth.
 TARGET_POINTS = 360
 
-# Rows are buckets times machines, and the cap above counts buckets alone. This
-# is the other factor, which is why `/metrics/stats` names its machines rather
-# than defaulting to the whole fleet.
+# The other factor: rows are buckets times machines, so stats names its machines.
 MAX_MACS = 10
 
 
@@ -163,9 +154,8 @@ async def metric_stats(
         settings.metrics_rollup_1m_retention_days * 24,
     )
     span = (end - start).total_seconds()
-    # Flooring to a *preset* rather than to the source's own interval string is
-    # what lets the width be named back to the caller: "1h" is a bucket anyone
-    # can ask for again, "1 hour" was only ever a substitution inside the query.
+    # Flooring to a preset, not the source's interval string, so the width can
+    # be named back to the caller as something they can ask for again.
     chosen = bucket or StatsBucket.at_least(span / TARGET_POINTS)
     floor = StatsBucket.at_least(rollups.SOURCE_MIN_BUCKET_SECONDS[source])
     effective = max(chosen, floor, key=lambda preset: preset.seconds)

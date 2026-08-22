@@ -1,5 +1,3 @@
-"""Operational endpoints: collector status, OpenStack cache inspection and flush."""
-
 from __future__ import annotations
 
 import logging
