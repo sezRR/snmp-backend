@@ -15,7 +15,6 @@ class CollectorStatusTests(IsolatedAsyncioTestCase):
             collector_enabled=True,
             collector_interval_seconds=5.0,
             collector_sample_timeout_seconds=1.0,
-            snmp_simulate=True,
         )
         db = SimpleNamespace(run_query=AsyncMock(return_value=rows))
         lookup = SimpleNamespace(mac_index=AsyncMock(return_value={}))

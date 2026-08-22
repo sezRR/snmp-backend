@@ -96,9 +96,7 @@ async def lifespan(app: FastAPI):
         )
         lookup = build_lookup(settings)
         app.state.lookup = lookup
-        # The simulated sampler sizes each host from its OpenStack flavor, so its
-        # reported cores/RAM/disk agree with what /machines returns.
-        app.state.sampler = build_sampler(settings, lookup=lookup)
+        app.state.sampler = build_sampler(settings)
         collector = Collector(
             settings=settings,
             db=db,
@@ -185,10 +183,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "version": __version__,
             "docs": f"{settings.root_path}/docs",
             "collector_interval_seconds": settings.collector_interval_seconds,
-            "simulated": {
-                "snmp": settings.snmp_simulate,
-                "openstack": settings.openstack_simulate,
-            },
         }
 
     return app

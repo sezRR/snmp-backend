@@ -399,7 +399,6 @@ class Collector:
             "overrun_count": self.overrun_count,
             "sample_budget_seconds": self._sample_budget,
             "concurrency": self._settings.collector_concurrency,
-            "snmp_simulated": self._settings.snmp_simulate,
             "started_at": self.started_at,
             "tick_count": self.tick_count,
             "last_tick_at": self.last_tick_at,

@@ -392,7 +392,6 @@ async def test_credential(
             credential_id=None if ad_hoc else credential.id,
             duration_seconds=round(time.monotonic() - started, 3),
             detail="no answer within the sample budget",
-            simulated=settings.snmp_simulate,
         )
     except Exception as exc:
         # pysnmp reports "wrongDigests" for a bad auth passphrase and
@@ -404,7 +403,6 @@ async def test_credential(
             credential_id=None if ad_hoc else credential.id,
             duration_seconds=round(time.monotonic() - started, 3),
             detail=f"{type(exc).__name__}: {exc}",
-            simulated=settings.snmp_simulate,
         )
     finally:
         if ad_hoc:
@@ -421,13 +419,6 @@ async def test_credential(
         ipv4=ipv4,
         credential_id=None if ad_hoc else credential.id,
         duration_seconds=round(time.monotonic() - started, 3),
-        simulated=settings.snmp_simulate,
-        detail=(
-            "SNMP_SIMULATE is on: the simulator authenticated to nothing, so "
-            "this proves the binding, not the credential"
-            if settings.snmp_simulate
-            else None
-        ),
     )
 
 

@@ -79,9 +79,10 @@ def get_client_ip(request: Request) -> str | None:
 def get_cipher(request: Request) -> CredentialCipher:
     """The credential cipher, or a 503 if this deployment has no key ring.
 
-    `Settings` only demands one when `SNMP_SIMULATE=false`, so a simulated stack
-    can reach the credential endpoints with nothing to encrypt with. Better a
-    503 naming the missing variable than a 500 out of the crypto layer.
+    `Settings` refuses to start without a parseable ring, so this should be
+    unreachable. Kept because the cipher is built once at startup and the
+    endpoints below hand it plaintext passphrases: if it is ever unusable, a
+    503 naming the missing variable beats a 500 out of the crypto layer.
     """
     cipher: CredentialCipher = request.app.state.cipher
     if not cipher.usable:

@@ -438,61 +438,98 @@ class SDKOpenStackTests(IsolatedAsyncioTestCase):
         upstream.close.assert_called_once_with()
 
 
+# Every documented REQUIRED variable, so a settings test states the whole
+# contract in one place rather than only the OpenStack half of it.
+REQUIRED_ENVIRONMENT: dict[str, Any] = {
+    "pgdatabase": "snmpmetricsdb",
+    "pguser": "admin",
+    "pgpassword": "db-password",
+    "jwt_secret": "x" * 32,
+    "admin_username": "admin",
+    "admin_password": "admin-password",
+    "snmp_credential_keys": '{"k1": "%s"}' % ("00" * 32),
+    "snmp_credential_active_key": "k1",
+    "os_auth_url": "https://keystone.example/v3",
+    "os_username": "metrics-reader",
+    "os_user_id": "user-uuid",
+    "os_password": "reader-password",
+    "os_user_domain_id": "default",
+    "os_project_id": "project-uuid",
+}
+
+
 class OpenStackSettingsTests(TestCase):
     def _settings(self, **overrides: Any) -> Settings:
-        base: dict[str, Any] = {
-            "_env_file": None,
-            "jwt_secret": "x" * 32,
-            "admin_username": "admin",
-            "admin_password": "admin-password",
-            "openstack_simulate": False,
-            "os_auth_url": "https://keystone.example/v3",
-            "os_username": "metrics-reader",
-            "os_password": "reader-password",
-            "os_project_id": "project-uuid",
-        }
+        base: dict[str, Any] = {"_env_file": None, **REQUIRED_ENVIRONMENT}
         base.update(overrides)
         return Settings(**base)
 
-    def test_real_lookup_requires_password_credentials_and_network(self) -> None:
+    def test_every_required_variable_is_rejected_when_blank(self) -> None:
+        """A present-but-empty `KEY=` line must stop startup, not be a default."""
+        for field, name in (
+            ("pgdatabase", "PGDATABASE"),
+            ("pguser", "PGUSER"),
+            ("pgpassword", "PGPASSWORD"),
+            ("jwt_secret", "JWT_SECRET"),
+            ("admin_username", "ADMIN_USERNAME"),
+            ("admin_password", "ADMIN_PASSWORD"),
+            ("snmp_credential_keys", "SNMP_CREDENTIAL_KEYS"),
+            ("snmp_credential_active_key", "SNMP_CREDENTIAL_ACTIVE_KEY"),
+            ("os_auth_url", "OS_AUTH_URL"),
+            ("os_username", "OS_USERNAME"),
+            ("os_user_id", "OS_USER_ID"),
+            ("os_password", "OS_PASSWORD"),
+            ("os_user_domain_id", "OS_USER_DOMAIN_ID"),
+            ("os_project_id", "OS_PROJECT_ID"),
+        ):
+            with self.subTest(variable=name):
+                with self.assertRaises(ValidationError) as raised:
+                    self._settings(**{field: ""})
+
+                self.assertIn(name, str(raised.exception))
+
+    def test_an_absent_required_variable_is_rejected(self) -> None:
         with self.assertRaises(ValidationError) as raised:
-            Settings(
-                _env_file=None,
-                jwt_secret="x" * 32,
-                admin_username="admin",
-                admin_password="admin-password",
-                openstack_simulate=False,
-            )
+            Settings(_env_file=None)
+
+        message = str(raised.exception)
+        for field in ("pgdatabase", "pguser", "jwt_secret"):
+            self.assertIn(field, message)
+
+    def test_disabling_openstack_drops_the_keystone_requirement(self) -> None:
+        without_keystone = {
+            key: value
+            for key, value in REQUIRED_ENVIRONMENT.items()
+            if not key.startswith("os_")
+        }
+
+        settings = Settings(
+            _env_file=None, openstack_enabled=False, **without_keystone
+        )
+
+        self.assertFalse(settings.openstack_enabled)
+        self.assertEqual(settings.os_auth_url, "")
+
+    def test_keystone_values_are_still_required_when_openstack_is_enabled(
+        self,
+    ) -> None:
+        without_keystone = {
+            key: value
+            for key, value in REQUIRED_ENVIRONMENT.items()
+            if not key.startswith("os_")
+        }
+
+        with self.assertRaises(ValidationError) as raised:
+            Settings(_env_file=None, openstack_enabled=True, **without_keystone)
 
         message = str(raised.exception)
         self.assertIn("OS_AUTH_URL", message)
-        self.assertIn("OS_PASSWORD", message)
-        self.assertIn("OS_PROJECT_ID", message)
-
-    def test_real_lookup_requires_a_user_name_or_a_user_id(self) -> None:
-        with self.assertRaises(ValidationError) as raised:
-            self._settings(os_username="")
-
-        self.assertIn("OS_USER_ID or OS_USERNAME", str(raised.exception))
-
-    def test_a_user_name_without_a_domain_is_rejected(self) -> None:
-        with self.assertRaises(ValidationError) as raised:
-            self._settings(os_user_domain_id="")
-
-        self.assertIn("OS_USER_DOMAIN_ID", str(raised.exception))
-
-    def test_a_user_id_needs_no_domain(self) -> None:
-        settings = self._settings(
-            os_username="", os_user_id="user-uuid", os_user_domain_id=""
-        )
-
-        self.assertEqual(settings.os_user_id, "user-uuid")
+        self.assertIn("OPENSTACK_ENABLED=false", message)
 
     @patch("app.services.openstack.sdk.openstack")
     def test_factory_builds_a_password_connection(self, sdk: Mock) -> None:
         settings = self._settings(
             openstack_api_timeout_seconds=12.5,
-            os_user_domain_id="default",
             os_region_name="RegionOne",
             os_interface="internal",
             os_cacert="/var/run/secrets/openstack/ca.crt",
@@ -507,10 +544,9 @@ class OpenStackSettingsTests(TestCase):
             load_yaml_config=False,
             load_envvars=False,
             auth_url="https://keystone.example/v3",
-            username="metrics-reader",
+            user_id="user-uuid",
             password="reader-password",
             project_id="project-uuid",
-            user_domain_id="default",
             region_name="RegionOne",
             interface="internal",
             cacert="/var/run/secrets/openstack/ca.crt",
@@ -522,7 +558,8 @@ class OpenStackSettingsTests(TestCase):
 
     @patch("app.services.openstack.sdk.openstack")
     def test_a_user_id_replaces_the_name_and_domain(self, sdk: Mock) -> None:
-        settings = self._settings(os_username="", os_user_id="user-uuid")
+        """OS_USER_ID is required and unambiguous, so it is what goes on the wire."""
+        settings = self._settings()
 
         build_sdk_lookup(settings)
 
@@ -531,11 +568,46 @@ class OpenStackSettingsTests(TestCase):
         self.assertNotIn("username", credentials)
         self.assertNotIn("user_domain_id", credentials)
 
+    @patch("app.services.openstack.sdk.openstack")
+    def test_an_unset_interface_leaves_the_catalog_default(self, sdk: Mock) -> None:
+        build_sdk_lookup(self._settings())
+
+        self.assertIsNone(sdk.connect.call_args.kwargs["interface"])
+
     @patch("app.services.openstack.sdk.build_sdk_lookup")
-    def test_lookup_factory_selects_real_adapter(self, sdk_factory: Mock) -> None:
+    def test_lookup_factory_builds_the_sdk_adapter(self, sdk_factory: Mock) -> None:
         settings = self._settings()
 
         lookup = build_lookup(settings)
 
         self.assertIsInstance(lookup, CachedOpenStack)
+        self.assertTrue(lookup.enabled)
         sdk_factory.assert_called_once_with(settings)
+
+
+class DisabledOpenStackTests(IsolatedAsyncioTestCase):
+    def _disabled_settings(self) -> Settings:
+        without_keystone = {
+            key: value
+            for key, value in REQUIRED_ENVIRONMENT.items()
+            if not key.startswith("os_")
+        }
+        return Settings(_env_file=None, openstack_enabled=False, **without_keystone)
+
+    @patch("app.services.openstack.sdk.build_sdk_lookup")
+    async def test_disabled_lookup_answers_empty_without_touching_keystone(
+        self, sdk_factory: Mock
+    ) -> None:
+        lookup = build_lookup(self._disabled_settings())
+
+        self.assertIsInstance(lookup, CachedOpenStack)
+        self.assertFalse(lookup.enabled)
+        self.assertEqual(await lookup.servers(), [])
+        self.assertEqual(await lookup.mac_index(), {})
+        self.assertIsNone(await lookup.by_ipv4("10.0.0.11"))
+        sdk_factory.assert_not_called()
+
+    async def test_disabled_lookup_closes_without_a_connection(self) -> None:
+        lookup = build_lookup(self._disabled_settings())
+
+        lookup.close()  # no upstream connection to release

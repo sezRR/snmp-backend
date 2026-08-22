@@ -42,7 +42,7 @@ logs: ## Follow the app's logs
 ps: ## Show container and health status
 	$(COMPOSE) ps
 
-seed: ## Register the simulated OpenStack fleet
+seed: ## Register the starter fleet from scripts/seed_dev.py
 	$(COMPOSE) exec -T api python /app/scripts/seed_dev.py
 
 psql: ## Open a psql shell on the database

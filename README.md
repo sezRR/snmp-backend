@@ -43,14 +43,12 @@ sampler and "which credential is this machine using" always has an answer.
 Sharing is what makes rotation feasible and what makes binding dangerous, so
 binding is a scope of its own — see [SNMP credentials](#snmp-credentials).
 
-**Both external systems are simulated, behind interfaces.** `SNMP_SIMULATE` and
-`OPENSTACK_SIMULATE` pick a fake sampler and a fake fleet. The real OpenStack
+**Both external systems sit behind interfaces.** `SnmpSampler` and
+`OpenStackLookup` are protocols, so the pysnmp backend and the SDK adapter are
+each one implementation and nothing above them knows which. The OpenStack
 adapter is deliberately read-only: it lists Nova servers across projects,
 Keystone projects/users and Neutron ports/subnets, then translates those
-resources into the same `ServerInfo` returned by the simulator. It issues no
-create, update or delete operation. The simulated agent sizes each host from its
-OpenStack flavor, so an `m1.small` reports 1 core and 2 GiB rather than
-contradicting itself.
+resources into `ServerInfo`. It issues no create, update or delete operation.
 
 No network is singled out. Every network a server is attached to is walked in
 Nova's own order and the first *fixed* IPv4 carrying a MAC is taken — floating
@@ -92,8 +90,8 @@ inventory.
 | `src/app/services/auth.py` | Argon2 hashing and JWT minting |
 | `src/app/services/bootstrap.py` | Ensures the admin role, account and `default-v2c` credential exist |
 | `src/app/services/credentials.py` | Decrypted-credential cache, keyed on `(id, secret_version)` |
-| `src/app/services/openstack/` | `OpenStackLookup` protocol, TTL cache, read-only SDK adapter and simulated fleet |
-| `src/app/services/snmp/` | `SnmpSampler` protocol, pysnmp backend, simulator |
+| `src/app/services/openstack/` | `OpenStackLookup` protocol, TTL cache, read-only SDK adapter |
+| `src/app/services/snmp/` | `SnmpSampler` protocol, pysnmp backend |
 | `src/app/services/snmp/flatten.py` | The only place that maps a nested reading onto columns, and back |
 | `src/app/services/collector.py` | The polling loop, and the last full reading per machine |
 | `src/app/services/bus.py` | In-process pub/sub feeding SSE |
@@ -101,7 +99,7 @@ inventory.
 | `alembic.ini` | Host CLI only; the app builds an equivalent config in code |
 | `.env.example` | Every setting with defaults; `.env` is git- and docker-ignored |
 | `compose.yaml` | Local API, TimescaleDB, and profile-gated SNMP test agents |
-| `scripts/seed_dev.py` | Registers the simulated fleet, binds credentials, and prints login tokens |
+| `scripts/seed_dev.py` | Registers a starter fleet, binds credentials, and prints login tokens |
 | `Makefile` | `up`, `seed`, `psql`, `logs`, `reencrypt`, `clean` for the Compose stack |
 
 ## Data model
@@ -346,7 +344,7 @@ scope in the third column. See [Authentication](#authentication).
 
 | Method | Path | Scope | Notes |
 | --- | --- | --- | --- |
-| GET | `/` | — | service info and which backends are simulated |
+| GET | `/` | — | service info |
 | GET | `/healthz` | — | no dependencies — backs liveness |
 | GET | `/readyz` | — | queries Postgres — backs readiness |
 | POST | `/auth/login` | — | form-encoded OAuth2 password grant ⇒ access + refresh token; throttled, 429 with `Retry-After` |
@@ -427,10 +425,7 @@ curl -fsS -X POST localhost:8000/machines/aa:bb:cc:00:00:01/snmp-credential/test
 ```
 
 A failing test names the reason without echoing the secret — `Wrong SNMP PDU
-digest` for a bad passphrase, `Unknown USM user` for a bad `username`. When
-`SNMP_SIMULATE=true` the result carries `"simulated": true`, because the
-simulator authenticates to nothing and would otherwise report every credential
-as working.
+digest` for a bad passphrase, `Unknown USM user` for a bad `username`.
 
 ### Why binding has its own scope
 
@@ -537,14 +532,20 @@ logging everyone out. `ADMIN_USERNAME` and `ADMIN_PASSWORD` are required for the
 reason in [Authentication](#authentication). A blank value counts as missing:
 `ADMIN_PASSWORD=` would otherwise create an admin whose password is empty.
 
-`SNMP_CREDENTIAL_KEYS` and `SNMP_CREDENTIAL_ACTIVE_KEY` are required too, but
-only once `SNMP_SIMULATE=false` — the simulator authenticates to nothing, so a
-developer running the default stack needs no key. The moment real agents are
-polled the key becomes load-bearing and the app refuses to start without a
-usable one: without it every credential fails to decrypt, and a monitoring
-backend that reports itself healthy while collecting nothing is worse than one
-that will not boot. A malformed ring is rejected either way, so a typo surfaces
-locally rather than on the first real deployment.
+`SNMP_CREDENTIAL_KEYS` and `SNMP_CREDENTIAL_ACTIVE_KEY` are required as well,
+and so are `PGDATABASE`, `PGUSER`, `PGPASSWORD` and — marked *\** in the table
+below — the six `OS_*` Keystone values. Every one of them is checked at startup
+and a blank value counts as missing, because the alternative is worse in each
+case: without the key ring no stored credential decrypts and every v3 machine
+fails every tick, and without the Keystone values the fleet lookup fails on its
+first call instead of at boot. A monitoring backend that reports itself healthy
+while collecting nothing is worse than one that will not start.
+
+**\*** The `OS_*` six are required only while `OPENSTACK_ENABLED` is true, which
+is the default. Set it to false for a deployment with no OpenStack: no Keystone
+call is made, the fleet is empty, and machines are registered by supplying a
+`mac` — they are stored as external, so the collector polls the address it was
+given and never moves it.
 
 The settings worth knowing:
 
@@ -553,10 +554,9 @@ The settings worth knowing:
 | `COLLECTOR_INTERVAL_SECONDS` | 5 | Poll period; the loop subtracts its own runtime so the cadence does not drift |
 | `COLLECTOR_CONCURRENCY` | 32 | Machines sampled in parallel. Bounds SNMP calls, not queries — see below |
 | `COLLECTOR_SAMPLE_TIMEOUT_SECONDS` | 0 | Ceiling on one machine's sample; 0 derives 80% of the interval |
-| `SNMP_SIMULATE` | true | false ⇒ real pysnmp against each machine's IPv4 |
 | `SNMP_COMMUNITY` | public | **Read once**, to seed the `default-v2c` credential. Not a live setting — see below |
-| `SNMP_CREDENTIAL_KEYS` | — | The AES-256 key ring that encrypts stored credentials. Required when `SNMP_SIMULATE=false` |
-| `SNMP_CREDENTIAL_ACTIVE_KEY` | — | Which key in the ring new writes use |
+| `SNMP_CREDENTIAL_KEYS` | **required** | The AES-256 key ring that encrypts stored credentials |
+| `SNMP_CREDENTIAL_ACTIVE_KEY` | **required** | Which key in the ring new writes use |
 | `SNMP_DISKIO_ENABLED` | true | ~6 extra walks per machine; needs the diskio view above |
 | `SNMP_MAX_REPETITIONS` | 10 | Rows per GETBULK reply. Lower it for agents behind a small-MTU path — see below |
 | `METRICS_COMPRESS_AFTER_HOURS` | 8 | 0 disables. TimescaleDB columnar compression |
@@ -567,18 +567,19 @@ The settings worth knowing:
 | `METRICS_ROLLUP_REFRESH_LAG_DAYS` | 2 | How far back a rollup refresh reaches; clamped to 75% of retention |
 | `METRICS_PSEUDO_MOUNT_PREFIXES` | `/run,/dev/shm,…` | Mounts excluded from `disk_max_used_pct` |
 | `METRICS_VIRTUAL_IFACE_PREFIXES` | `veth,cni,…` | Interfaces excluded from the network totals |
-| `OPENSTACK_SIMULATE` | true | false ⇒ read-only Nova/Keystone/Neutron lookup using a Keystone password |
+| `OPENSTACK_ENABLED` | true | false ⇒ no Keystone call, empty fleet, `OS_*` neither required nor read |
 | `OPENSTACK_CACHE_TTL_SECONDS` | 300 | How stale a tenant/flavor read may be |
 | `OPENSTACK_API_TIMEOUT_SECONDS` | 10 | Timeout applied to each SDK HTTP request, not to the complete paginated refresh |
-| `OS_AUTH_URL` | — | Keystone endpoint, `/v3` included; required for the real lookup |
-| `OS_USERNAME` / `OS_USER_ID` | — | Identify the user by name or by UUID. Exactly one is required; a user id wins if both are set |
-| `OS_USER_DOMAIN_ID` | default | Domain the username lives in. Ignored, and not required, when `OS_USER_ID` is used |
-| `OS_PASSWORD` | — | Password for that user; required for the real lookup |
-| `OS_PROJECT_ID` | — | Project UUID the session is scoped to; required for the real lookup |
-| `OS_INTERFACE` | public | Service-catalog interface: public, internal or admin |
+| `OS_AUTH_URL` | **required*** | Keystone endpoint, `/v3` included |
+| `OS_USERNAME` / `OS_USER_ID` | **required*** | Both are required; the user id is what goes on the wire |
+| `OS_USER_DOMAIN_ID` | **required*** | Domain the username lives in |
+| `OS_PASSWORD` | **required*** | Password for that user |
+| `OS_PROJECT_ID` | **required*** | Project UUID the session is scoped to |
+| `OS_INTERFACE` | empty | Service-catalog interface: public, internal or admin. Empty leaves the catalog's default |
 | `OS_CACERT` | — | Optional CA bundle; TLS verification cannot be disabled |
 | `DB_AUTO_MIGRATE` | true | `alembic upgrade head` on startup, under an advisory lock |
 | `DB_POOL_MIN` | 5 | SQLAlchemy's persistent pool, not a floor — see below |
+| `PGDATABASE` / `PGUSER` / `PGPASSWORD` | **required** | No defaults; Compose refuses to interpolate without them too |
 | `JWT_SECRET` | **required** | No default. Blank or under 32 chars and the app refuses to start |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD` | **required** | The bootstrap account; likewise no default |
 | `ADMIN_PASSWORD_RESET` | false | One-shot: rewrites the admin password from the environment |
@@ -589,7 +590,7 @@ The settings worth knowing:
 | `LOGIN_RATE_LIMIT_MAX_PER_IP` | 20 | Same per client address; both are per process |
 | `LOGIN_RATE_LIMIT_WINDOW_SECONDS` | 300 | The window both counters slide over |
 | `ROOT_PATH` | empty | Optional prefix when a reverse proxy strips a path prefix |
-| `CORS_ALLOW_ORIGINS` | localhost 5173/4173/8080 | Comma separated browser origins, matched exactly on scheme, host and port |
+| `CORS_ALLOW_ORIGINS` | `http://localhost:8080` | Comma separated browser origins, matched exactly on scheme, host and port |
 
 ### Holding the cadence
 
@@ -930,10 +931,13 @@ and runs uvicorn with reload enabled.
 
 ```bash
 cp .env.example .env
-# Fill JWT_SECRET (openssl rand -hex 32) and ADMIN_PASSWORD in .env.
+# Fill every REQUIRED value in .env: PGPASSWORD, JWT_SECRET (openssl rand -hex
+# 32), ADMIN_PASSWORD, the SNMP credential key ring, and the six OS_* values
+# from your OpenStack dashboard's API Access tab. The app will not start
+# without them.
 
 make up      # build, start, and wait until /readyz answers
-make seed    # register and bind the simulated OpenStack fleet
+make seed    # register machines and bind them to the default credential
 make smoke   # check readiness, machines, and collector status
 make token   # print an admin access token
 open http://localhost:8000/docs
@@ -946,11 +950,10 @@ docker compose up -d --build --wait
 docker compose exec api python /app/scripts/seed_dev.py
 ```
 
-An empty `machines` table is valid but not useful. `make seed` registers the six
-hosts from `app/services/openstack/simulated.py` and binds them to the
-`default-v2c` credential. Keep `SNMP_CREDENTIAL_KEYS` configured in `.env`; the
-bootstrap needs it to create that encrypted credential even when sampling is
-simulated.
+An empty `machines` table is valid but not useful. `make seed` registers the
+addresses listed in `scripts/seed_dev.py` — edit them to match your fleet — and
+binds each to the `default-v2c` credential. `SNMP_CREDENTIAL_KEYS` must be
+configured for that: the bootstrap needs it to create the encrypted credential.
 
 ### Environment
 
@@ -984,7 +987,6 @@ The `snmp` profile starts two real net-snmp agents with authPriv users:
 
 ```bash
 docker compose --profile snmp up -d snmpd snmpd2
-# Set SNMP_SIMULATE=false in .env, then:
 make restart
 ```
 

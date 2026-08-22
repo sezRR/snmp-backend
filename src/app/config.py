@@ -84,9 +84,14 @@ class DatabaseSettings(BaseSettings):
     # Names match libpq's own environment variables.
     pghost: str = "timescaledb"
     pgport: int = 5432
-    pgdatabase: str = "app"
-    pguser: str = "app"
-    pgpassword: str = ""
+    # Required, and deliberately without defaults. A database name, user or
+    # password guessed on the deployment's behalf either reaches nothing or
+    # reaches the wrong database with someone else's rows in it, and Compose
+    # already refuses to start without all three. `.env.example` carries the
+    # values the rest of the documentation assumes.
+    pgdatabase: str
+    pguser: str
+    pgpassword: str
     pgsslmode: str = "prefer"
 
     # SQLAlchemy's pool_size is the *persistent* pool, not a floor to grow from:
@@ -143,6 +148,31 @@ class DatabaseSettings(BaseSettings):
             "options": f"-c statement_timeout={self.db_statement_timeout_ms}",
         }
 
+    @model_validator(mode="after")
+    def _connection_settings_are_not_blank(self) -> "DatabaseSettings":
+        """Reject blank required values, which typing alone cannot.
+
+        A required `str` field is satisfied by an empty string, and an empty
+        string is exactly what an unfilled `KEY=` line in `.env` produces. A
+        missing variable is already a pydantic error; this covers the line that
+        is present and empty.
+        """
+        blank = [
+            name
+            for name, value in (
+                ("PGDATABASE", self.pgdatabase),
+                ("PGUSER", self.pguser),
+                ("PGPASSWORD", self.pgpassword),
+            )
+            if not value.strip()
+        ]
+        if blank:
+            raise ValueError(
+                f"{', '.join(blank)} must be set and non-blank. "
+                "Generate a password with: openssl rand -hex 16"
+            )
+        return self
+
 
 class Settings(DatabaseSettings):
     """Everything else: the collector, SNMP, OpenStack, the API and auth."""
@@ -160,9 +190,6 @@ class Settings(DatabaseSettings):
     collector_sample_timeout_seconds: float = 0.0
 
     # ---- SNMP ---------------------------------------------------------------
-    # With no real SNMP agents around, the simulator is the default. Flipping
-    # this to false uses pysnmp against the machines' IPv4 addresses.
-    snmp_simulate: bool = True
     # The seed for the built-in `default-v2c` credential profile, and nothing
     # else. Since credentials became rows, the sampler has no fallback path to
     # this value: `app.services.bootstrap` copies it into a profile once, on the
@@ -195,12 +222,11 @@ class Settings(DatabaseSettings):
     # what makes rotation a rolling operation rather than a re-entry of every
     # passphrase.
     #
-    # Unlike JWT_SECRET these have defaults, because the simulated sampler never
-    # decrypts anything and a developer running SNMP_SIMULATE=true should not
-    # need to generate a key. The validator below demands them as soon as the
-    # deployment polls real agents.
-    snmp_credential_keys: SecretStr = SecretStr("")
-    snmp_credential_active_key: str = ""
+    # Required, like JWT_SECRET. Every stored SNMPv3 passphrase is sealed with
+    # one of these keys, so a backend without the ring decrypts nothing and
+    # fails every v3 machine on every tick — while reporting itself healthy.
+    snmp_credential_keys: SecretStr
+    snmp_credential_active_key: str
 
     # ---- Metric retention ----------------------------------------------------
     # Applied as TimescaleDB background jobs by `app.db.policies`. Any of these
@@ -266,27 +292,33 @@ class Settings(DatabaseSettings):
         return _csv_tuple(self.metrics_virtual_iface_prefixes)
 
     # ---- OpenStack ----------------------------------------------------------
-    # The real lookup is read-only: it lists Nova servers across projects and
-    # uses Keystone solely to resolve the project/user names already present in
-    # the API contract. Every network a server is attached to is considered, and
-    # the first fixed IPv4/MAC pair Nova lists is the one the collector needs.
-    openstack_simulate: bool = True
+    # The lookup is read-only: it lists Nova servers across projects and uses
+    # Keystone solely to resolve the project/user names already present in the
+    # API contract. Every network a server is attached to is considered, and the
+    # first fixed IPv4/MAC pair Nova lists is the one the collector needs.
+    # False for a deployment with no OpenStack at all: no Keystone call is made,
+    # the fleet is empty, and the `OS_*` credentials below are neither required
+    # nor read. Machines must then be registered with an explicit `mac`, which
+    # stores them as external — the collector polls the address it was given and
+    # never moves it, because nothing else knows better.
+    openstack_enabled: bool = True
     openstack_cache_ttl_seconds: float = 300.0
     openstack_api_timeout_seconds: float = Field(default=10.0, gt=0)
+    # All required while OPENSTACK_ENABLED is true, and checked below rather
+    # than by their types: a blank `OS_PASSWORD=` line has to fail the same way
+    # a missing one does. Keystone password authentication — OS_USER_ID
+    # identifies the user on its own and is what goes on the wire when set,
+    # OS_USERNAME is that same user by name inside OS_USER_DOMAIN_ID, and
+    # OS_PROJECT_ID is the scope the session is bound to.
     os_auth_url: str = ""
-    # Keystone password authentication. The user is identified by *either*
-    # OS_USER_ID or OS_USERNAME — a name is only unique inside a domain, so a
-    # name additionally needs OS_USER_DOMAIN_ID, while a UUID stands alone. The
-    # scope is the project UUID, which is likewise domain-unambiguous.
     os_username: str = ""
     os_user_id: str = ""
     os_password: SecretStr = SecretStr("")
     os_project_id: str = ""
-    os_user_domain_id: str = "default"
+    os_user_domain_id: str = ""
     os_region_name: str = ""
-    os_interface: str = Field(
-        default="public", pattern="^(public|internal|admin)$"
-    )
+    # Empty leaves the choice to the service catalog's own default.
+    os_interface: str = Field(default="", pattern="^(|public|internal|admin)$")
     os_cacert: str = ""
 
     # ---- Auth ---------------------------------------------------------------
@@ -344,17 +376,15 @@ class Settings(DatabaseSettings):
     # Restores a prefix stripped by a reverse proxy in URLs FastAPI generates.
     root_path: str = ""
     # Comma separated browser origins allowed to call this API. Matched exactly
-    # — scheme, host and port all count, so http://localhost:5173 does not cover
-    # https://ui.example.com or a bare hostname. The default is the local Vite
-    # dev/preview server and the compose UI port; a deployment adds its own.
+    # — scheme, host and port all count, so http://localhost:8080 does not cover
+    # https://ui.example.com or a bare hostname. The default is the compose UI
+    # port; a deployment adds its own.
     #
     # `*` is honoured but is a poor idea here: responses carry credentials, so
     # Starlette echoes the caller's origin back instead of a literal `*`, which
     # makes every site on the internet an allowed origin for cookie-bearing
     # requests. Startup logs a warning if it is set.
-    cors_allow_origins: str = (
-        "http://localhost:5173,http://localhost:4173,http://localhost:8080"
-    )
+    cors_allow_origins: str = "http://localhost:8080"
     sse_heartbeat_seconds: float = 15.0
     sse_queue_maxsize: int = 100
     log_level: str = Field(default="INFO", pattern="(?i)^(debug|info|warning|error|critical)$")
@@ -370,8 +400,9 @@ class Settings(DatabaseSettings):
 
         A required `str` field is satisfied by an empty string, and an empty
         string is exactly what an unfilled `KEY=` line in `.env` produces.
-        Without this, `ADMIN_PASSWORD=` starts the backend with
-        an admin account whose password is "".
+        Without this, `ADMIN_PASSWORD=` starts the backend with an admin
+        account whose password is "", and `OS_PASSWORD=` starts one whose fleet
+        lookup fails on its first call rather than at startup.
         """
         blank = [
             name
@@ -379,15 +410,43 @@ class Settings(DatabaseSettings):
                 ("JWT_SECRET", self.jwt_secret.get_secret_value()),
                 ("ADMIN_USERNAME", self.admin_username),
                 ("ADMIN_PASSWORD", self.admin_password.get_secret_value()),
+                (
+                    "SNMP_CREDENTIAL_KEYS",
+                    self.snmp_credential_keys.get_secret_value(),
+                ),
+                ("SNMP_CREDENTIAL_ACTIVE_KEY", self.snmp_credential_active_key),
             )
             if not value.strip()
         ]
+        if self.openstack_enabled:
+            blank += [
+                name
+                for name, value in (
+                    ("OS_AUTH_URL", self.os_auth_url),
+                    ("OS_USERNAME", self.os_username),
+                    ("OS_USER_ID", self.os_user_id),
+                    ("OS_PASSWORD", self.os_password.get_secret_value()),
+                    ("OS_USER_DOMAIN_ID", self.os_user_domain_id),
+                    ("OS_PROJECT_ID", self.os_project_id),
+                )
+                if not value.strip()
+            ]
         if blank:
-            hint = (
-                " Generate a signing key with: openssl rand -hex 32"
-                if "JWT_SECRET" in blank
-                else ""
-            )
+            hints = []
+            if "JWT_SECRET" in blank:
+                hints.append("Generate a signing key with: openssl rand -hex 32")
+            if "SNMP_CREDENTIAL_KEYS" in blank:
+                hints.append(
+                    'Generate a credential key with: openssl rand -hex 32, then '
+                    'set {"k1": "<that>"} and SNMP_CREDENTIAL_ACTIVE_KEY=k1'
+                )
+            if any(name.startswith("OS_") for name in blank):
+                hints.append(
+                    "Copy the OS_* values from your OpenStack dashboard's API "
+                    "Access tab, or set OPENSTACK_ENABLED=false to run without "
+                    "OpenStack."
+                )
+            hint = (" " + " ".join(hints)) if hints else ""
             raise ValueError(
                 f"{', '.join(blank)} must be set and non-blank.{hint}"
             )
@@ -399,62 +458,19 @@ class Settings(DatabaseSettings):
         return self
 
     @model_validator(mode="after")
-    def _real_openstack_configuration_is_complete(self) -> "Settings":
-        if self.openstack_simulate:
-            return self
-        blank = [
-            name
-            for name, value in (
-                ("OS_AUTH_URL", self.os_auth_url),
-                ("OS_PASSWORD", self.os_password.get_secret_value()),
-                ("OS_PROJECT_ID", self.os_project_id),
-            )
-            if not value.strip()
-        ]
-        if blank:
-            raise ValueError(
-                f"{', '.join(blank)} must be set and non-blank when "
-                "OPENSTACK_SIMULATE=false"
-            )
-        if not self.os_user_id.strip() and not self.os_username.strip():
-            raise ValueError(
-                "OS_USER_ID or OS_USERNAME must be set when OPENSTACK_SIMULATE=false"
-            )
-        if not self.os_user_id.strip() and not self.os_user_domain_id.strip():
-            raise ValueError(
-                "OS_USER_DOMAIN_ID must be set when the user is identified by "
-                "OS_USERNAME; a username is only unique within its domain"
-            )
-        return self
-
-    @model_validator(mode="after")
     def _credential_key_ring_is_usable(self) -> "Settings":
-        """Refuse to start without a usable key ring, once SNMP is real.
+        """Refuse to start without a usable key ring.
 
-        Gated on `snmp_simulate` because the simulated sampler never decrypts a
-        credential, so demanding a key from a developer running the default
-        stack would be ceremony. The moment the app polls real agents the
-        key becomes load-bearing: without it every v3 machine fails every tick,
-        and a monitoring backend that reports itself healthy while collecting
-        nothing is worse than one that will not boot.
+        Without it every v3 machine fails every tick, and a monitoring backend
+        that reports itself healthy while collecting nothing is worse than one
+        that will not boot. The ring being present is checked above; this is
+        about it being *parseable* and naming the active key.
         """
-        if self.snmp_simulate:
-            # Still reject a *malformed* ring even here — a typo should surface
-            # on the developer's machine, not on the first real deployment.
-            parse_key_ring(self.snmp_credential_keys.get_secret_value())
-            return self
-
         ring = parse_key_ring(self.snmp_credential_keys.get_secret_value())
         if not ring:
             raise ValueError(
-                "SNMP_CREDENTIAL_KEYS must be set when SNMP_SIMULATE=false. "
-                'Generate one with: openssl rand -hex 32, then set {"k1": "<that>"} '
-                "and SNMP_CREDENTIAL_ACTIVE_KEY=k1"
-            )
-        if not self.snmp_credential_active_key.strip():
-            raise ValueError(
-                "SNMP_CREDENTIAL_ACTIVE_KEY must name one of the ids in "
-                f"SNMP_CREDENTIAL_KEYS ({', '.join(sorted(ring))})"
+                'SNMP_CREDENTIAL_KEYS must be a non-empty key ring, e.g. {"k1": '
+                '"<64 hex chars>"}. Generate a key with: openssl rand -hex 32'
             )
         if self.snmp_credential_active_key not in ring:
             raise ValueError(

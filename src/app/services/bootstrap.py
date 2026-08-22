@@ -175,12 +175,11 @@ def seed_default_credential_blocking(
 async def bootstrap_credentials(
     db: Database, settings: Settings, cipher: CredentialCipher
 ) -> None:
-    """Seed the default credential, if this deployment has a key to seal it.
+    """Seed the default credential.
 
-    Skipped without a key ring, which is the simulated-stack case: `Settings`
-    only demands one when `SNMP_SIMULATE=false`, and a simulated sampler
-    authenticates to nothing. The endpoints report the same missing
-    configuration as a 503 if anyone tries to create a credential anyway.
+    `Settings` requires a key ring, so the guard below is belt and braces: a
+    cipher that cannot seal anything would otherwise fail inside the seeding
+    query, on a code path that runs before the API serves its first request.
     """
     if not cipher.usable:
         log.info(

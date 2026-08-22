@@ -89,8 +89,11 @@ async def register_machine(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=(
-                f"OpenStack has no server with address {ipv4}; supply `mac` to "
-                "register it as a machine outside OpenStack"
+                "OPENSTACK_ENABLED is false, so there is no fleet to resolve "
+                f"{ipv4} against; supply `mac` to register it"
+                if not lookup.enabled
+                else f"OpenStack has no server with address {ipv4}; supply "
+                "`mac` to register it as a machine outside OpenStack"
             ),
         )
 

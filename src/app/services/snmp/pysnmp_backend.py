@@ -44,8 +44,6 @@ using at that moment. The failures that produces are intermittent and
 load-dependent, which is the worst kind to debug. Separate engines have no
 shared cache to race on, and the cost is one engine per distinct credential, not
 per machine.
-
-Selected by `SNMP_SIMULATE=false`.
 """
 
 from __future__ import annotations

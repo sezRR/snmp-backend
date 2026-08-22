@@ -45,14 +45,11 @@ or DISKIO-MIB still yields a usable sample, minus that key.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import Any, Protocol
 from uuid import UUID
 
 from app.config import Settings
 from app.models.credential import ResolvedCredential
-
-if TYPE_CHECKING:
-    from app.services.openstack import CachedOpenStack
 
 log = logging.getLogger(__name__)
 
@@ -88,15 +85,7 @@ class SnmpError(RuntimeError):
     """An agent did not answer, or answered with something unusable."""
 
 
-def build_sampler(
-    settings: Settings, lookup: "CachedOpenStack | None" = None
-) -> SnmpSampler:
-    if settings.snmp_simulate:
-        from app.services.snmp.simulated import SimulatedSampler
-
-        log.info("snmp: simulated sampler")
-        return SimulatedSampler(hardware=_flavor_hardware(lookup) if lookup else None)
-
+def build_sampler(settings: Settings) -> SnmpSampler:
     from app.services.snmp.pysnmp_backend import PySnmpSampler
 
     log.info(
@@ -116,25 +105,3 @@ def build_sampler(
         diskio_enabled=settings.snmp_diskio_enabled,
         virtual_iface_prefixes=settings.virtual_iface_prefixes,
     )
-
-
-def _flavor_hardware(lookup: "CachedOpenStack"):
-    """Let the simulator size a host from its flavor, so the two agree.
-
-    Only the simulator uses this; a real agent reports the guest's own hardware.
-    """
-
-    async def resolve(ipv4: str) -> tuple[int, int, int] | None:
-        try:
-            server = await lookup.by_ipv4(ipv4)
-        except Exception:  # lookup down: fall back to seeded sizes
-            return None
-        if server is None:
-            return None
-        return (
-            server.flavor.vcpus,
-            server.flavor.ram_mb * 1024**2,
-            server.flavor.disk_gb * 1024**3,
-        )
-
-    return resolve

@@ -44,7 +44,7 @@ def build_sdk_lookup(settings: Settings) -> "SDKOpenStack":
         load_yaml_config=False,
         load_envvars=False,
         region_name=settings.os_region_name or None,
-        interface=settings.os_interface,
+        interface=settings.os_interface or None,
         cacert=settings.os_cacert or None,
         api_timeout=settings.openstack_api_timeout_seconds,
         compute_api_version="2",

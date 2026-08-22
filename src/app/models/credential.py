@@ -259,12 +259,6 @@ class CredentialTestResult(BaseModel):
     credential_id: UUID | None
     duration_seconds: float
     detail: str | None = None
-    # True when SNMP_SIMULATE is on, in which case `ok` means only that the
-    # simulator produced a payload — it authenticates to nothing, so a wrong
-    # passphrase passes just as happily as a right one. Reported rather than
-    # hidden: a test that always says yes is worse than no test at all if the
-    # caller cannot tell which kind of yes they got.
-    simulated: bool = False
 
 
 @dataclass(frozen=True, slots=True)

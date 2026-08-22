@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 
 
 class OpenStackLookup(Protocol):
-    """Read-only fleet seam implemented by simulated and SDK backends."""
+    """Read-only fleet seam, implemented by the SDK adapter."""
 
     async def servers(self) -> list[ServerInfo]: ...
 
@@ -31,9 +31,15 @@ class OpenStackLookup(Protocol):
 class CachedOpenStack:
     """TTL cache over an `OpenStackLookup`, with MAC and IPv4 indexes."""
 
-    def __init__(self, upstream: OpenStackLookup, ttl_seconds: float) -> None:
+    def __init__(
+        self, upstream: OpenStackLookup, ttl_seconds: float, enabled: bool = True
+    ) -> None:
         self._upstream = upstream
         self._ttl = ttl_seconds
+        # Read by the endpoints that have to explain an empty fleet: "OpenStack
+        # is off" and "OpenStack knows nothing about this address" are the same
+        # answer here and completely different problems for the caller.
+        self.enabled = enabled
         self._lock = asyncio.Lock()
         self._servers: list[ServerInfo] = []
         self._by_mac: dict[str, ServerInfo] = {}
@@ -141,15 +147,33 @@ def normalise_mac(mac: str) -> str:
     return ":".join(cleaned[i : i + 2] for i in range(0, 12, 2))
 
 
+class DisabledOpenStack:
+    """The seam, answering with an empty fleet. No Keystone call is made.
+
+    A null object rather than a `None` lookup, so every consumer keeps one code
+    path: a machine simply has no OpenStack record, which is the same case as a
+    machine that was deregistered from the fleet — already handled everywhere.
+    """
+
+    async def servers(self) -> list[ServerInfo]:
+        return []
+
+    def close(self) -> None:
+        return None
+
+
 def build_lookup(settings: Settings) -> CachedOpenStack:
-    if settings.openstack_simulate:
-        from app.services.openstack.simulated import SimulatedOpenStack
+    if not settings.openstack_enabled:
+        log.info(
+            "openstack: disabled, fleet is empty — register machines with an "
+            "explicit mac"
+        )
+        return CachedOpenStack(
+            DisabledOpenStack(), settings.openstack_cache_ttl_seconds, enabled=False
+        )
 
-        upstream: OpenStackLookup = SimulatedOpenStack()
-        log.info("openstack: simulated fleet")
-    else:
-        from app.services.openstack.sdk import build_sdk_lookup
+    from app.services.openstack.sdk import build_sdk_lookup
 
-        upstream = build_sdk_lookup(settings)
-        log.info("openstack: read-only SDK lookup across all projects and networks")
+    upstream: OpenStackLookup = build_sdk_lookup(settings)
+    log.info("openstack: read-only SDK lookup across all projects and networks")
     return CachedOpenStack(upstream, settings.openstack_cache_ttl_seconds)
