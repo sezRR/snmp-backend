@@ -28,6 +28,11 @@ async def force_tick(collector: CollectorDep) -> dict[str, Any]:
     Useful when demonstrating the pipeline — and when debugging a machine that
     just started failing.
 
+    Polls every enabled machine, including any that the failure backoff is
+    holding back: this is somebody asking for an answer now, usually straight
+    after fixing what those machines were failing on, so making them wait out a
+    ten minute delay would defeat the point of asking.
+
     Declines rather than queues when the loop is mid-tick: waiting for the lock
     would just run a second round the instant the first finished, against
     counter baselines a few milliseconds old, and every rate in it would be
@@ -38,8 +43,12 @@ async def force_tick(collector: CollectorDep) -> dict[str, Any]:
             status_code=status.HTTP_409_CONFLICT,
             detail="a collection round is already running; try again shortly",
         )
-    stored = await collector.tick()
-    return {"stored": stored, "failed": collector.last_failed}
+    stored = await collector.tick(force=True)
+    return {
+        "stored": stored,
+        "failed": collector.last_failed,
+        "skipped": collector.last_skipped,
+    }
 
 
 @router.get("/openstack/cache", dependencies=[requires(Scope.ADMIN_READ)])

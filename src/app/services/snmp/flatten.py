@@ -14,6 +14,9 @@ COLUMNS: tuple[str, ...] = (
     "disk_root_total_bytes",
     "disk_root_used_bytes",
     "disk_root_used_pct",
+    "disk_total_bytes",
+    "disk_used_bytes",
+    "disk_used_pct",
     "disk_max_used_pct",
     "dio_read_bps",
     "dio_write_bps",
@@ -175,6 +178,21 @@ def flatten(
     if disk_max is None:
         disk_max = _max([d.get("used_percent") for d in real_mounts])
 
+    # How full the machine's storage is, which is a different question from
+    # `disk_max_used_pct` — that one answers "is any filesystem nearly full".
+    # A maximum cannot answer this: a 100 MB /boot/efi at 10% and a 100 GB / at
+    # 1% is 1% of the machine's storage, not 10%. So sum the bytes and divide,
+    # which weights every filesystem by how much space it actually contributes.
+    disk_total = _int(payload.get("disk_total_bytes"))
+    disk_used = _int(payload.get("disk_used_bytes"))
+    if disk_total is None:
+        disk_total = _int(_sum([d.get("total_bytes") for d in real_mounts]))
+    if disk_used is None:
+        disk_used = _int(_sum([d.get("used_bytes") for d in real_mounts]))
+    disk_used_pct = _num(payload.get("disk_used_percent"))
+    if disk_used_pct is None and disk_total and disk_used is not None:
+        disk_used_pct = round(disk_used / disk_total * 100, 2)
+
     return {
         "cpu_usage_pct": _num(cpu.get("usage_percent")),
         "cpu_cores": _int(cpu.get("cores")),
@@ -185,6 +203,9 @@ def flatten(
         "disk_root_total_bytes": _int(root.get("total_bytes")),
         "disk_root_used_bytes": _int(root.get("used_bytes")),
         "disk_root_used_pct": _num(root.get("used_percent")),
+        "disk_total_bytes": disk_total,
+        "disk_used_bytes": disk_used,
+        "disk_used_pct": disk_used_pct,
         "disk_max_used_pct": disk_max,
         "dio_read_bps": _num(disk_io.get("read_bps")),
         "dio_write_bps": _num(disk_io.get("write_bps")),
@@ -287,7 +308,14 @@ def nest(row: dict[str, Any]) -> dict[str, Any]:
     # Matching the sampler, which omits the key rather than emitting an empty one.
     if disk_io:
         payload["disk_io"] = disk_io
-    # A machine-level reading, so not part of the per-mount array.
-    if row.get("disk_max_used_pct") is not None:
-        payload["disk_max_used_percent"] = row["disk_max_used_pct"]
+    # Machine-level readings, so not part of the per-mount array. A stored row
+    # carries only root, so a reduction over `disk` could not reproduce them.
+    for column, key in (
+        ("disk_max_used_pct", "disk_max_used_percent"),
+        ("disk_total_bytes", "disk_total_bytes"),
+        ("disk_used_bytes", "disk_used_bytes"),
+        ("disk_used_pct", "disk_used_percent"),
+    ):
+        if row.get(column) is not None:
+            payload[key] = row[column]
     return payload

@@ -22,7 +22,9 @@ cpu_usage_pct          real         cpu_cores              smallint
 ram_total_bytes        bigint       ram_used_bytes         bigint
 ram_used_pct           real         ram_available_bytes    bigint
 disk_root_total_bytes  bigint       disk_root_used_bytes   bigint
-disk_root_used_pct     real         disk_max_used_pct      real
+disk_root_used_pct     real         disk_total_bytes       bigint
+disk_used_bytes        bigint       disk_used_pct          real
+disk_max_used_pct      real
 dio_read_bps           float8       dio_write_bps          float8
 dio_read_iops          real         dio_write_iops         real
 dio_read_bytes         bigint       dio_write_bytes        bigint
@@ -110,6 +112,13 @@ scalars the old payload carried:
 - `disk_max_used_pct` is the max over **non-pseudo mounts** (`is_pseudo_mount`,
   `flatten.py:67`). The old query took the max over every mount, so a full
   `/run/credentials/...` read as a full disk.
+- `disk_used_pct` is `disk_used_bytes / disk_total_bytes` over the same mounts —
+  a different question, and the one "how full is this machine" actually asks. A
+  maximum cannot answer it: a 100 MB `/boot/efi` at 10% beside a 100 GB `/` at
+  1% is 1% of the machine, not 10%. Measured on the k8s node: 59.1% reported by
+  the maximum against 55.9% of capacity actually used. Revision 0006 adds the
+  three columns; rows written before it read as NULL, because a stored row keeps
+  root and the maximum but never the per-mount table the sum needs.
 
 Both prefix lists are settings (`METRICS_VIRTUAL_IFACE_PREFIXES`,
 `METRICS_PSEUDO_MOUNT_PREFIXES`), because `/tmp` is a real filesystem on some

@@ -197,11 +197,20 @@ metrics = Table(
     Column("ram_used_pct", REAL),
     Column("ram_available_bytes", BigInteger),
     # --- disk ---
-    # Root plus the fullest real filesystem. Submounts churn and are mostly
-    # tmpfs, so they are live-only.
+    # Root, the machine's total capacity, and the fullest single filesystem.
+    # Per-mount rows churn and are mostly tmpfs, so they stay live-only.
+    #
+    # `disk_used_pct` is used/total over every real filesystem, which is what
+    # "how full is this machine" means. `disk_max_used_pct` is the fullest one,
+    # which is what "is anything about to fill up" means. They answer different
+    # questions and a maximum cannot stand in for the ratio: a 100 MB /boot/efi
+    # at 10% beside a 100 GB / at 1% is 1% of the machine, not 10%.
     Column("disk_root_total_bytes", BigInteger),
     Column("disk_root_used_bytes", BigInteger),
     Column("disk_root_used_pct", REAL),
+    Column("disk_total_bytes", BigInteger),
+    Column("disk_used_bytes", BigInteger),
+    Column("disk_used_pct", REAL),
     Column("disk_max_used_pct", REAL),
     # --- disk i/o, summed over the devices that count toward the host total ---
     Column("dio_read_bps", DOUBLE_PRECISION),

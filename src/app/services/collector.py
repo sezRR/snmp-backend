@@ -33,6 +33,11 @@ class MachineStatus:
         self.last_ok: datetime | None = None
         self.last_error: str | None = None
         self.last_error_at: datetime | None = None
+        # Consecutive, not total: one success clears it, so a machine that fails
+        # occasionally is never backed off.
+        self.consecutive_failures = 0
+        # Monotonic, because this is a delay rather than a moment anyone reads.
+        self.skip_until: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -44,12 +49,47 @@ class MachineStatus:
             "last_ok": self.last_ok,
             "last_error": self.last_error,
             "last_error_at": self.last_error_at,
+            "consecutive_failures": self.consecutive_failures,
+            "retry_in_seconds": self.retry_in_seconds,
         }
 
-    def record_failure(self, error: str) -> None:
+    @property
+    def retry_in_seconds(self) -> float | None:
+        """Seconds until this machine is polled again, or None if it is due."""
+        if self.skip_until is None:
+            return None
+        remaining = self.skip_until - time.monotonic()
+        return round(remaining, 1) if remaining > 0 else None
+
+    def record_failure(self, error: str, backoff_max_seconds: float, interval: float) -> None:
         self.fail_count += 1
+        self.consecutive_failures += 1
         self.last_error = error
         self.last_error_at = datetime.now(timezone.utc)
+        if backoff_max_seconds <= 0:
+            self.skip_until = None
+            return
+        # One interval after the first failure, then doubling. The machine is
+        # still polled at the cap, so recovery is noticed without a restart.
+        #
+        # The exponent is clamped before the multiply, not after: a machine that
+        # has been dead for a week reaches 1025 consecutive failures, and
+        # `2 ** 1024` is larger than a float can hold. Left unclamped that raises
+        # OverflowError inside the sample, which `asyncio.gather` propagates —
+        # killing the whole tick, healthy machines included, which is precisely
+        # what this backoff exists to prevent.
+        exponent = min(self.consecutive_failures - 1, 30)
+        delay = min(interval * 2**exponent, backoff_max_seconds)
+        self.skip_until = time.monotonic() + delay
+
+    def record_success(self) -> None:
+        self.ok_count += 1
+        self.last_ok = datetime.now(timezone.utc)
+        self.consecutive_failures = 0
+        self.skip_until = None
+
+    def is_due(self, now: float) -> bool:
+        return self.skip_until is None or now >= self.skip_until
 
 
 class Collector:
@@ -82,6 +122,7 @@ class Collector:
         self.last_tick_duration: float | None = None
         self.last_inserted = 0
         self.last_failed = 0
+        self.last_skipped = 0
         self.last_tick_error: str | None = None
         self.overrun_count = 0
         # Smoothed tick-to-tick spacing: what the loop achieves, not what it
@@ -177,12 +218,19 @@ class Collector:
             # Subtract the work from the period so the cadence does not drift.
             await asyncio.sleep(max(0.0, interval - elapsed))
 
-    async def tick(self) -> int:
-        """One collection round. Returns how many samples were stored."""
+    async def tick(self, force: bool = False) -> int:
+        """One collection round. Returns how many samples were stored.
+
+        `force` polls every enabled machine, backoff or not. The scheduled loop
+        never sets it — a forced round is somebody asking for an answer now,
+        typically right after fixing whatever the failing machines were failing
+        on, and having to wait out a ten minute delay to find out would make the
+        button useless exactly when it is wanted.
+        """
         self._pending_ticks += 1
         try:
             async with self._tick_lock:
-                return await self._tick()
+                return await self._tick(force=force)
         finally:
             self._pending_ticks -= 1
 
@@ -199,7 +247,7 @@ class Collector:
             self.last_samples.pop(mac, None)
             return deleted
 
-    async def _tick(self) -> int:
+    async def _tick(self, force: bool = False) -> int:
         self.tick_count += 1
         self.last_tick_at = datetime.now(timezone.utc)
 
@@ -215,14 +263,24 @@ class Collector:
 
         targets = await self._resolve_addresses(rows)
 
+        # Machines still inside their backoff window are not polled at all, so a
+        # dead fleet cannot spend the tick's slots on hosts that will time out.
+        now = time.monotonic()
+        due = [
+            (row, ipv4)
+            for row, ipv4 in targets
+            if force or self.statuses[row["mac"]].is_due(now)
+        ]
+        self.last_skipped = len(targets) - len(due)
+
         results = await asyncio.gather(
-            *(self._sample_one(row, ipv4) for row, ipv4 in targets),
+            *(self._sample_one(row, ipv4) for row, ipv4 in due),
             return_exceptions=False,
         )
         samples = [sample for sample in results if sample is not None]
 
         self.last_inserted = len(samples)
-        self.last_failed = len(targets) - len(samples)
+        self.last_failed = len(due) - len(samples)
 
         if samples:
             await self._db.run_query(
@@ -290,6 +348,13 @@ class Collector:
             status.credential = row["credential_name"]
         return targets
 
+    def _record_failure(self, status: MachineStatus, error: str) -> None:
+        status.record_failure(
+            error,
+            self._settings.collector_failure_backoff_max_seconds,
+            self._settings.collector_interval_seconds,
+        )
+
     async def _sample_one(
         self, row: dict[str, Any], ipv4: str
     ) -> MetricSample | None:
@@ -299,8 +364,8 @@ class Collector:
         if row["credential_id"] is None:
             # A configuration gap, not an unreachable host: reported per machine
             # so /admin/collector shows it.
-            status.record_failure(
-                "no credential bound: PUT /machines/{mac}/snmp-credential"
+            self._record_failure(
+                status, "no credential bound: PUT /machines/{mac}/snmp-credential"
             )
             return None
 
@@ -311,7 +376,7 @@ class Collector:
         except Exception as exc:
             # Deleted credential or unopenable row: nothing to poll with, and
             # one machine must not fail the tick.
-            status.record_failure(f"{type(exc).__name__}: {exc}")
+            self._record_failure(status, f"{type(exc).__name__}: {exc}")
             log.warning("credential unavailable for %s (%s): %s", mac, ipv4, exc)
             return None
 
@@ -324,8 +389,8 @@ class Collector:
                 )
             except asyncio.TimeoutError:
                 # The point is the slot: a dead host must not hold one all period.
-                status.record_failure(
-                    f"TimeoutError: no sample within {self._sample_budget:.1f}s"
+                self._record_failure(
+                    status, f"TimeoutError: no sample within {self._sample_budget:.1f}s"
                 )
                 log.warning(
                     "sample timed out for %s (%s) after %.1fs",
@@ -335,11 +400,10 @@ class Collector:
                 )
                 return None
             except Exception as exc:
-                status.record_failure(f"{type(exc).__name__}: {exc}")
+                self._record_failure(status, f"{type(exc).__name__}: {exc}")
                 log.warning("sample failed for %s (%s): %s", mac, ipv4, exc)
                 return None
-        status.ok_count += 1
-        status.last_ok = datetime.now(timezone.utc)
+        status.record_success()
         return MetricSample(ts=datetime.now(timezone.utc), mac=mac, metrics=metrics)
 
     # ---- status -------------------------------------------------------------
@@ -361,6 +425,7 @@ class Collector:
             "last_tick_duration_seconds": self.last_tick_duration,
             "last_inserted": self.last_inserted,
             "last_failed": self.last_failed,
+            "last_skipped": self.last_skipped,
             "last_tick_error": self.last_tick_error,
             "sse_subscribers": self._bus.subscriber_count,
             "machines": [s.as_dict() for s in self.statuses.values()],

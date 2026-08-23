@@ -156,12 +156,17 @@ class Settings(DatabaseSettings):
 
     # ---- Collector ----------------------------------------------------------
     collector_enabled: bool = True
-    collector_interval_seconds: float = 5.0
-    # Bounds SNMP calls, not database connections: a tick issues two or three
-    # queries either way.
+    collector_interval_seconds: float = 10.0
+    # Bounds stuck samples, not throughput: CPU saturates long before 32 slots
+    # do. It decides how many unreachable machines one tick can absorb.
     collector_concurrency: int = 32
-    # Ceiling on one machine's sample; 0 derives it from the interval.
-    collector_sample_timeout_seconds: float = 0.0
+    # Ceiling on one machine's sample; 0 derives 80% of the interval. Keep it
+    # above SNMP_TIMEOUT_SECONDS * (SNMP_RETRIES + 1) so one full retry fits.
+    collector_sample_timeout_seconds: float = 5.0
+    # A machine that keeps failing is retried on a doubling delay rather than
+    # every tick, so a dead fleet cannot crowd out a healthy one. 0 disables the
+    # backoff and restores per-tick retries.
+    collector_failure_backoff_max_seconds: float = 600.0
 
     # ---- SNMP ---------------------------------------------------------------
     # Seeds the `default-v2c` profile once, on the first boot that finds none.
@@ -173,7 +178,7 @@ class Settings(DatabaseSettings):
     snmp_retries: int = 1
     # Rows per GETBULK reply. Low on purpose: a reply past the path MTU
     # fragments, and one lost fragment times the whole walk out.
-    snmp_max_repetitions: int = 10
+    snmp_max_repetitions: int = 25
     # ~6 extra walks per machine; needs an snmpd exposing 1.3.6.1.4.1.2021.13.15.
     snmp_diskio_enabled: bool = True
 

@@ -142,7 +142,9 @@ CREATE TABLE metrics (
     ram_total_bytes       bigint,    ram_used_bytes      bigint,
     ram_used_pct          real,      ram_available_bytes bigint,
     disk_root_total_bytes bigint,    disk_root_used_bytes bigint,
-    disk_root_used_pct    real,      disk_max_used_pct    real,
+    disk_root_used_pct    real,      disk_total_bytes     bigint,
+    disk_used_bytes       bigint,    disk_used_pct        real,
+    disk_max_used_pct     real,
     dio_read_bps  double precision,  dio_write_bps double precision,
     dio_read_iops real,              dio_write_iops real,
     dio_read_bytes bigint,           dio_write_bytes bigint,
@@ -552,8 +554,9 @@ The settings worth knowing:
 | Setting | Default | Why it matters |
 | --- | --- | --- |
 | `COLLECTOR_INTERVAL_SECONDS` | 5 | Poll period; the loop subtracts its own runtime so the cadence does not drift |
-| `COLLECTOR_CONCURRENCY` | 32 | Machines sampled in parallel. Bounds SNMP calls, not queries — see below |
-| `COLLECTOR_SAMPLE_TIMEOUT_SECONDS` | 0 | Ceiling on one machine's sample; 0 derives 80% of the interval |
+| `COLLECTOR_CONCURRENCY` | 32 | Stuck samples in flight, not throughput — CPU saturates first. Sets how many unreachable machines a tick absorbs |
+| `COLLECTOR_SAMPLE_TIMEOUT_SECONDS` | 5 | Ceiling on one machine's sample, and how long a dead one holds a slot; 0 derives 80% of the interval |
+| `COLLECTOR_FAILURE_BACKOFF_MAX_SECONDS` | 600 | Failing machines retry on a doubling delay, capped here. 0 restores per-tick retries |
 | `SNMP_COMMUNITY` | public | **Read once**, to seed the `default-v2c` credential. Not a live setting — see below |
 | `SNMP_CREDENTIAL_KEYS` | **required** | The AES-256 key ring that encrypts stored credentials |
 | `SNMP_CREDENTIAL_ACTIVE_KEY` | **required** | Which key in the ring new writes use |
@@ -565,7 +568,7 @@ The settings worth knowing:
 | `METRICS_ROLLUP_1M_RETENTION_DAYS` | 90 | 0 disables. How long `metrics_1m` is kept |
 | `METRICS_ROLLUP_1H_RETENTION_DAYS` | 730 | 0 disables. How long `metrics_1h` is kept |
 | `METRICS_ROLLUP_REFRESH_LAG_DAYS` | 2 | How far back a rollup refresh reaches; clamped to 75% of retention |
-| `METRICS_PSEUDO_MOUNT_PREFIXES` | `/run,/dev/shm,…` | Mounts excluded from `disk_max_used_pct` |
+| `METRICS_PSEUDO_MOUNT_PREFIXES` | `/run,/dev/shm,…` | Mounts excluded from `disk_used_pct` and `disk_max_used_pct` |
 | `METRICS_VIRTUAL_IFACE_PREFIXES` | `veth,cni,…` | Interfaces excluded from the network totals |
 | `OPENSTACK_ENABLED` | true | false ⇒ no Keystone call, empty fleet, `OS_*` neither required nor read |
 | `OPENSTACK_CACHE_TTL_SECONDS` | 300 | How stale a tenant/flavor read may be |
