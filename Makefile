@@ -18,8 +18,8 @@ export APP_VERSION
 IMAGE := fastapi-demo:$(APP_VERSION)
 
 .DEFAULT_GOAL := help
-.PHONY: help version up down clean logs ps seed psql shell build watch restart smoke \
-        migrate check test reencrypt revision history token
+.PHONY: help version up down clean logs ps psql shell build watch restart migrate \
+        check test reencrypt revision history
 
 help: ## List targets
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[36m%-11s\033[0m %s\n", $$1, $$2}'
@@ -41,9 +41,6 @@ logs: ## Follow the app's logs
 
 ps: ## Show container and health status
 	$(COMPOSE) ps
-
-seed: ## Register the starter fleet from scripts/seed_dev.py
-	$(COMPOSE) exec -T api python /app/scripts/seed_dev.py
 
 psql: ## Open a psql shell on the database
 	$(COMPOSE) exec timescaledb sh -c 'psql -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"'
@@ -86,15 +83,3 @@ revision: ## Autogenerate a revision — make revision m="add widgets"
 history: ## Show the migration history and where this database sits
 	uv run alembic history --verbose
 	@uv run alembic current
-
-token: ## Print an admin access token, for pasting into curl
-	@$(COMPOSE) exec -T api python /app/scripts/seed_dev.py --token
-
-smoke: ## Hit the endpoints that prove the stack works end to end
-	@# The login has to run inside the recipe. Make's $$(shell ...) function
-	@# expands at parse time, before the stack exists.
-	@set -e; base=http://$$($(COMPOSE) port api 8000); \
-	curl -fsS $$base/readyz && echo; \
-	tok=$$($(MAKE) -s token); \
-	curl -fsS -H "Authorization: Bearer $$tok" $$base/machines | head -c 400 && echo; \
-	curl -fsS -H "Authorization: Bearer $$tok" $$base/admin/collector && echo

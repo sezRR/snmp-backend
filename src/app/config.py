@@ -286,7 +286,7 @@ class Settings(DatabaseSettings):
     root_path: str = ""
     # Matched exactly on scheme, host and port. `*` is honoured but poor here:
     # responses carry credentials, so the caller's origin is echoed back.
-    cors_allow_origins: str = "http://localhost:8080"
+    cors_allow_origins: str
     sse_heartbeat_seconds: float = 15.0
     sse_queue_maxsize: int = 100
     log_level: str = Field(default="INFO", pattern="(?i)^(debug|info|warning|error|critical)$")
@@ -297,7 +297,7 @@ class Settings(DatabaseSettings):
         return list(_csv_tuple(self.cors_allow_origins))
 
     @model_validator(mode="after")
-    def _required_secrets_are_not_blank(self) -> "Settings":
+    def _required_settings_are_not_blank(self) -> "Settings":
         """Reject blank required values, which typing alone cannot.
 
         A required `str` field is satisfied by an empty string, and an empty
@@ -317,6 +317,7 @@ class Settings(DatabaseSettings):
                     self.snmp_credential_keys.get_secret_value(),
                 ),
                 ("SNMP_CREDENTIAL_ACTIVE_KEY", self.snmp_credential_active_key),
+                ("CORS_ALLOW_ORIGINS", self.cors_allow_origins),
             )
             if not value.strip()
         ]
@@ -356,6 +357,10 @@ class Settings(DatabaseSettings):
             raise ValueError(
                 "JWT_SECRET must be at least 32 characters; "
                 "generate one with: openssl rand -hex 32"
+            )
+        if not self.allowed_origins:
+            raise ValueError(
+                "CORS_ALLOW_ORIGINS must contain at least one non-blank origin"
             )
         return self
 

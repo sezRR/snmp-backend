@@ -449,6 +449,7 @@ REQUIRED_ENVIRONMENT: dict[str, Any] = {
     "admin_password": "admin-password",
     "snmp_credential_keys": '{"k1": "%s"}' % ("00" * 32),
     "snmp_credential_active_key": "k1",
+    "cors_allow_origins": "https://metrics.example",
     "os_auth_url": "https://keystone.example/v3",
     "os_username": "metrics-reader",
     "os_user_id": "user-uuid",
@@ -475,6 +476,7 @@ class OpenStackSettingsTests(TestCase):
             ("admin_password", "ADMIN_PASSWORD"),
             ("snmp_credential_keys", "SNMP_CREDENTIAL_KEYS"),
             ("snmp_credential_active_key", "SNMP_CREDENTIAL_ACTIVE_KEY"),
+            ("cors_allow_origins", "CORS_ALLOW_ORIGINS"),
             ("os_auth_url", "OS_AUTH_URL"),
             ("os_username", "OS_USERNAME"),
             ("os_user_id", "OS_USER_ID"),
@@ -495,6 +497,24 @@ class OpenStackSettingsTests(TestCase):
         message = str(raised.exception)
         for field in ("pgdatabase", "pguser", "jwt_secret"):
             self.assertIn(field, message)
+
+    def test_cors_allow_origins_is_required(self) -> None:
+        without_cors = {
+            key: value
+            for key, value in REQUIRED_ENVIRONMENT.items()
+            if key != "cors_allow_origins"
+        }
+
+        with self.assertRaises(ValidationError) as raised:
+            Settings(_env_file=None, **without_cors)
+
+        self.assertIn("cors_allow_origins", str(raised.exception))
+
+    def test_cors_allow_origins_must_name_an_origin(self) -> None:
+        with self.assertRaises(ValidationError) as raised:
+            self._settings(cors_allow_origins=" , ")
+
+        self.assertIn("CORS_ALLOW_ORIGINS", str(raised.exception))
 
     def test_disabling_openstack_drops_the_keystone_requirement(self) -> None:
         without_keystone = {

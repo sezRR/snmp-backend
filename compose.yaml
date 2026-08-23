@@ -54,10 +54,9 @@ services:
       PGUSER: ${PGUSER:?Set PGUSER in .env}
       PGPASSWORD: ${PGPASSWORD:?Set PGPASSWORD in .env}
     ports:
-      - "127.0.0.1:${API_PORT:-8000}:8000"
+      - "0.0.0.0:${API_PORT:-8000}:8000"
     volumes:
       - ./src:/app/src:ro
-      - ./scripts:/app/scripts:ro
     command:
       - uvicorn
       - app.main:app

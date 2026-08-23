@@ -156,8 +156,7 @@ The 30 synthetic machines are inserted **disabled**, so the collector does not
 start polling 30 simulated agents and writing live rows on top of the historic
 set. Flip `enabled` to poll them.
 
-Scripts live in the session scratchpad, not in the repo; `scripts/seed_dev.py`
-remains the supported way to seed a dev database.
+Scripts live in the session scratchpad, not in the repo.
 
 ---
 

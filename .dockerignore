@@ -11,8 +11,6 @@ __pycache__/
 Dockerfile
 compose.yaml
 Makefile
-# Mounted into the API container at run time; never baked in.
-scripts/
 README.md
 build/
 dist/

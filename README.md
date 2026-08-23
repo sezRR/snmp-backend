@@ -99,8 +99,7 @@ inventory.
 | `alembic.ini` | Host CLI only; the app builds an equivalent config in code |
 | `.env.example` | Every setting with defaults; `.env` is git- and docker-ignored |
 | `compose.yaml` | Local API, TimescaleDB, and profile-gated SNMP test agents |
-| `scripts/seed_dev.py` | Registers a starter fleet, binds credentials, and prints login tokens |
-| `Makefile` | `up`, `seed`, `psql`, `logs`, `reencrypt`, `clean` for the Compose stack |
+| `Makefile` | `up`, `psql`, `logs`, `reencrypt`, `clean` for the Compose stack |
 
 ## Data model
 
@@ -408,7 +407,10 @@ so per machine in `GET /admin/collector`:
 Creating and binding one:
 
 ```bash
-tok=$(make -s token)
+tok=$(curl -fsS -X POST localhost:8000/auth/login \
+  -d grant_type=password -d username="$ADMIN_USERNAME" \
+  -d password="$ADMIN_PASSWORD" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
 
 curl -fsS -X POST localhost:8000/snmp-credentials \
   -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' \
@@ -593,7 +595,7 @@ The settings worth knowing:
 | `LOGIN_RATE_LIMIT_MAX_PER_IP` | 20 | Same per client address; both are per process |
 | `LOGIN_RATE_LIMIT_WINDOW_SECONDS` | 300 | The window both counters slide over |
 | `ROOT_PATH` | empty | Optional prefix when a reverse proxy strips a path prefix |
-| `CORS_ALLOW_ORIGINS` | `http://localhost:8080` | Comma separated browser origins, matched exactly on scheme, host and port |
+| `CORS_ALLOW_ORIGINS` | **required** | One or more comma separated browser origins, matched exactly on scheme, host and port; production must list its frontend origins explicitly |
 
 ### Holding the cadence
 
@@ -809,7 +811,6 @@ confirms a guess to a caller who did not already know the password.
 TOKEN=$(curl -fsS -X POST localhost:8000/auth/login \
   -d grant_type=password -d username=admin -d password="$ADMIN_PASSWORD" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
-# or just: make token
 
 curl -fsS -H "Authorization: Bearer $TOKEN" localhost:8000/auth/me
 
@@ -940,9 +941,6 @@ cp .env.example .env
 # without them.
 
 make up      # build, start, and wait until /readyz answers
-make seed    # register machines and bind them to the default credential
-make smoke   # check readiness, machines, and collector status
-make token   # print an admin access token
 open http://localhost:8000/docs
 ```
 
@@ -950,13 +948,7 @@ Without Make, use:
 
 ```bash
 docker compose up -d --build --wait
-docker compose exec api python /app/scripts/seed_dev.py
 ```
-
-An empty `machines` table is valid but not useful. `make seed` registers the
-addresses listed in `scripts/seed_dev.py` — edit them to match your fleet — and
-binds each to the `default-v2c` credential. `SNMP_CREDENTIAL_KEYS` must be
-configured for that: the bootstrap needs it to create the encrypted credential.
 
 ### Environment
 
