@@ -93,6 +93,31 @@ class MetricSample(BaseModel):
     metrics: dict[str, Any]
 
 
+class MetricSourceCount(BaseModel):
+    """Storage occupied by one machine in one raw or rollup source."""
+
+    rows: int
+    samples: int = Field(description="Raw samples represented by these rows")
+    oldest: datetime | None = Field(
+        default=None, description="Oldest raw sample time or rollup bucket start"
+    )
+    latest: datetime | None = Field(
+        default=None, description="Latest raw sample time or rollup bucket start"
+    )
+
+
+class MetricCounts(BaseModel):
+    """Per-source storage counts for one machine."""
+
+    mac: str
+    # Backward-compatible aliases for the raw source.
+    samples: int
+    latest: datetime | None = None
+    metrics: MetricSourceCount
+    metrics_1m: MetricSourceCount
+    metrics_1h: MetricSourceCount
+
+
 class MetricStatsRow(BaseModel):
     """A `time_bucket` aggregate row.
 
@@ -140,5 +165,12 @@ class PurgeResult(BaseModel):
     method: str = Field(description="delete, truncate or drop_chunks")
     rows_deleted: int | None = Field(
         default=None,
-        description="Null when the method does not report a row count (truncate, drop_chunks)",
+        description=(
+            "Total rows removed across raw, 1m and 1h storage; null when the "
+            "method does not report row counts (truncate, drop_chunks)"
+        ),
+    )
+    rows_deleted_by_source: dict[str, int] | None = Field(
+        default=None,
+        description="Exact raw, 1m and 1h row counts for a machine purge",
     )

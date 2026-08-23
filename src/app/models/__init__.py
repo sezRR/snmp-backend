@@ -17,7 +17,7 @@ from app.models.machine import (
     MachineRow,
     MachineUpdate,
 )
-from app.models.metric import MetricSample, MetricStatsRow, PurgeResult
+from app.models.metric import MetricCounts, MetricSample, MetricStatsRow, PurgeResult
 from app.models.openstack import ServerInfo
 
 __all__ = [
@@ -29,6 +29,7 @@ __all__ = [
     "MachineCreate",
     "MachineRow",
     "MachineUpdate",
+    "MetricCounts",
     "MetricSample",
     "MetricStatsRow",
     "PrivProtocol",

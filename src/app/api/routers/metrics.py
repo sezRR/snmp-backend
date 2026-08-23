@@ -14,6 +14,7 @@ from app.db import machines as machines_repo
 from app.db import metrics as metrics_repo
 from app.db import rollups
 from app.models.metric import (
+    MetricCounts,
     MetricSample,
     MetricStatsRow,
     PurgeResult,
@@ -182,9 +183,10 @@ async def metric_stats(
 
 
 @router.get("/metrics/counts", dependencies=[requires(Scope.METRICS_READ)])
-async def metric_counts(db: DbDep) -> list[dict]:
-    """Row count and latest sample per machine."""
-    return await db.run_query(metrics_repo.counts_by_machine)
+async def metric_counts(db: DbDep) -> list[MetricCounts]:
+    """Rows, represented samples and time coverage per machine and source."""
+    rows = await db.run_query(metrics_repo.counts_by_machine)
+    return [MetricCounts(**row) for row in rows]
 
 
 @router.delete(
@@ -194,22 +196,42 @@ async def purge_machine_metrics(
     mac: str,
     db: DbDep,
     before: Annotated[
-        datetime | None, Query(description="Only purge samples older than this")
+        datetime | None,
+        Query(
+            description=(
+                "Purge raw samples older than this. A matching 1m or 1h rollup "
+                "bucket is removed whole; a later refresh may rebuild it from "
+                "surviving newer raw samples"
+            )
+        ),
     ] = None,
 ) -> PurgeResult:
-    """Purge one machine's history, keeping the machine registered."""
+    """Purge one machine's raw and rolled-up history.
+
+    The machine normally remains registered. Aggregate-only history left by a
+    deregistration from before rollup cleanup was introduced can also be purged.
+    An unaligned `before` removes the containing rollup bucket; when newer raw
+    samples survive, the normal refresh policy may rebuild it without the purged
+    samples.
+    """
     normalised = parse_mac(mac)
     row = await db.run_query(machines_repo.get, normalised)
-    if row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="unknown machine")
     deleted = await db.run_query(metrics_repo.purge_machine, normalised, before)
-    log.info("purged %s samples for %s (before=%s)", deleted, normalised, before)
+    if row is None and not any(deleted.values()):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="unknown machine")
+    log.info(
+        "purged metrics for %s (before=%s): %s",
+        normalised,
+        before,
+        deleted,
+    )
     return PurgeResult(
         scope="machine",
         mac=normalised,
         before=before,
         method="delete",
-        rows_deleted=deleted,
+        rows_deleted=sum(deleted.values()),
+        rows_deleted_by_source=deleted,
     )
 
 
@@ -226,9 +248,10 @@ async def purge_all_metrics(
 ) -> PurgeResult:
     """Purge every machine's history.
 
-    Without `before` this truncates the hypertable. With it, whole chunks are
-    dropped — cheap, but chunk-granular, so a chunk straddling the cutoff
-    survives and slightly newer data may remain.
+    Without `before` this truncates raw metrics and drops every rollup chunk.
+    With it, whole chunks are dropped from all three sources — cheap, but
+    chunk-granular, so a chunk straddling the cutoff survives and older data may
+    remain.
     """
     if not confirm:
         raise HTTPException(

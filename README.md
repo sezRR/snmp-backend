@@ -181,9 +181,10 @@ needs the encryption key ring, and Alembic deliberately loads only
 `default-v2c` row is written by `app.services.bootstrap` on the first boot that
 finds none.
 
-The FK is what makes "delete the MAC, delete its history" one statement. A
-hypertable may reference a regular table; the cascade touches every chunk, which
-is fine at this scale — time-ranged purges use `drop_chunks` instead.
+The FK cascades a deleted MAC through every raw hypertable chunk. Continuous
+aggregates are independent materializations, so deregistration explicitly deletes
+the same MAC from `metrics_1m` and `metrics_1h` in that transaction. Time-ranged
+global purges use `drop_chunks` instead.
 
 `app.services.snmp.flatten` maps the sampler's nested reading onto those
 columns and back. A reading, before flattening, looks like:
@@ -372,11 +373,11 @@ scope in the third column. See [Authentication](#authentication).
 | GET | `/metrics` | `metrics:read` | `?mac=&since=&limit=` — repeat `mac` to filter on several |
 | GET | `/metrics/latest` | `metrics:read` | most recent sample per machine |
 | GET | `/metrics/stats` | `metrics:read` | `?from=&to=&mac=&bucket=` — `time_bucket` over a required ISO 8601 window for one or more named machines (`mac` required, up to 10). Read from the raw table or a rollup depending on how far back `from` reaches. `bucket` is optional and a preset — `30s`, `1m`, `5m`, `15m`, `1h`, `6h`, `1d`, `7d` — fitted to the window when omitted. Answers carry `X-Metrics-Bucket` and `X-Metrics-Source` |
-| GET | `/metrics/counts` | `metrics:read` | rows and latest sample per machine |
+| GET | `/metrics/counts` | `metrics:read` | rows, represented samples, and oldest/latest timestamps per machine for raw, 1m, and 1h storage |
 | GET | `/metrics/stream` | `metrics:read` | SSE firehose, `?mac=` to filter |
 | GET | `/machines/{mac}/metrics/stream` | `metrics:read` | SSE for one machine |
-| DELETE | `/machines/{mac}/metrics` | `metrics:write` | purge one machine's history, `?before=` for a range |
-| DELETE | `/metrics` | `metrics:write` | purge everything; **requires `?confirm=true`**. `?before=` drops whole chunks instead |
+| DELETE | `/machines/{mac}/metrics` | `metrics:write` | purge one machine's raw, 1m, and 1h history; `?before=` is exact for raw rows and removes matching rollup buckets whole (a refresh may rebuild the boundary bucket from surviving newer raw samples) |
+| DELETE | `/metrics` | `metrics:write` | purge raw, 1m, and 1h storage; **requires `?confirm=true`**. `?before=` drops whole chunks instead |
 | GET | `/admin/collector` | `admin:read` | loop health and per-machine ok/fail counts |
 | POST | `/admin/collector/tick` | `admin:write` | run one round now instead of waiting; 409 if one is already running |
 | GET | `/admin/openstack/cache` | `admin:read` | ttl, age, hits, misses, refreshes |

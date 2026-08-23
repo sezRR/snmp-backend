@@ -17,6 +17,11 @@ METRIC_COLUMNS: tuple[str, ...] = tuple(
 
 _SELECT_COLUMNS = ", ".join(METRIC_COLUMNS)
 
+_ROLLUP_SOURCES: tuple[tuple[str, str], ...] = (
+    ("metrics_1m", "bucket"),
+    ("metrics_1h", "bucket"),
+)
+
 
 def insert_many(conn: Connection, samples: list[dict[str, Any]]) -> int:
     """Batch-insert flattened samples.
@@ -147,25 +152,93 @@ def counts_by_machine(conn: Connection) -> list[dict[str, Any]]:
     rows = conn.execute(
         text(
             """
-            SELECT CAST(mac AS text) AS mac, count(*) AS samples, max(ts) AS latest
+            SELECT
+                'metrics' AS source,
+                CAST(mac AS text) AS mac,
+                count(*) AS rows,
+                count(*) AS samples,
+                min(ts) AS oldest,
+                max(ts) AS latest
             FROM metrics
+            GROUP BY mac
+            UNION ALL
+            SELECT
+                'metrics_1m' AS source,
+                CAST(mac AS text) AS mac,
+                count(*) AS rows,
+                CAST(sum(samples) AS bigint) AS samples,
+                min(bucket) AS oldest,
+                max(bucket) AS latest
+            FROM metrics_1m
+            GROUP BY mac
+            UNION ALL
+            SELECT
+                'metrics_1h' AS source,
+                CAST(mac AS text) AS mac,
+                count(*) AS rows,
+                CAST(sum(samples) AS bigint) AS samples,
+                min(bucket) AS oldest,
+                max(bucket) AS latest
+            FROM metrics_1h
             GROUP BY mac
             ORDER BY mac
             """
         )
     ).mappings()
-    return [dict(row) for row in rows]
+
+    by_machine: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        count = dict(row)
+        source = count.pop("source")
+        mac = count.pop("mac")
+        machine = by_machine.setdefault(
+            mac,
+            {
+                "mac": mac,
+                **{
+                    name: {
+                        "rows": 0,
+                        "samples": 0,
+                        "oldest": None,
+                        "latest": None,
+                    }
+                    for name in ("metrics", "metrics_1m", "metrics_1h")
+                },
+            },
+        )
+        machine[source] = count
+    result = list(by_machine.values())
+    for machine in result:
+        # Preserve the original endpoint fields as aliases for raw storage while
+        # the nested fields add the two rollup sources.
+        machine["samples"] = machine["metrics"]["samples"]
+        machine["latest"] = machine["metrics"]["latest"]
+    return result
 
 
-def purge_machine(conn: Connection, mac: str, before: datetime | None) -> int:
-    """Delete one machine's history, optionally only rows older than `before`."""
+def allow_bulk_decompression(conn: Connection) -> None:
+    """Let one purge rewrite every compressed segment belonging to a machine."""
+    conn.execute(
+        text(
+            "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0"
+        )
+    )
+
+
+def _purge_source(
+    conn: Connection,
+    source: str,
+    time_column: str,
+    mac: str,
+    before: datetime | None,
+) -> int:
     result = conn.execute(
         text(
-            """
-            DELETE FROM metrics
+            f"""
+            DELETE FROM {source}
             WHERE mac = :mac
               AND (CAST(:before AS timestamptz) IS NULL
-                   OR ts < CAST(:before AS timestamptz))
+                   OR {time_column} < CAST(:before AS timestamptz))
             """
         ),
         {"mac": mac, "before": before},
@@ -173,22 +246,52 @@ def purge_machine(conn: Connection, mac: str, before: datetime | None) -> int:
     return result.rowcount
 
 
+def purge_machine_rollups(
+    conn: Connection, mac: str, before: datetime | None
+) -> dict[str, int]:
+    """Delete matching buckets from both aggregate materializations.
+
+    A materialized aggregate cannot be split without the raw samples from which
+    it was built. A bucket beginning before an unaligned cutoff is therefore
+    removed whole, favoring complete erasure over preserving newer data in that
+    same minute or hour. If newer raw samples still exist, a later continuous-
+    aggregate refresh can rebuild that boundary bucket from only those samples.
+    """
+    return {
+        source: _purge_source(conn, source, time_column, mac, before)
+        for source, time_column in _ROLLUP_SOURCES
+    }
+
+
+def purge_machine(
+    conn: Connection, mac: str, before: datetime | None
+) -> dict[str, int]:
+    """Delete one machine from raw storage and both materialized rollups."""
+    allow_bulk_decompression(conn)
+    deleted = {"metrics": _purge_source(conn, "metrics", "ts", mac, before)}
+    deleted.update(purge_machine_rollups(conn, mac, before))
+    return deleted
+
+
 def purge_all(conn: Connection, before: datetime | None) -> tuple[str, int | None]:
     """Delete every machine's history.
 
     With `before`, drops whole chunks — cheap, but chunk-granular: a chunk that
-    straddles the cutoff is kept, so slightly newer data than requested may
-    survive. Without it, TRUNCATE clears every chunk at once.
+    straddles the cutoff is kept, so some older data may survive. Without it,
+    TRUNCATE clears every chunk at once.
 
-    Neither touches the continuous aggregates, which keep their own copy of the
-    history at coarser resolution. Dropping those is a retention setting, not a
-    purge.
+    The same operation is applied to both continuous aggregates so a purge does
+    not leave independently materialized history behind.
     """
     if before is None:
-        conn.execute(text("TRUNCATE TABLE metrics"))
+        conn.execute(text("TRUNCATE TABLE metrics, metrics_1m, metrics_1h"))
         return "truncate", None
-    conn.execute(
-        text("SELECT drop_chunks('metrics', older_than => CAST(:before AS timestamptz))"),
-        {"before": before},
-    )
+    for source in ("metrics", *(name for name, _ in _ROLLUP_SOURCES)):
+        conn.execute(
+            text(
+                f"SELECT drop_chunks('{source}', "
+                "older_than => CAST(:before AS timestamptz))"
+            ),
+            {"before": before},
+        )
     return "drop_chunks", None

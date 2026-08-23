@@ -6,6 +6,8 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
+from app.db import metrics as metrics_repo
+
 _COLUMNS = (
     "CAST(mac AS text) AS mac, host(ipv4) AS ipv4, label, enabled, external, "
     "credential_id, created_at, updated_at"
@@ -215,8 +217,14 @@ def mark_managed(conn: Connection, mac: str) -> bool:
 
 
 def delete(conn: Connection, mac: str) -> bool:
-    """Remove a machine. Its metrics go with it, via ON DELETE CASCADE."""
+    """Remove a machine and every raw or materialized metric associated with it."""
+    metrics_repo.allow_bulk_decompression(conn)
     result = conn.execute(
         text("DELETE FROM machines WHERE mac = :mac"), {"mac": mac}
     )
-    return result.rowcount > 0
+    deleted = result.rowcount > 0
+    if deleted:
+        # The foreign key cascades through raw metrics only. Continuous
+        # aggregates are independent materializations and need explicit cleanup.
+        metrics_repo.purge_machine_rollups(conn, mac, None)
+    return deleted
