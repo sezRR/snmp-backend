@@ -67,6 +67,7 @@ class CachedOpenStack:
             self._by_mac = {normalise_mac(s.mac): s for s in servers}
             self._by_ipv4 = {s.ipv4: s for s in servers}
             self._fetched_at = time.monotonic()
+            self._hits = 0
             self._refreshes += 1
             self._last_error = None
             log.info("openstack lookup refreshed (%s servers)", len(servers))
@@ -98,6 +99,7 @@ class CachedOpenStack:
         self._by_mac = {}
         self._by_ipv4 = {}
         self._fetched_at = None
+        self._hits = 0
         log.info("openstack cache flushed (%s servers dropped)", dropped)
         return dropped
 

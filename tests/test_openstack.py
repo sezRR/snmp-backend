@@ -2,7 +2,7 @@ import threading
 from types import SimpleNamespace
 from typing import Any
 from unittest import IsolatedAsyncioTestCase, TestCase
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from pydantic import ValidationError
 
@@ -436,6 +436,34 @@ class SDKOpenStackTests(IsolatedAsyncioTestCase):
         lookup.close()
 
         upstream.close.assert_called_once_with()
+
+
+class CachedOpenStackTests(IsolatedAsyncioTestCase):
+    @patch("app.services.openstack.time.monotonic")
+    async def test_refresh_resets_hits(self, monotonic: Mock) -> None:
+        monotonic.side_effect = [0, 1, 1, 11, 11, 11, 11]
+        upstream = SimpleNamespace(servers=AsyncMock(return_value=[]), close=Mock())
+        lookup = CachedOpenStack(upstream, ttl_seconds=10)
+
+        await lookup.servers()
+        await lookup.servers()
+        self.assertEqual(lookup.stats().hits, 1)
+
+        await lookup.servers()
+
+        self.assertEqual(lookup.stats().hits, 0)
+
+    async def test_flush_resets_hits(self) -> None:
+        upstream = SimpleNamespace(servers=AsyncMock(return_value=[]), close=Mock())
+        lookup = CachedOpenStack(upstream, ttl_seconds=300)
+
+        await lookup.servers()
+        await lookup.servers()
+        self.assertEqual(lookup.stats().hits, 1)
+
+        lookup.flush()
+
+        self.assertEqual(lookup.stats().hits, 0)
 
 
 # Every documented REQUIRED variable, so a settings test states the whole
