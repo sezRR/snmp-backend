@@ -155,3 +155,12 @@ services:
 volumes:
   # `docker compose down` keeps data; `down -v` removes it.
   timescale-data:
+
+networks:
+ default:
+   driver: bridge
+   driver_opts:
+     com.docker.network.bridge.name: br-72ec59b7c8bb
+   ipam:
+     config:
+       - subnet: 172.19.0.0/16
