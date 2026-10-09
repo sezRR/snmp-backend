@@ -28,7 +28,7 @@ services:
       timeout: 3s
       retries: 20
       start_period: 30s
-    restart: "no"
+    restart: unless-stopped
     security_opt:
       - no-new-privileges:true
     deploy:
